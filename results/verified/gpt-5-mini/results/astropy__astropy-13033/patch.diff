@@ -1,0 +1,76 @@
+diff --git a/astropy/timeseries/core.py b/astropy/timeseries/core.py
+index c279f35f8..20efc7d8b 100644
+--- a/astropy/timeseries/core.py
++++ b/astropy/timeseries/core.py
+@@ -59,31 +59,56 @@ class BaseTimeSeries(QTable):
+         if not self._required_columns_enabled:
+             return
+ 
+-        if self._required_columns is not None:
+-
+-            if self._required_columns_relax:
+-                required_columns = self._required_columns[:len(self.colnames)]
+-            else:
+-                required_columns = self._required_columns
++        if self._required_columns is None:
++            return
+ 
+-            plural = 's' if len(required_columns) > 1 else ''
++        # Determine which required columns to check depending on the relax flag
++        if self._required_columns_relax:
++            required_columns = self._required_columns[:len(self.colnames)]
++        else:
++            required_columns = self._required_columns
+ 
+-            if not self._required_columns_relax and len(self.colnames) == 0:
++        plural = 's' if len(required_columns) > 1 else ''
+ 
+-                raise ValueError("{} object is invalid - expected '{}' "
+-                                 "as the first column{} but time series has no columns"
+-                                 .format(self.__class__.__name__, required_columns[0], plural))
++        # No columns present: keep legacy message that references only the
++        # first expected column for backward compatibility.
++        if not self._required_columns_relax and len(self.colnames) == 0:
++            raise ValueError("{} object is invalid - expected '{}' "
++                             "as the first column{} but time series has no columns"
++                             .format(self.__class__.__name__, required_columns[0], plural))
+ 
+-            elif self.colnames[:len(required_columns)] != required_columns:
++        # If the leading columns don't match the required ones
++        if self.colnames[:len(required_columns)] != required_columns:
+ 
++            # Single required column: preserve original wording
++            if len(required_columns) == 1:
+                 raise ValueError("{} object is invalid - expected '{}' "
+                                  "as the first column{} but found '{}'"
+                                  .format(self.__class__.__name__, required_columns[0], plural, self.colnames[0]))
+ 
+-            if (self._required_columns_relax
+-                    and self._required_columns == self.colnames[:len(self._required_columns)]):
+-                self._required_columns_relax = False
++            # If the very first column is wrong, keep legacy message that
++            # reports the first expected and first found column (backwards
++            # compatible common case).
++            if len(self.colnames) > 0 and self.colnames[0] != required_columns[0]:
++                raise ValueError("{} object is invalid - expected '{}' "
++                                 "as the first column{} but found '{}'"
++                                 .format(self.__class__.__name__, required_columns[0], plural, self.colnames[0]))
+ 
++            # Otherwise, the first column matches but subsequent required
++            # columns are missing or different. Report the full expected list
++            # and the actual columns present (for the slice compared) to be
++            # informative.
++            expected = list(required_columns)
++            actual = list(self.colnames[:len(required_columns)])
++            raise ValueError("{} object is invalid - expected {} "
++                             "as the first column{} but found {}"
++                             .format(self.__class__.__name__, expected, plural, actual))
++
++        # If we were in a relaxed state and now all required columns are
++        # present, turn off the relaxed checking.
++        if (self._required_columns_relax
++                and self._required_columns == self.colnames[:len(self._required_columns)]):
++            self._required_columns_relax = False
+     @contextmanager
+     def _delay_required_column_checks(self):
+         self._required_columns_enabled = False

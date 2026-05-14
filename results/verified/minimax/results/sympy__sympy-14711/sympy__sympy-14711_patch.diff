@@ -1,0 +1,32 @@
+diff --git a/sympy/physics/vector/vector.py b/sympy/physics/vector/vector.py
+index a048ee57f..ad124af9e 100644
+--- a/sympy/physics/vector/vector.py
++++ b/sympy/physics/vector/vector.py
+@@ -57,6 +57,10 @@ def __hash__(self):
+ 
+     def __add__(self, other):
+         """The add operator for Vector. """
++        # Allow adding with the integer 0 (used as the start value in sum()).
++        # If other is 0, treat it as the zero Vector and return self.
++        if other == 0:
++            return self
+         other = _check_vector(other)
+         return Vector(self.args + other.args)
+ 
+@@ -451,7 +455,15 @@ def _det(mat):
+     __repr__ = __str__
+     __radd__ = __add__
+     __rand__ = __and__
+-    __rmul__ = __mul__
++
++    def __rmul__(self, other):
++        """Right-hand multiplication: allow scalar * Vector.
++
++        Delegate to __mul__ so that expressions like (scalar * Vector)
++        return a Vector when Python falls back to the right-hand method.
++        """
++        # sympify scalar before delegating to __mul__
++        return self.__mul__(other)
+ 
+     def separate(self):
+         """

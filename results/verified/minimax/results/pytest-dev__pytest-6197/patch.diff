@@ -1,0 +1,51 @@
+diff --git a/src/_pytest/main.py b/src/_pytest/main.py
+index 3c205027d..24bd837a1 100644
+--- a/src/_pytest/main.py
++++ b/src/_pytest/main.py
+@@ -493,7 +493,7 @@ class Session(nodes.FSCollector):
+             self.trace.root.indent -= 1
+ 
+     def _collect(self, arg):
+-        from _pytest.python import Package
++        from _pytest.python import Package, path_matches_patterns
+ 
+         names = self._parsearg(arg)
+         argpath = names.pop(0)
+@@ -533,14 +533,33 @@ class Session(nodes.FSCollector):
+                     seen_dirs.add(dirpath)
+                     pkginit = dirpath.join("__init__.py")
+                     if pkginit.exists():
+-                        for x in self._collectfile(pkginit):
+-                            yield x
+-                            if isinstance(x, Package):
+-                                self._pkg_roots[dirpath] = x
++                        # Check if the directory has any python test files
++                        # before collecting the package
++                        has_test_files = any(
++                            f.check(file=1)
++                            and f.ext == ".py"
++                            and path_matches_patterns(
++                                f, self.config.getini("python_files")
++                            )
++                            for f in dirpath.listdir()
++                        )
++                        # Also check if __init__.py matches python_files (like in pytest_collect_file)
++                        if path_matches_patterns(
++                            pkginit, self.config.getini("python_files")
++                        ) or has_test_files:
++                            for x in self._collectfile(pkginit):
++                                yield x
++                                if isinstance(x, Package):
++                                    self._pkg_roots[dirpath] = x
+                 if dirpath in self._pkg_roots:
+                     # Do not collect packages here.
+                     continue
+ 
++                # Skip __init__.py files in directories that have no test files
++                # and weren't collected as packages
++                if path.basename == "__init__.py" and dirpath not in self._pkg_roots:
++                    continue
++
+                 for x in self._collectfile(path):
+                     key = (type(x), x.fspath)
+                     if key in self._node_cache:

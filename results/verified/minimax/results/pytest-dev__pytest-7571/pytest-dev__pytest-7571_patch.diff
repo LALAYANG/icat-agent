@@ -1,0 +1,39 @@
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index 11031f2f2..7004d2245 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -346,17 +346,21 @@ class LogCaptureFixture:
+         self._item = item
+         # dict of log name -> log level
+         self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
++        # original handler level saved when set_level is first used
++        self._initial_handler_level = None  # type: Optional[int]
+ 
+     def _finalize(self) -> None:
+         """Finalizes the fixture.
+ 
+         This restores the log levels changed by :meth:`set_level`.
+-        """
+         # restore log levels
+         for logger_name, level in self._initial_logger_levels.items():
+             logger = logging.getLogger(logger_name)
+             logger.setLevel(level)
+ 
++        # restore handler level if it was changed
++        if self._initial_handler_level is not None:
++            self.handler.setLevel(self._initial_handler_level)
+     @property
+     def handler(self) -> LogCaptureHandler:
+         """
+@@ -434,8 +438,10 @@ class LogCaptureFixture:
+         # save the original log-level to restore it during teardown
+         self._initial_logger_levels.setdefault(logger, logger_obj.level)
+         logger_obj.setLevel(level)
++        # save the original handler level so it can be restored on teardown
++        if self._initial_handler_level is None:
++            self._initial_handler_level = self.handler.level
+         self.handler.setLevel(level)
+-
+     @contextmanager
+     def at_level(
+         self, level: int, logger: Optional[str] = None

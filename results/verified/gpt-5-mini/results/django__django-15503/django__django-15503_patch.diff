@@ -1,0 +1,32 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..999eb5054b 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -191,15 +191,20 @@ class HasKeyLookup(PostgresOperatorLookup):
+         for key in rhs:
+             if isinstance(key, KeyTransform):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
++                rhs_params.append(
++                    "%s%s"
++                    % (
++                        lhs_json_path,
++                        compile_json_path(rhs_key_transforms, include_root=False),
++                    )
++                )
+             else:
+-                rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
+-                    lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                # For has_key/has_keys/has_any_keys, the key should always be
++                # treated as a string key (object key), not an array index.
++                # e.g., '1111' should be $."1111" not $[1111]
++                rhs_params.append(
++                    "%s.%s" % (lhs_json_path, json.dumps(key))
+                 )
+-            )
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))

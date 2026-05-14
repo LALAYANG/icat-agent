@@ -1,0 +1,63 @@
+diff --git a/lib/matplotlib/offsetbox.py b/lib/matplotlib/offsetbox.py
+index 13af941552..f15d4b4b9a 100644
+--- a/lib/matplotlib/offsetbox.py
++++ b/lib/matplotlib/offsetbox.py
+@@ -389,13 +389,28 @@ class OffsetBox(martist.Artist):
+     @_api.deprecated("3.7", alternative="get_bbox")
+     def get_extent(self, renderer):
+         """Return a tuple ``width, height, xdescent, ydescent`` of the box."""
+-        bbox = self.get_bbox(renderer)
+-        return bbox.width, bbox.height, -bbox.x0, -bbox.y0
+-
+     def get_window_extent(self, renderer=None):
+         # docstring inherited
+         if renderer is None:
+-            renderer = self.figure._get_renderer()
++            # Try to obtain a renderer from the figure associated with this
++            # offsetbox. The OffsetBox may not have been added to a figure
++            # (self.figure can be None), but it often has an axes attribute
++            # set by clients (e.g., AnchoredLocatorBase), so try that as well.
++            fig = getattr(self, "figure", None)
++            if fig is None:
++                ax = getattr(self, "axes", None)
++                if ax is not None:
++                    fig = getattr(ax, "figure", None)
++            if fig is not None:
++                try:
++                    renderer = fig._get_renderer()
++                except Exception:
++                    canvas = getattr(fig, "canvas", None)
++                    if canvas is not None and hasattr(canvas, "get_renderer"):
++                        try:
++                            renderer = canvas.get_renderer()
++                        except Exception:
++                            renderer = None
+         bbox = self.get_bbox(renderer)
+         try:  # Some subclasses redefine get_offset to take no args.
+             px, py = self.get_offset(bbox, renderer)
+diff --git a/lib/mpl_toolkits/axes_grid1/inset_locator.py b/lib/mpl_toolkits/axes_grid1/inset_locator.py
+index 9d35051074..f0b6e5af7e 100644
+--- a/lib/mpl_toolkits/axes_grid1/inset_locator.py
++++ b/lib/mpl_toolkits/axes_grid1/inset_locator.py
+@@ -70,6 +70,21 @@ class AnchoredLocatorBase(AnchoredOffsetbox):
+ 
+     def __call__(self, ax, renderer):
+         self.axes = ax
++        # When called from tight_bbox adjusters the renderer can be None. Try
++        # to obtain a renderer from the axes' figure so that get_window_extent
++        # does not rely on self.figure being set (which may be None for
++        # locator-like OffsetBox instances).
++        if renderer is None and getattr(ax, "figure", None) is not None:
++            fig = ax.figure
++            try:
++                renderer = fig._get_renderer()
++            except Exception:
++                # Fallback to canvas' get_renderer() if available.
++                try:
++                    renderer = fig.canvas.get_renderer()
++                except Exception:
++                    renderer = None
++
+         bbox = self.get_window_extent(renderer)
+         px, py = self.get_offset(bbox.width, bbox.height, 0, 0, renderer)
+         bbox_canvas = Bbox.from_bounds(px, py, bbox.width, bbox.height)

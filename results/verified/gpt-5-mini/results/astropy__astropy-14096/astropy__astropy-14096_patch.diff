@@ -1,0 +1,54 @@
+diff --git a/astropy/coordinates/sky_coordinate.py b/astropy/coordinates/sky_coordinate.py
+index ab475f7d0..9e0b83a91 100644
+--- a/astropy/coordinates/sky_coordinate.py
++++ b/astropy/coordinates/sky_coordinate.py
+@@ -2,6 +2,7 @@ import copy
+ import operator
+ import re
+ import warnings
++import sys
+ 
+ import erfa
+ import numpy as np
+@@ -31,8 +32,6 @@ from .sky_coordinate_parsers import (
+     _parse_coordinate_data,
+ )
+ 
+-__all__ = ["SkyCoord", "SkyCoordInfo"]
+-
+ 
+ class SkyCoordInfo(MixinInfo):
+     """
+@@ -871,6 +870,23 @@ class SkyCoord(ShapedLikeNDArray):
+         Overrides getattr to return coordinates that this can be transformed
+         to, based on the alias attr in the primary transform graph.
+         """
++        # If the attribute exists on the class as a descriptor (for example a
++        # property), then the descriptor's __get__ may have raised an
++        # AttributeError (for example because a missing internal attribute was
++        # accessed). In that case object.__getattribute__ forwards to
++        # __getattr__ and we should call the descriptor ourselves and let any
++        # AttributeError it raises propagate, so the user sees the original
++        # missing-attribute message (rather than a misleading message about the
++        # outer attribute name).
++                    try:
++                        return desc.__get__(self, type(self))
++                    except AttributeError as e:
++                        # Re-raise an AttributeError with the original message so
++                        # the user sees the actual missing attribute referenced
++                        # inside the descriptor (property) rather than a
++                        # misleading message about the outer attribute name.
++                        raise AttributeError(str(e))
++
+         if "_sky_coord_frame" in self.__dict__:
+             if self._is_name(attr):
+                 return self  # Should this be a deepcopy of self?
+@@ -898,8 +914,6 @@ class SkyCoord(ShapedLikeNDArray):
+         raise AttributeError(
+             f"'{self.__class__.__name__}' object has no attribute '{attr}'"
+         )
+-
+-    def __setattr__(self, attr, val):
+         # This is to make anything available through __getattr__ immutable
+         if "_sky_coord_frame" in self.__dict__:
+             if self._is_name(attr):

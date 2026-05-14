@@ -1,0 +1,28 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..38f275e554 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,19 +748,19 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+                 if not is_reverse_o2o(source):
+-                    must_include[old_model].add(source)
+-                add_to_dict(must_include, cur_model, opts.pk)
++                    must_include[old_model._meta.concrete_model].add(source)
++                add_to_dict(must_include, cur_model._meta.concrete_model, opts.pk)
+             field = opts.get_field(parts[-1])
+             is_reverse_object = field.auto_created and not field.concrete
+             model = field.related_model if is_reverse_object else field.model
+             model = model._meta.concrete_model
+             if model == opts.model:
+-                model = cur_model
++                model = cur_model._meta.concrete_model
+             if not is_reverse_o2o(field):
+                 add_to_dict(seen, model, field)
+ 

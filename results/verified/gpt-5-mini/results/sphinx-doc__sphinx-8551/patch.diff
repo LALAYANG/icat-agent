@@ -1,0 +1,19 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..df69e3f34 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1233,6 +1233,14 @@ class PythonDomain(Domain):
+             if mod.docname in docnames:
+                 self.modules[modname] = mod
+ 
++    def process_field_xref(self, pnode: pending_xref) -> None:
++        """Process a pending xref created in a doc field.
++
++        Attach information about the current scope (py:module, py:class) to
++        pending_xref nodes created from info fields so they resolve the same way
++        as explicit xref roles.
++        """
++        pnode.attributes.update(self.env.ref_context)
+     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+                  name: str, type: str, searchmode: int = 0
+                  ) -> List[Tuple[str, ObjectEntry]]:

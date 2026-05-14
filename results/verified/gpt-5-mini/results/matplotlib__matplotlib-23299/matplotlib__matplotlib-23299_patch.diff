@@ -1,0 +1,21 @@
+diff --git a/lib/matplotlib/__init__.py b/lib/matplotlib/__init__.py
+index c268a56724..2608af9a5d 100644
+--- a/lib/matplotlib/__init__.py
++++ b/lib/matplotlib/__init__.py
+@@ -673,6 +673,16 @@ class RcParams(MutableMapping, dict):
+         elif key == "backend" and self is globals().get("rcParams"):
+             val = dict.__getitem__(self, key)
+             if val is rcsetup._auto_backend_sentinel:
++                # The backend was not explicitly set, but may have been
++                # already resolved in rcParamsOrig (e.g., if a figure was
++                # created in an rc_context). Use the resolved backend
++                # without calling switch_backend (which would close all
++                # figures).
++                resolved_backend = dict.__getitem__(
++                    globals().get("rcParamsOrig"), key)
++                if resolved_backend is not rcsetup._auto_backend_sentinel:
++                    dict.__setitem__(self, key, resolved_backend)
++                    return resolved_backend
+                 from matplotlib import pyplot as plt
+                 plt.switch_backend(rcsetup._auto_backend_sentinel)
+ 

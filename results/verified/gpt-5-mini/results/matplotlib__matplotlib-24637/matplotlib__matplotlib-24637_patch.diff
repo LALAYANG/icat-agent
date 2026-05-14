@@ -1,0 +1,41 @@
+diff --git a/lib/matplotlib/offsetbox.py b/lib/matplotlib/offsetbox.py
+index efa34dd078..06e7f0a462 100644
+--- a/lib/matplotlib/offsetbox.py
++++ b/lib/matplotlib/offsetbox.py
+@@ -1203,11 +1203,21 @@ class OffsetImage(OffsetBox):
+ 
+     def draw(self, renderer):
+         # docstring inherited
++        # propagate our gid to the contained image so backends that look
++        # for the gid on the image artist (or its GC) will see it. Only set
++        # the child's gid if we have one to avoid overwriting an existing
++        # gid on the child when the parent has none.
++        gid = self.get_gid()
++        if gid is not None:
++            try:
++                self.image.set_gid(gid)
++            except Exception:
++                # be conservative: if child doesn't accept gid, ignore
++                pass
+         self.image.draw(renderer)
+         # bbox_artist(self, renderer, fill=False, props=dict(pad=0.))
+         self.stale = False
+ 
+-
+ class AnnotationBbox(martist.Artist, mtext._AnnotationBase):
+     """
+     Container for an `OffsetBox` referring to a specific position *xy*.
+@@ -1457,8 +1467,13 @@ or callable, default: value of *xycoords*
+             if self.arrow_patch.figure is None and self.figure is not None:
+                 self.arrow_patch.figure = self.figure
+             self.arrow_patch.draw(renderer)
++        # Open a renderer group so that backends that respect groups (e.g. SVG)
++        # can attach the gid to a wrapping element. This mirrors how other
++        # complex artists create groups when they have gids.
++        renderer.open_group('annotationbox', gid=self.get_gid())
+         self.patch.draw(renderer)
+         self.offsetbox.draw(renderer)
++        renderer.close_group('annotationbox')
+         self.stale = False
+ 
+ 

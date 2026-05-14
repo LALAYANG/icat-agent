@@ -1,0 +1,30 @@
+diff --git a/django/http/response.py b/django/http/response.py
+index f62dec8ce9..e10caba378 100644
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -607,12 +607,22 @@ class FileResponse(StreamingHttpResponse):
+             if filename:
+                 content_type, encoding = mimetypes.guess_type(filename)
+                 # Encoding isn't set to prevent browsers from automatically
+-                # uncompressing files.
+-                content_type = {
++                # uncompressing files. If an encoding is present, prefer a
++                # safe binary content type (or a more specific one for known
++                # encodings) instead of the guessed content type based on the
++                # underlying filename (e.g. avoid serving "text/html" for
++                # compressed files like "file.html.br").
++                encoding_to_content_type = {
+                     "bzip2": "application/x-bzip",
+                     "gzip": "application/gzip",
+                     "xz": "application/x-xz",
+-                }.get(encoding, content_type)
++                    "compress": "application/x-compress",
++                    "br": "application/brotli",
++                }
++                if encoding:
++                    content_type = encoding_to_content_type.get(
++                        encoding, "application/octet-stream"
++                    )
+                 self.headers["Content-Type"] = (
+                     content_type or "application/octet-stream"
+                 )

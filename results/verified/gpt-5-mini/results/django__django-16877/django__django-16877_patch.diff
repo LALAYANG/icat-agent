@@ -1,0 +1,24 @@
+diff --git a/django/template/defaultfilters.py b/django/template/defaultfilters.py
+index 5289ef34a0..30ad0e0e37 100644
+--- a/django/template/defaultfilters.py
++++ b/django/template/defaultfilters.py
+@@ -498,6 +498,19 @@ def safeseq(value):
+     return [mark_safe(obj) for obj in value]
+ 
+ 
++@register.filter(is_safe=True)
++def escapeseq(value):
++    """
++    A filter for sequences that escapes each element in the sequence,
++    individually, after converting them to strings. Return a list with the
++    results.
++
++    This is the counterpart to ``safeseq``; use it when autoescape is off and
++    you want each item escaped before operations like ``join``.
++    """
++    return [mark_safe(conditional_escape(obj)) for obj in value]
++
++
+ @register.filter(is_safe=True)
+ @stringfilter
+ def striptags(value):

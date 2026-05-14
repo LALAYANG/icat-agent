@@ -1,0 +1,45 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b8efb9f881..b636db0cfe 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -216,15 +216,35 @@ def get_child_arguments():
+     executable is reported to not have the .exe extension which can cause bugs
+     on reloading.
+     """
+-    import django.__main__
+-    django_main_path = Path(django.__main__.__file__)
++    import __main__
+     py_script = Path(sys.argv[0])
+ 
+     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+-    if py_script == django_main_path:
+-        # The server was started with `python -m django runserver`.
+-        args += ['-m', 'django']
++    # __spec__ is set when the server was started with the `-m` option,
++    # see https://docs.python.org/3/reference/import.html#main-module
++    # __spec__.parent is the parent package, which is used to construct
++    # the `-m` argument.
++    # Use getattr to handle cases where __spec__ doesn't exist or doesn't have parent.
++    spec = getattr(__main__, '__spec__', None)
++    if spec is not None and getattr(spec, 'parent', None):
++        # The server was started with `python -m package runserver`.
++        args += ['-m', spec.parent]
+         args += sys.argv[1:]
++    # __spec__ is not set when running as a script or in some Python environments.
++    # In that case, fallback to the previous behavior of checking if the script
++    # path looks like a __main__.py module.
++    elif py_script.name == '__main__.py':
++        # The server was started with `python -m django runserver`
++        # or a custom package that has a __main__.py module.
++        # Try to determine the package name from the path.
++        # This is a fallback for environments where __spec__ is not set.
++        import django.__main__
++        if py_script == Path(django.__main__.__file__):
++            args += ['-m', 'django']
++            args += sys.argv[1:]
++        else:
++            # Fall back to the script path for other packages.
++            args += sys.argv
+     elif not py_script.exists():
+         # sys.argv[0] may not exist for several reasons on Windows.
+         # It may exist with a .exe extension or have a -script.py suffix.

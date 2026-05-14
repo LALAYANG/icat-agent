@@ -1,0 +1,28 @@
+diff --git a/sympy/polys/sqfreetools.py b/sympy/polys/sqfreetools.py
+index 1783a7744a..55f3f6874c 100644
+--- a/sympy/polys/sqfreetools.py
++++ b/sympy/polys/sqfreetools.py
+@@ -17,7 +17,7 @@
+     dmp_raise, dmp_inject,
+     dup_convert)
+ from sympy.polys.densetools import (
+-    dup_diff, dmp_diff,
++    dup_diff, dmp_diff, dmp_diff_in,
+     dup_shift, dmp_compose,
+     dup_monic, dmp_ground_monic,
+     dup_primitive, dmp_ground_primitive)
+@@ -252,7 +252,13 @@ def dmp_sqf_part(f, u, K):
+     if K.is_negative(dmp_ground_LC(f, u, K)):
+         f = dmp_neg(f, u, K)
+ 
+-    gcd = dmp_gcd(f, dmp_diff(f, 1, u, K), u, K)
++    # Compute GCD of f with all partial derivatives
++    # For multivariate polynomials, we need to consider derivatives w.r.t. all variables
++    gcd = f
++    for j in range(u + 1):
++        deriv = dmp_diff_in(f, 1, j, u, K)
++        gcd = dmp_gcd(gcd, deriv, u, K)
++
+     sqf = dmp_quo(f, gcd, u, K)
+ 
+     if K.is_Field:

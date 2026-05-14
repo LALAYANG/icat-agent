@@ -1,0 +1,18 @@
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index ea5baca08d..181ec42150 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -159,8 +159,11 @@ class TemplateView(TemplateResponseMixin, ContextMixin, View):
+     def get(self, request, *args, **kwargs):
+         # RemovedInDjango40Warning: when the deprecation ends, replace with:
+         #   context = self.get_context_data()
+-        context_kwargs = _wrap_url_kwargs_with_deprecation_warning(kwargs)
+-        context = self.get_context_data(**context_kwargs)
++        context = self.get_context_data(**kwargs)
++        # Wrap URL kwargs with deprecation warning after get_context_data()
++        # so the warning is only triggered when accessed in templates, not
++        # when used programmatically in get_context_data().
++        context.update(_wrap_url_kwargs_with_deprecation_warning(kwargs))
+         return self.render_to_response(context)
+ 
+ 

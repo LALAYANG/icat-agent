@@ -1,0 +1,124 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 823cbe02..88816be8 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -25,7 +25,7 @@ import numpy as np
+ from . import dtypes, duck_array_ops, utils
+ from .alignment import align, deep_align
+ from .common import zeros_like
+-from .duck_array_ops import datetime_to_numeric
++from .duck_array_ops import datetime_to_numeric, np_timedelta64_to_float
+ from .indexes import Index, filter_indexes_from_coords
+ from .merge import merge_attrs, merge_coordinates_without_align
+ from .options import OPTIONS, _get_keep_attrs
+@@ -1905,15 +1905,72 @@ def polyval(
+     coeffs = coeffs.reindex(
+         {degree_dim: np.arange(max_deg + 1)}, fill_value=0, copy=False
+     )
+-    coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
++    # If coord is a DataArray and it has a coordinate variable with the same name,
++    # evaluate the polynomial at that coordinate variable (this matches historical
++    # behavior where passing a DataArray uses its coordinate values rather than its
++    # data values). See issue report reproductions where coord.data is datetime64
++    # but coord.coords[coord.name] is timedelta64 offsets.
++    from .dataarray import DataArray
++    if isinstance(coord, DataArray) and coord.name in coord.coords:
++        # Prefer the coordinate variable if it exists. If that coordinate is
++        # already a timedelta-like variable, use it. If not, and the
++        # DataArray itself contains datetime64 values, compute offsets
++        # relative to the first value (common user intent) and evaluate the
++        # polynomial at those offsets.
++        coord_var = coord.coords[coord.name]
++        try:
++            from .dataarray import DataArray as _DA
++
++            # If coordinate variable is timedelta-like, use it directly
++            if getattr(coord_var, "dtype", None) is not None and coord_var.dtype.kind == "m":
++                coord = coord_var if isinstance(coord_var, _DA) else _DA(coord_var.values)
++            else:
++                # If the DataArray itself is datetime64, compute offsets from
++                # its data (data - data[0]) to obtain timedelta offsets.
++                if getattr(coord, "dtype", None) is not None and coord.dtype.kind == "M":
++                    try:
++                        offsets = coord.data - coord.data[0]
++                        coord = _DA(offsets, dims=coord.dims, coords={coord.name: offsets}, name=coord.name)
++                    except Exception:
++                        # fallback to using the coord_var directly
++                        coord = coord_var if isinstance(coord_var, _DA) else _DA(coord_var.values)
++                else:
++                    # fallback: wrap coord_var into a DataArray
++                    coord = coord_var if isinstance(coord_var, _DA) else _DA(coord_var.values)
++        except Exception:
++            # If construction fails, fall back to raw coord_var
++            coord = coord_var
++
++    # If coord is a timedelta-like DataArray, convert to numeric in seconds
++    # directly for polynomial evaluation to match historical behavior where
++    # polynomial coefficients were computed against seconds. Otherwise, fall
++    # back to the generic conversion routine.
++    if getattr(coord, "dtype", None) is not None and coord.dtype.kind == "m":
++        coord = coord.copy(data=np_timedelta64_to_float(coord.data, datetime_unit="s"))
++    else:
++        coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
+ 
+     # using Horner's method
+     # https://en.wikipedia.org/wiki/Horner%27s_method
+-    res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord)
++    res = zeros_like(coord) + coeffs.isel({degree_dim: max_deg}, drop=True)
+     for deg in range(max_deg - 1, -1, -1):
+         res *= coord
+         res += coeffs.isel({degree_dim: deg}, drop=True)
+ 
++    # Ensure coordinate dimensions appear first in the result (preserve older behavior
++    # where the coordinate dimension ordering is maintained). Place any dimensions
++    # from `coord` (in their original order) before any other dimensions in `res`.
++    if hasattr(res, "dims"):
++        coord_dims = tuple(d for d in getattr(coord, "dims", ()) if d in res.dims)
++        other_dims = tuple(d for d in res.dims if d not in coord_dims)
++        desired_order = coord_dims + other_dims
++        try:
++            # transpose is a no-op if already in desired order
++            res = res.transpose(*desired_order)
++        except Exception:
++            # If transpose fails for any reason (e.g., scalar), ignore and return res
++            pass
++
+     return res
+ 
+ 
+@@ -1933,13 +1990,33 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+     from .dataset import Dataset
+ 
+     def to_floatable(x: DataArray) -> DataArray:
+-        if x.dtype.kind in "mM":
++        # If x is a DataArray whose data are datetime64 but which has a
++        # coordinate variable with the same name that is timedelta64, prefer
++        # converting the coordinate variable (e.g., offsets) to numeric. This
++        # handles the common pattern where a DataArray's values are datetimes
++        # while its coordinate labels are relative timedeltas.
++        try:
++            if x.name in x.coords:
++                coord_var = x.coords[x.name]
++                if getattr(coord_var, "dtype", None) is not None and coord_var.dtype.kind == "m":
++                    return x.copy(data=np_timedelta64_to_float(coord_var.data, datetime_unit="ns"))
++        except Exception:
++            # Be conservative: if any attribute access fails, fall back to
++            # the general logic below.
++            pass
++
++        # Handle timedelta64 ('m') and datetime64 ('M') separately.
++        if x.dtype.kind == "m":
++            # timedelta64 -> numeric relative to given unit (array-aware helper)
++            return x.copy(data=np_timedelta64_to_float(x.data, datetime_unit="ns"))
++        if x.dtype.kind == "M":
++            # datetime64 -> numeric relative to epoch (1970-01-01) to reduce overflow
+             return x.copy(
+                 data=datetime_to_numeric(
+                     x.data,
+                     offset=np.datetime64("1970-01-01"),
+                     datetime_unit="ns",
+-                ),
++                )
+             )
+         return x
+ 

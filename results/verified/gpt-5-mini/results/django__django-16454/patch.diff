@@ -1,0 +1,87 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..3b5a10f8be 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -71,6 +71,65 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, *args, **kwargs):
++        """Return the subparsers action, ensuring subparsers created through
++        it inherit CommandParser-specific options (like missing_args_message
++        and called_from_command_line) and use the same parser class by
++        default. This ensures subparsers retain Django's error formatting
++        behavior instead of raising raw stack traces.
++        """
++        action = super().add_subparsers(*args, **kwargs)
++        original_add_parser = action.add_parser
++
++        def add_parser(*p_args, **p_kwargs):
++            # Extract any user-specified parser_class; we'll apply it by
++            # temporarily setting action._parser_class so we don't pass
++            # unknown kwargs to the parser constructor.
++            requested_parser_class = p_kwargs.pop("parser_class", None)
++            original_parser_class = getattr(action, "_parser_class", None)
++            # Determine target parser class: user-specified, existing action
++            # _parser_class, or default to this CommandParser's type.
++            target_parser_class = (
++                requested_parser_class
++                or original_parser_class
++                or type(self)
++            )
++            # Temporarily set the action's parser class so original_add_parser
++            # constructs the correct parser without receiving a parser_class kwarg.
++            action._parser_class = target_parser_class
++
++            try:
++                parser = original_add_parser(*p_args, **p_kwargs)
++            finally:
++                # Restore the action's original parser class.
++                if original_parser_class is None:
++                    if hasattr(action, "_parser_class"):
++                        try:
++                            delattr(action, "_parser_class")
++                        except Exception:
++                            action._parser_class = None
++                else:
++                    action._parser_class = original_parser_class
++
++            # Inject CommandParser-specific attributes on the created parser
++            # instance (instead of passing them to the constructor) so we don't
++            # risk providing unexpected kwargs to other parser classes.
++            try:
++                is_command_parser = isinstance(parser, CommandParser)
++            except Exception:
++                is_command_parser = False
++
++            if is_command_parser:
++                if getattr(parser, "missing_args_message", None) is None:
++                    parser.missing_args_message = getattr(self, "missing_args_message", None)
++                if getattr(parser, "called_from_command_line", None) is None:
++                    parser.called_from_command_line = getattr(self, "called_from_command_line", None)
++
++            return parser
++
++        action.add_parser = add_parser
++        return action
++
+ 
+ def handle_default_options(options):
+     """
+@@ -86,7 +145,6 @@ def handle_default_options(options):
+ 
+ def no_translations(handle_func):
+     """Decorator that forces a command to run with translations deactivated."""
+-
+     def wrapper(*args, **kwargs):
+         from django.utils import translation
+ 
+@@ -241,8 +299,6 @@ class BaseCommand:
+         A tuple of any options the command uses which aren't defined by the
+         argument parser.
+     """
+-
+-    # Metadata about this command.
+     help = ""
+ 
+     # Configuration shortcuts that alter various logic.

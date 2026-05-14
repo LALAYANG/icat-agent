@@ -1,0 +1,106 @@
+diff --git a/django/contrib/admin/models.py b/django/contrib/admin/models.py
+index a0fbb02afd..5c29b5b5b8 100644
+--- a/django/contrib/admin/models.py
++++ b/django/contrib/admin/models.py
+@@ -25,7 +25,7 @@ class LogEntryManager(models.Manager):
+ 
+     def log_action(self, user_id, content_type_id, object_id, object_repr, action_flag, change_message=''):
+         if isinstance(change_message, list):
+-            change_message = json.dumps(change_message)
++            change_message = json.dumps(change_message, ensure_ascii=False)
+         return self.model.objects.create(
+             user_id=user_id,
+             content_type_id=content_type_id,
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index bea685966e..a672e8121e 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1204,7 +1204,7 @@ class ModelAdmin(BaseModelAdmin):
+             popup_response_data = json.dumps({
+                 'value': str(value),
+                 'obj': str(obj),
+-            })
++            }, ensure_ascii=False)
+             return TemplateResponse(request, self.popup_response_template or [
+                 'admin/%s/%s/popup_response.html' % (opts.app_label, opts.model_name),
+                 'admin/%s/popup_response.html' % opts.app_label,
+@@ -1264,7 +1264,7 @@ class ModelAdmin(BaseModelAdmin):
+                 'value': str(value),
+                 'obj': str(obj),
+                 'new_value': str(new_value),
+-            })
++            }, ensure_ascii=False)
+             return TemplateResponse(request, self.popup_response_template or [
+                 'admin/%s/%s/popup_response.html' % (opts.app_label, opts.model_name),
+                 'admin/%s/popup_response.html' % opts.app_label,
+@@ -1427,7 +1427,7 @@ class ModelAdmin(BaseModelAdmin):
+             popup_response_data = json.dumps({
+                 'action': 'delete',
+                 'value': str(obj_id),
+-            })
++            }, ensure_ascii=False)
+             return TemplateResponse(request, self.popup_response_template or [
+                 'admin/%s/%s/popup_response.html' % (opts.app_label, opts.model_name),
+                 'admin/%s/popup_response.html' % opts.app_label,
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index a249f4cdbf..cf0fbad998 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -81,7 +81,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+     def get_prep_value(self, value):
+         if value is None:
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def get_transform(self, name):
+         transform = super().get_transform(name)
+@@ -92,7 +92,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+     def validate(self, value, model_instance):
+         super().validate(value, model_instance)
+         try:
+-            json.dumps(value, cls=self.encoder)
++            json.dumps(value, cls=self.encoder, ensure_ascii=False)
+         except TypeError:
+             raise exceptions.ValidationError(
+                 self.error_messages['invalid'],
+@@ -119,7 +119,7 @@ def compile_json_path(key_transforms, include_root=True):
+             num = int(key_transform)
+         except ValueError:  # non-integer
+             path.append('.')
+-            path.append(json.dumps(key_transform))
++            path.append(json.dumps(key_transform, ensure_ascii=False))
+         else:
+             path.append('[%s]' % num)
+     return ''.join(path)
+@@ -380,7 +380,7 @@ class KeyTransformIn(lookups.In):
+                     function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
+                     func.append("%s('%s', '$.value')" % (
+                         function,
+-                        json.dumps({'value': value}),
++                        json.dumps({'value': value}, ensure_ascii=False),
+                     ))
+                 func = tuple(func)
+                 rhs_params = ()
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 9de2c60b35..8ba0013871 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1258,7 +1258,7 @@ class JSONField(CharField):
+     def prepare_value(self, value):
+         if isinstance(value, InvalidJSONInput):
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def has_changed(self, initial, data):
+         if super().has_changed(initial, data):
+@@ -1266,6 +1266,6 @@ class JSONField(CharField):
+         # For purposes of seeing whether something has changed, True isn't the
+         # same as 1 and the order of keys doesn't matter.
+         return (
+-            json.dumps(initial, sort_keys=True, cls=self.encoder) !=
+-            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder)
++            json.dumps(initial, sort_keys=True, cls=self.encoder, ensure_ascii=False) !=
++            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder, ensure_ascii=False)
+         )

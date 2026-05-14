@@ -1,0 +1,42 @@
+diff --git a/sympy/sets/handlers/issubset.py b/sympy/sets/handlers/issubset.py
+index fdca06025a..6bc104c5e0 100644
+--- a/sympy/sets/handlers/issubset.py
++++ b/sympy/sets/handlers/issubset.py
+@@ -1,7 +1,7 @@
+ from sympy import S, Symbol
+ from sympy.core.logic import fuzzy_and, fuzzy_bool, fuzzy_not, fuzzy_or
+ from sympy.core.relational import Eq
+-from sympy.sets.sets import FiniteSet, Interval, Set, Union
++from sympy.sets.sets import FiniteSet, Interval, ProductSet, Set, Union
+ from sympy.sets.fancysets import Complexes, Reals, Range, Rationals
+ from sympy.multipledispatch import dispatch
+ 
+@@ -133,3 +133,9 @@ def is_subset_sets(a, b): # noqa:F811
+ @dispatch(Rationals, Range)  # type: ignore # noqa:F811
+ def is_subset_sets(a, b): # noqa:F811
+     return False
++
++@dispatch(ProductSet, FiniteSet)  # type: ignore # noqa:F811
++def is_subset_sets(a, b): # noqa:F811
++    # If the ProductSet is finite, check if all its elements are in the FiniteSet
++    if a.is_finite_set and a.is_iterable:
++        return fuzzy_and(b._contains(e) for e in a)
+diff --git a/sympy/sets/sets.py b/sympy/sets/sets.py
+index 3c4aa86e36..3395031d0f 100644
+--- a/sympy/sets/sets.py
++++ b/sympy/sets/sets.py
+@@ -1606,6 +1606,14 @@ def is_finite_set(self):
+         elif a_finite is False and B.is_finite_set:
+             return False
+ 
++    def equals(self, other):
++        if isinstance(other, Complement):
++            return self.args == other.args
++        # A complement equals 0 if it is the empty set
++        if other == 0:
++            return self == S.EmptySet
++        return None
++
+     def __iter__(self):
+         A, B = self.args
+         for a in A:

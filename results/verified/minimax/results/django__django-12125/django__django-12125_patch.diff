@@ -1,0 +1,21 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..f67b49483c 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -269,7 +269,15 @@ class TypeSerializer(BaseSerializer):
+             if module == builtins.__name__:
+                 return self.value.__name__, set()
+             else:
+-                return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
++                # Use qualified name (includes enclosing class names) so nested
++                # classes are correctly referenced (e.g. pkg.module.Outer.Inner).
++                # If the qualname contains '<' (e.g. local <locals> classes),
++                # fall back to using __name__ to preserve historical behavior.
++                qualname = getattr(self.value, "__qualname__", self.value.__name__)
++                if '<' in qualname:
++                    # Cannot use qualname for local classes; fall back to __name__
++                    return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
++                return "%s.%s" % (module, qualname), {"import %s" % module}
+ 
+ 
+ class UUIDSerializer(BaseSerializer):

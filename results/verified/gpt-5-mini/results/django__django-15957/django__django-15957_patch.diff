@@ -1,0 +1,39 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index be0deb90b0..e249c6aed3 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -2162,6 +2162,10 @@ class Prefetch:
+ 
+         self.queryset = queryset
+         self.to_attr = to_attr
++        # Store slice info for sliced querysets
++        self.slice = None
++        if queryset is not None and queryset.query.is_sliced:
++            self.slice = slice(queryset.query.low_mark, queryset.query.high_mark)
+ 
+     def __getstate__(self):
+         obj_dict = self.__dict__.copy()
+@@ -2188,6 +2192,12 @@ class Prefetch:
+ 
+     def get_current_queryset(self, level):
+         if self.get_current_prefetch_to(level) == self.prefetch_to:
++            if self.slice:
++                # Return a cloned queryset with the slice removed so that
++                # filtering can be applied in get_prefetch_queryset.
++                queryset = self.queryset._chain()
++                queryset.query.clear_limits()
++                return queryset
+             return self.queryset
+         return None
+ 
+@@ -2500,6 +2510,10 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+         instance_attr_val = instance_attr(obj)
+         vals = rel_obj_cache.get(instance_attr_val, [])
+ 
++        # Apply slice if the queryset was sliced
++        if lookup.slice:
++            vals = vals[lookup.slice]
++
+         if single:
+             val = vals[0] if vals else None
+             if as_attr:

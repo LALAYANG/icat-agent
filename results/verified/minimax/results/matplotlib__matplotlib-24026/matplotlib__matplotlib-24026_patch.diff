@@ -1,0 +1,23 @@
+diff --git a/lib/matplotlib/stackplot.py b/lib/matplotlib/stackplot.py
+index c580043eeb..2397804933 100644
+--- a/lib/matplotlib/stackplot.py
++++ b/lib/matplotlib/stackplot.py
+@@ -8,7 +8,7 @@ https://stackoverflow.com/q/2225995/
+ 
+ import numpy as np
+ 
+-from matplotlib import _api
++from matplotlib import _api, colors as mcolors
+ 
+ __all__ = ['stackplot']
+ 
+@@ -70,6 +70,9 @@ def stackplot(axes, x, *args,
+ 
+     labels = iter(labels)
+     if colors is not None:
++        # Resolve CN colors to actual RGBA to avoid passing cycle references
++        # to set_prop_cycle, which does not accept them.
++        colors = [mcolors.to_rgba(c) for c in colors]
+         axes.set_prop_cycle(color=colors)
+ 
+     # Assume data passed has not been 'stacked', so stack it here.

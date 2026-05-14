@@ -1,0 +1,45 @@
+diff --git a/sklearn/model_selection/_search.py b/sklearn/model_selection/_search.py
+index 99d6096af..2bbc55982 100644
+--- a/sklearn/model_selection/_search.py
++++ b/sklearn/model_selection/_search.py
+@@ -34,6 +34,7 @@ from ..utils import check_random_state
+ from ..utils.fixes import sp_version
+ from ..utils.fixes import MaskedArray
+ from ..utils.random import sample_without_replacement
++import time
+ from ..utils.validation import indexable, check_is_fitted
+ from ..utils.metaestimators import if_delegate_has_method
+ from ..utils.deprecation import DeprecationDict
+@@ -756,7 +757,6 @@ class BaseSearchCV(six.with_metaclass(ABCMeta, BaseEstimator,
+ 
+         # For multi-metric evaluation, store the best_index_, best_params_ and
+         # best_score_ iff refit is one of the scorer names
+-        # In single metric evaluation, refit_metric is "score"
+         if self.refit or not self.multimetric_:
+             self.best_index_ = results["rank_test_%s" % refit_metric].argmin()
+             self.best_params_ = candidate_params[self.best_index_]
+@@ -766,10 +766,15 @@ class BaseSearchCV(six.with_metaclass(ABCMeta, BaseEstimator,
+         if self.refit:
+             self.best_estimator_ = clone(base_estimator).set_params(
+                 **self.best_params_)
++            # Refit the best estimator on the whole dataset and record time
++            start_time = time.time()
+             if y is not None:
+                 self.best_estimator_.fit(X, y, **fit_params)
+             else:
+                 self.best_estimator_.fit(X, **fit_params)
++            end_time = time.time()
++            # Time in seconds to refit the best estimator on the whole dataset
++            self.refit_time_ = end_time - start_time
+ 
+         # Store the only scorer not as a dict for single metric evaluation
+         self.scorer_ = scorers if self.multimetric_ else scorers['score']
+@@ -804,8 +809,6 @@ class BaseSearchCV(six.with_metaclass(ABCMeta, BaseEstimator,
+             grid_scores.append(_CVScoreTuple(params, mean, scores))
+ 
+         return grid_scores
+-
+-
+ class GridSearchCV(BaseSearchCV):
+     """Exhaustive search over specified parameter values for an estimator.
+ 

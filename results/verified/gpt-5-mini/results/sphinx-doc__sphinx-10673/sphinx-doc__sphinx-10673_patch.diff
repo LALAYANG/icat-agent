@@ -1,0 +1,89 @@
+diff --git a/sphinx/directives/other.py b/sphinx/directives/other.py
+index 35e16e623..2cb2059fa 100644
+--- a/sphinx/directives/other.py
++++ b/sphinx/directives/other.py
+@@ -119,16 +119,23 @@ class TocTree(SphinxDirective):
+                 if url_re.match(ref) or ref == 'self':
+                     toctree['entries'].append((title, ref))
+                 elif docname not in self.env.found_docs:
+-                    if excluded(self.env.doc2path(docname, False)):
++                    if self.env.is_special_document(docname):
++                        # Allow special documents (genindex, search, py-modindex, etc.)
++                        toctree['entries'].append((title, docname))
++                    elif excluded(self.env.doc2path(docname, False)):
+                         message = __('toctree contains reference to excluded document %r')
+                         subtype = 'excluded'
++
++                        logger.warning(message, docname, type='toc', subtype=subtype,
++                                       location=toctree)
++                        self.env.note_reread()
+                     else:
+                         message = __('toctree contains reference to nonexisting document %r')
+                         subtype = 'not_readable'
+ 
+-                    logger.warning(message, docname, type='toc', subtype=subtype,
+-                                   location=toctree)
+-                    self.env.note_reread()
++                        logger.warning(message, docname, type='toc', subtype=subtype,
++                                       location=toctree)
++                        self.env.note_reread()
+                 else:
+                     if docname in all_docnames:
+                         all_docnames.remove(docname)
+diff --git a/sphinx/environment/__init__.py b/sphinx/environment/__init__.py
+index 1a1dd755f..4eb4a0914 100644
+--- a/sphinx/environment/__init__.py
++++ b/sphinx/environment/__init__.py
+@@ -508,6 +508,26 @@ class BuildEnvironment:
+         except KeyError as exc:
+             raise ExtensionError(__('Domain %r is not registered') % domainname) from exc
+ 
++    def is_special_document(self, docname: str) -> bool:
++        """Check if a document is a special Sphinx-generated page.
++
++        These include 'genindex', 'modindex', 'search', and domain indices like 'py-modindex'.
++        """
++        if docname in ('genindex', 'modindex', 'search'):
++            return True
++
++        # Check for domain indices (e.g., py-modindex)
++        if '-' in docname:
++            domain_name = docname.split('-')[0]
++            if domain_name in self.domains:
++                domain = self.domains[domain_name]
++                index_name = docname[len(domain_name) + 1:]
++                for index in domain.indices:
++                    if index.name == index_name:
++                        return True
++
++        return False
++
+     # --------- RESOLVING REFERENCES AND TOCTREES ------------------------------
+ 
+     def get_doctree(self, docname: str) -> nodes.document:
+diff --git a/sphinx/environment/adapters/toctree.py b/sphinx/environment/adapters/toctree.py
+index 9678e3c7c..3480df5fa 100644
+--- a/sphinx/environment/adapters/toctree.py
++++ b/sphinx/environment/adapters/toctree.py
+@@ -165,14 +165,18 @@ class TocTree:
+                                        ref, location=toctreenode)
+                 except KeyError:
+                     # this is raised if the included file does not exist
+-                    if excluded(self.env.doc2path(ref, False)):
++                    if self.env.is_special_document(ref):
++                        # Skip warning for special documents (genindex, search, py-modindex, etc.)
++                        pass
++                    elif excluded(self.env.doc2path(ref, False)):
+                         message = __('toctree contains reference to excluded document %r')
++                        logger.warning(message, ref, location=toctreenode)
+                     elif not included(self.env.doc2path(ref, False)):
+                         message = __('toctree contains reference to non-included document %r')
++                        logger.warning(message, ref, location=toctreenode)
+                     else:
+                         message = __('toctree contains reference to nonexisting document %r')
+-
+-                    logger.warning(message, ref, location=toctreenode)
++                        logger.warning(message, ref, location=toctreenode)
+                 else:
+                     # if titles_only is given, only keep the main title and
+                     # sub-toctrees

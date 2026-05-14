@@ -1,0 +1,43 @@
+diff --git a/lib/matplotlib/figure.py b/lib/matplotlib/figure.py
+index f8aa99d48a..1122faec40 100644
+--- a/lib/matplotlib/figure.py
++++ b/lib/matplotlib/figure.py
+@@ -220,8 +220,16 @@ class FigureBase(Artist):
+                         child.apply_aspect(pos)
+                     else:
+                         child.apply_aspect()
+-        return artists
+ 
++        # Exclude artists that belong to invisible axes. When artists are added
++        # to an Axes, they are also assigned that Axes' figure; therefore
++        # Figure.get_children() may include artists whose ``axes`` attribute
++        # points to an Axes that is not visible. Drawing those artists
++        # directly from the Figure would bypass the Axes' visibility check
++        # (particularly problematic for mpl_toolkits.mplot3d artists).
++        artists = [a for a in artists if getattr(a, 'axes', None) is None
++                   or a.axes.get_visible()]
++        return artists
+     def autofmt_xdate(
+             self, bottom=0.2, rotation=30, ha='right', which='major'):
+         """
+diff --git a/lib/mpl_toolkits/mplot3d/axes3d.py b/lib/mpl_toolkits/mplot3d/axes3d.py
+index 9db44b7994..f722708bfe 100644
+--- a/lib/mpl_toolkits/mplot3d/axes3d.py
++++ b/lib/mpl_toolkits/mplot3d/axes3d.py
+@@ -387,6 +387,16 @@ class Axes3D(Axes):
+ 
+     @martist.allow_rasterization
+     def draw(self, renderer):
++        """Draw the 3D axes.
++
++        Honor the visibility flag and ensure a renderer is provided, matching
++        the behavior of the 2D Axes draw method.
++        """
++        if renderer is None:
++            raise RuntimeError('No renderer defined')
++        if not self.get_visible():
++            return
++
+         self._unstale_viewLim()
+ 
+         # draw the background patch

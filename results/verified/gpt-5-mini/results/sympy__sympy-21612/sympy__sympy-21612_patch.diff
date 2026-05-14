@@ -1,0 +1,16 @@
+diff --git a/sympy/parsing/latex/_parse_latex_antlr.py b/sympy/parsing/latex/_parse_latex_antlr.py
+index 2e4a45ad20..4648acf4a9 100644
+--- a/sympy/parsing/latex/_parse_latex_antlr.py
++++ b/sympy/parsing/latex/_parse_latex_antlr.py
+@@ -382,6 +382,11 @@ def convert_frac(frac):
+ 
+     expr_top = convert_expr(frac.upper)
+     expr_bot = convert_expr(frac.lower)
++    # If expr_bot is a Mul, wrap it in a tuple to ensure proper parentheses
++    # in the output. This fixes nested fractions like \frac{\frac{a^3+b}{c}}{\frac{1}{c^2}}
++    # which should become ((a**3 + b)/c)/(1/(c**2)) not ((a**3 + b)/c)/1/(c**2).
++    if isinstance(expr_bot, sympy.Mul):
++        expr_bot = (expr_bot,)
+     inverse_denom = sympy.Pow(expr_bot, -1, evaluate=False)
+     if expr_top == 1:
+         return inverse_denom

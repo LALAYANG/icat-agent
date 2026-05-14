@@ -1,0 +1,37 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..b0e340220b 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -569,6 +569,14 @@ class Model(metaclass=ModelBase):
+         return getattr(self, meta.pk.attname)
+ 
+     def _set_pk_val(self, value):
++        if value is None:
++            for parent, parent_link in self._meta.parents.items():
++                if parent_link:
++                    # Clear the child link field (e.g., item_ptr_id)
++                    setattr(self, parent_link.attname, value)
++                    # Also clear the parent pk (e.g., uid)
++                    setattr(self, parent._meta.pk.attname, value)
++            self._state.pk_is_reset = True
+         return setattr(self, self._meta.pk.attname, value)
+ 
+     pk = property(_get_pk_val, _set_pk_val)
+@@ -804,9 +812,14 @@ class Model(metaclass=ModelBase):
+         inserted = False
+         for parent, field in meta.parents.items():
+             # Make sure the link fields are synced between parent and self.
+-            if (field and getattr(self, parent._meta.pk.attname) is None and
+-                    getattr(self, field.attname) is not None):
+-                setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
++            if field:
++                parent_pk_val = getattr(self, parent._meta.pk.attname)
++                child_link_val = getattr(self, field.attname)
++                # Skip if pk was explicitly reset to None (for both new and loaded objects).
++                pk_reset = getattr(self._state, 'pk_is_reset', False)
++                if (not pk_reset and self._state.adding and 
++                        parent_pk_val is None and child_link_val is not None):
++                    setattr(self, parent._meta.pk.attname, child_link_val)
+             parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)
+             updated = self._save_table(
+                 cls=parent, using=using, update_fields=update_fields,

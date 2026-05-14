@@ -1,0 +1,32 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..4327244068 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -71,6 +71,27 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, *args, **kwargs):
++        """
++        Override ArgumentParser.add_subparsers to ensure that subparsers are
++        instances of CommandParser (or the current parser class) and that the
++        CommandParser-specific kwargs (missing_args_message and
++        called_from_command_line) are propagated to those subparsers. This
++        prevents missing required arguments on subcommands from raising
++        unhandled exceptions instead of displaying a friendly usage message.
++        """
++        # Extract any provided parser_class; default to this parser's class.
++        parser_cls = kwargs.pop("parser_class", None) or self.__class__
++
++        def make_parser_class(*p_args, **p_kwargs):
++            # Inject CommandParser-specific defaults into created subparsers.
++            p_kwargs.setdefault("missing_args_message", getattr(self, "missing_args_message", None))
++            p_kwargs.setdefault("called_from_command_line", getattr(self, "called_from_command_line", None))
++            return parser_cls(*p_args, **p_kwargs)
++
++        kwargs["parser_class"] = make_parser_class
++        return super().add_subparsers(*args, **kwargs)
++
+ 
+ def handle_default_options(options):
+     """

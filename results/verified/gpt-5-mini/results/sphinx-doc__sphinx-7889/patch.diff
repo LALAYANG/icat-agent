@@ -1,0 +1,42 @@
+diff --git a/sphinx/ext/autodoc/mock.py b/sphinx/ext/autodoc/mock.py
+index 98a3a3a96..92b99e4ba 100644
+--- a/sphinx/ext/autodoc/mock.py
++++ b/sphinx/ext/autodoc/mock.py
+@@ -70,10 +70,35 @@ class _MockObject:
+ 
+ def _make_subclass(name: str, module: str, superclass: Any = _MockObject,
+                    attributes: Any = None) -> Any:
+-    attrs = {'__module__': module, '__display_name__': module + '.' + name}
++    # Ensure the class name is a string. Sometimes `name` can be a
++    # typing.TypeVar or other non-str object (e.g. when generics are used),
++    # which would raise TypeError when concatenating with strings or when
++    # passing to `type()` as the class name. Try to use a sensible
++    # identifier if available, otherwise fall back to str(name).
++    if isinstance(name, str):
++        name_str = name
++    else:
++        name_str = getattr(name, "__name__", None) or str(name)
++
++    # Coerce module/display name to string as well to be safe.
++    if isinstance(module, str):
++        module_str = module
++    else:
++        module_str = getattr(module, "__display_name__", None) or str(module)
++
++    # Make sure the class name is a valid identifier for `type()`.
++    # If not, create a safe fallback name.
++    if not name_str.isidentifier():
++        # Filter to ASCII letters, digits and underscore
++        filtered = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name_str)
++        if not filtered or not filtered[0].isalpha():
++            filtered = "Mock_" + filtered
++        name_str = filtered
++
++    attrs = {"__module__": module_str, "__display_name__": module_str + "." + name_str}
+     attrs.update(attributes or {})
+ 
+-    return type(name, (superclass,), attrs)
++    return type(name_str, (superclass,), attrs)
+ 
+ 
+ class _MockModule(ModuleType):

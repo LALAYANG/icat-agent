@@ -1,0 +1,19 @@
+diff --git a/requests/sessions.py b/requests/sessions.py
+index 3f59cab9..30c88ead 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -293,9 +293,12 @@ class SessionRedirectMixin(object):
+         except KeyError:
+             username, password = None, None
+ 
+-        if username and password:
++        # If a username is present we should set Proxy-Authorization even if the
++        # password is empty. This mirrors the behavior in
++        # HTTPAdapter.proxy_headers where the header is set when username is
++        # truthy.
++        if username:
+             headers['Proxy-Authorization'] = _basic_auth_str(username, password)
+-
+         return new_proxies
+ 
+     def rebuild_method(self, prepared_request, response):

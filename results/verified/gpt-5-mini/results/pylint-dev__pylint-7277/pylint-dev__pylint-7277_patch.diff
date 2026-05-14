@@ -1,0 +1,43 @@
+diff --git a/pylint/__init__.py b/pylint/__init__.py
+index 9f3dd74e..acfaeca3 100644
+--- a/pylint/__init__.py
++++ b/pylint/__init__.py
+@@ -81,6 +81,7 @@ def modify_sys_path() -> None:
+     """Modify sys path for execution as Python module.
+ 
+     Strip out the current working directory from sys.path.
++
+     Having the working directory in `sys.path` means that `pylint` might
+     inadvertently import user code from modules having the same name as
+     stdlib or pylint's own modules.
+@@ -96,13 +97,26 @@ def modify_sys_path() -> None:
+       if pylint is installed in an editable configuration (as the last item).
+       https://github.com/PyCQA/pylint/issues/4161
+     """
+-    sys.path.pop(0)
+     env_pythonpath = os.environ.get("PYTHONPATH", "")
+     cwd = os.getcwd()
++
++    initial_popped = False
++    # Only remove the first entry if it is the cwd markers ("", ".") or the cwd
++    if sys.path:
++        first = sys.path[0]
++        if first in ("", ".", cwd):
++            sys.path.pop(0)
++            initial_popped = True
++
++    # If PYTHONPATH starts with ':' it can cause an extra cwd entry to appear.
++    # Remove that entry only if it actually matches one of the cwd markers.
+     if env_pythonpath.startswith(":") and env_pythonpath not in (f":{cwd}", ":."):
+-        sys.path.pop(0)
++        target_index = 0 if initial_popped else 1
++        if len(sys.path) > target_index and sys.path[target_index] in (cwd, ".", ""):
++            sys.path.pop(target_index)
+     elif env_pythonpath.endswith(":") and env_pythonpath not in (f"{cwd}:", ".:"):
+-        sys.path.pop(1)
+-
++        target_index = 1 if initial_popped else 2
++        if len(sys.path) > target_index and sys.path[target_index] in (cwd, ".", ""):
++            sys.path.pop(target_index)
+ 
+ version = __version__

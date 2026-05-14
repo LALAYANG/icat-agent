@@ -1,0 +1,50 @@
+diff --git a/sympy/physics/quantum/dagger.py b/sympy/physics/quantum/dagger.py
+index 17da3cfd2c..f75871c92a 100644
+--- a/sympy/physics/quantum/dagger.py
++++ b/sympy/physics/quantum/dagger.py
+@@ -85,5 +85,11 @@ def __new__(cls, arg):
+             return obj
+         return Expr.__new__(cls, arg)
+ 
+-adjoint.__name__ = "Dagger"
+-adjoint._sympyrepr = lambda a, b: "Dagger(%s)" % b._print(a.args[0])
++    def __mul__(self, other):
++        from sympy.physics.quantum.operator import IdentityOperator
++        if isinstance(other, IdentityOperator):
++            return self
++        return Expr.__mul__(self, other)
++
++    adjoint.__name__ = "Dagger"
++    adjoint._sympyrepr = lambda a, b: "Dagger(%s)" % b._print(a.args[0])
+diff --git a/sympy/physics/quantum/operator.py b/sympy/physics/quantum/operator.py
+index 306bfee64f..84cd6d45d8 100644
+--- a/sympy/physics/quantum/operator.py
++++ b/sympy/physics/quantum/operator.py
+@@ -268,6 +268,8 @@ class IdentityOperator(Operator):
+     def dimension(self):
+         return self.N
+ 
++    _op_priority = 11.0
++
+     @classmethod
+     def default_args(self):
+         return (oo,)
+@@ -306,11 +308,14 @@ def _print_contents_latex(self, printer, *args):
+         return r'{\mathcal{I}}'
+ 
+     def __mul__(self, other):
++        if isinstance(other, IdentityOperator):
++            return self
++        return other
+ 
+-        if isinstance(other, Operator):
+-            return other
+-
+-        return Mul(self, other)
++    def __rmul__(self, other):
++        if isinstance(other, IdentityOperator):
++            return self
++        return other
+ 
+     def _represent_default_basis(self, **options):
+         if not self.N or self.N == oo:

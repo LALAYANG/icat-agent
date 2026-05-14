@@ -1,0 +1,23 @@
+diff --git a/sympy/sets/contains.py b/sympy/sets/contains.py
+index b2d4268d12..99a25438aa 100644
+--- a/sympy/sets/contains.py
++++ b/sympy/sets/contains.py
+@@ -45,4 +45,18 @@ def binary_symbols(self):
+             isinstance(i, (Eq, Ne))])
+ 
+     def as_set(self):
++        """Return a set representing the values of the (symbol) for which
++        this Contains is true.
++
++        If the first argument is a single Symbol, we can return the
++        underlying set directly (e.g. Contains(x, S.Reals).as_set() -> S.Reals).
++        For other, more complicated expressions, rewriting Contains as a set
++        is not implemented.
++        """
++        a, s = self.args
++        # If the element is a simple symbol, the set of values that make
++        # Contains true is just the set itself.
++        if a.is_Symbol:
++            return s
++        # Rewriting arbitrary expressions as sets is not implemented yet.
+         raise NotImplementedError()

