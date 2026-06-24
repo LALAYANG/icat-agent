@@ -405,6 +405,23 @@ class CostTracker:
                 input_tokens = getattr(usage, 'input_tokens', 0)
                 output_tokens = getattr(usage, 'output_tokens', 0)
 
+        # Extract prompt-cache token counts from the actual response, across providers:
+        #  - Anthropic (direct or via litellm): usage_dict.cache_read/creation_input_tokens
+        #  - Normalized LangChain usage_metadata.input_token_details (Anthropic + OpenAI)
+        #  - OpenAI: prompt_tokens_details.cached_tokens (no separate creation count)
+        cache_read, cache_creation = 0, 0
+        if usage_dict:
+            cache_read = int(usage_dict.get('cache_read_input_tokens', 0) or 0)
+            cache_creation = int(usage_dict.get('cache_creation_input_tokens', 0) or 0)
+        if not cache_read and hasattr(response, 'usage_metadata'):
+            um = response.usage_metadata
+            details = (um.get('input_token_details') if isinstance(um, dict) else None) or {}
+            cache_read = int(details.get('cache_read', 0) or 0)
+            cache_creation = int(details.get('cache_creation', 0) or cache_creation)
+        if not cache_read and usage_dict:
+            ptd = usage_dict.get('prompt_tokens_details') or {}
+            cache_read = int(ptd.get('cached_tokens', 0) or 0)
+
         # Calculate cost
         # Try OpenRouter's raw captured cost first (most accurate)
         openrouter_cost = get_openrouter_cost()
@@ -420,7 +437,8 @@ class CostTracker:
                 model,
             )
 
-        return self._update_stats(input_tokens, output_tokens, cost, model, metadata)
+        return self._update_stats(input_tokens, output_tokens, cost, model, metadata,
+                                  cache_read=cache_read, cache_creation=cache_creation)
 
     def add_call(self, model: str, input_tokens: int, output_tokens: int,
                  metadata: Optional[Dict] = None, cost: Optional[float] = None) -> Dict[str, Any]:
@@ -432,7 +450,8 @@ class CostTracker:
         return self._update_stats(input_tokens, output_tokens, cost, model, metadata)
 
     def _update_stats(self, input_tokens: int, output_tokens: int, cost: float,
-                      model: str, metadata: Optional[Dict] = None) -> Dict[str, Any]:
+                      model: str, metadata: Optional[Dict] = None,
+                      cache_read: int = 0, cache_creation: int = 0) -> Dict[str, Any]:
         with _global_stats_lock:
             _global_stats.total_cost += cost
             _global_stats.total_tokens_sent += input_tokens
@@ -444,16 +463,16 @@ class CostTracker:
         self.stats.tokens_received += output_tokens
         self.stats.api_calls += 1
 
-        # Capture cache info from the most recent OpenRouter response (if any)
-        cache_read = 0
-        cache_creation = 0
-        try:
-            raw = _openrouter_capture.last_raw_usage or {}
-            details = raw.get("prompt_tokens_details") or {}
-            cache_read = int(details.get("cached_tokens") or raw.get("cache_read_input_tokens") or 0)
-            cache_creation = int(raw.get("cache_creation_input_tokens") or 0)
-        except Exception:
-            pass
+        # Cache counts are extracted from the response by the caller (all providers).
+        # Fall back to the most recent OpenRouter raw usage only if none were passed.
+        if not cache_read and not cache_creation:
+            try:
+                raw = _openrouter_capture.last_raw_usage or {}
+                details = raw.get("prompt_tokens_details") or {}
+                cache_read = int(details.get("cached_tokens") or raw.get("cache_read_input_tokens") or 0)
+                cache_creation = int(raw.get("cache_creation_input_tokens") or 0)
+            except Exception:
+                pass
 
         call_record = {
             "timestamp": datetime.now().isoformat(),

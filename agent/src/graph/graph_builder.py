@@ -1257,7 +1257,10 @@ def localizer_node(state: dict) -> dict:
     # SKIP LOGIC: When feasibility is HIGH, skip localizer
     # ==========================================================================
     feasibility_status = state.get("feasibility_status", "")
-    feasibility_score = state.get("feasibility_score", 0.0)
+    # `.get(..., 0.0)` does NOT apply when the key exists with value None
+    # (e.g. triage mode sets feasibility_status but not feasibility_score),
+    # so coerce None -> 0.0 to keep the `:.3f` formatting below from crashing.
+    feasibility_score = state.get("feasibility_score") or 0.0
     feasibility_details = state.get("feasibility_details", {})
 
     if feasibility_status == "HIGH" and not state.get("force_localizer", False):

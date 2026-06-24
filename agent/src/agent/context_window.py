@@ -406,34 +406,63 @@ Provide a concise summary (max 300 words):"""
         return f"Completed {len(turns_to_summarize)} exploration steps."
 
     def _is_anthropic_model(self) -> bool:
-        """Check if the current model is an Anthropic model."""
+        """Check if the current model is an Anthropic model (direct or via OpenRouter)."""
         return "claude" in self.model_name.lower() or "anthropic" in self.model_name.lower()
 
-    def _set_cache_control(self, message: BaseMessage) -> None:
-        """Add Anthropic cache_control to a message's content.
+    def _cache_strategy(self) -> str:
+        """Prompt-cache strategy for the current model's provider.
 
-        We add BOTH the cache_control field AND a text marker. The field is the
-        official mechanism (used by direct Anthropic / litellm). The marker is a
-        fallback for langchain's ChatOpenAI path, which strips cache_control
-        during serialization — a request hook in agent/utils re-injects
-        cache_control on the wire when it sees the marker.
+        - 'marker': OpenRouter → Anthropic. langchain's ChatOpenAI strips the
+          cache_control field during serialization, so we smuggle a text marker
+          (CACHE_CONTROL_MARKER) that a request hook in agent/utils re-injects as
+          a real cache_control field on the wire.
+        - 'field' : direct Anthropic (anthropic:*). langchain-anthropic forwards
+          real cache_control blocks, so we set the field and add NO marker
+          (the marker would be dead text that wastes tokens and is never stripped).
+        - 'none'  : OpenAI (automatic caching — no cache_control needed) or any
+          other provider, or caching disabled.
         """
-        from .utils import CACHE_CONTROL_MARKER
+        if not self.config.enable_prompt_caching:
+            return "none"
+        name = self.model_name.lower()
+        is_anthropic = "claude" in name or "anthropic" in name
+        if name.startswith("openrouter/"):
+            return "marker" if is_anthropic else "none"
+        if is_anthropic:
+            return "field"
+        return "none"
+
+    def _set_cache_control(self, message: BaseMessage, use_marker: bool = False) -> None:
+        """Add a prompt-cache breakpoint to a message's content.
+
+        Always sets the real `cache_control` field. Only when ``use_marker`` is
+        True (the OpenRouter → Anthropic path) does it also embed the text marker
+        that the agent/utils request hook converts back into cache_control on the
+        wire. On the direct Anthropic path the field is forwarded as-is, so no
+        marker is added.
+        """
         content = message.content
+        marker_prefix = ""
+        if use_marker:
+            from .utils import CACHE_CONTROL_MARKER
+            marker_prefix = CACHE_CONTROL_MARKER + " "
+
         if isinstance(content, str):
-            merged = (CACHE_CONTROL_MARKER + " " + content).rstrip()
+            text = (marker_prefix + content).rstrip() if marker_prefix else content
             message.content = [
                 {"type": "text",
-                 "text": merged,
+                 "text": text,
                  "cache_control": {"type": "ephemeral"}}
             ]
         elif isinstance(content, list):
             if content and isinstance(content[-1], dict):
                 last = content[-1]
                 last["cache_control"] = {"type": "ephemeral"}
-                txt = last.get("text")
-                if isinstance(txt, str) and CACHE_CONTROL_MARKER not in txt:
-                    last["text"] = (CACHE_CONTROL_MARKER + " " + txt).rstrip()
+                if use_marker:
+                    from .utils import CACHE_CONTROL_MARKER
+                    txt = last.get("text")
+                    if isinstance(txt, str) and CACHE_CONTROL_MARKER not in txt:
+                        last["text"] = (CACHE_CONTROL_MARKER + " " + txt).rstrip()
 
     def _clear_cache_control(self, message: BaseMessage) -> None:
         """Remove cache_control from a message's content."""
@@ -538,18 +567,20 @@ Provide a concise summary (max 300 words):"""
         from copy import deepcopy
 
         messages = []
-        is_anthropic = self._is_anthropic_model() and self.config.enable_prompt_caching
+        cache_strategy = self._cache_strategy()
+        add_cache = cache_strategy in ("field", "marker")
+        use_marker = cache_strategy == "marker"
 
         if self.system_message:
-            msg = deepcopy(self.system_message.message) if is_anthropic else self.system_message.message
-            if is_anthropic:
-                self._set_cache_control(msg)
+            msg = deepcopy(self.system_message.message) if add_cache else self.system_message.message
+            if add_cache:
+                self._set_cache_control(msg, use_marker)
             messages.append(msg)
 
         if self.plan_message:
-            msg = deepcopy(self.plan_message.message) if is_anthropic else self.plan_message.message
-            if is_anthropic:
-                self._set_cache_control(msg)
+            msg = deepcopy(self.plan_message.message) if add_cache else self.plan_message.message
+            if add_cache:
+                self._set_cache_control(msg, use_marker)
             messages.append(msg)
 
         for summary in self.summaries:
@@ -575,7 +606,7 @@ Provide a concise summary (max 300 words):"""
         #                 subsequent turns.
         #   4. last     — current-tail breakpoint. Writes a cache that next turn
         #                 can match against (same content, with appended new msgs).
-        if is_anthropic and messages:
+        if add_cache and messages:
             from copy import deepcopy as _deepcopy
 
             # Clear any stale cache_control AND the smuggled marker from
@@ -592,7 +623,7 @@ Provide a concise summary (max 300 words):"""
 
             # 1+2: system + plan (first 2 entries in messages list).
             for msg in messages[:2]:
-                self._set_cache_control(msg)
+                self._set_cache_control(msg, use_marker)
 
             # 3: tail breakpoint on the very last message (next turn will hit it).
             # NOTE: only 4 cache_control blocks total are allowed by Anthropic.
@@ -601,7 +632,7 @@ Provide a concise summary (max 300 words):"""
             if messages:
                 if isinstance(messages[-1].content, str):
                     messages[-1] = _deepcopy(messages[-1])
-                self._set_cache_control(messages[-1])
+                self._set_cache_control(messages[-1], use_marker)
 
         return messages
 
