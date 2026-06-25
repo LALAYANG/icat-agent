@@ -153,3 +153,20 @@ def sample_repo(tmp_path) -> Path:
 @pytest.fixture
 def local_env(sample_repo) -> LocalShellEnv:
     return LocalShellEnv(str(sample_repo))
+
+
+@pytest.fixture
+def git_repo(sample_repo) -> Path:
+    """sample_repo initialized as a git repo with one commit (so `git diff` works)."""
+    for cmd in [
+        "git init -q",
+        "git -c user.email=t@t.io -c user.name=test add -A",
+        "git -c user.email=t@t.io -c user.name=test commit -q -m init",
+    ]:
+        subprocess.run(["bash", "-c", cmd], cwd=sample_repo, env=_TEST_ENV, capture_output=True)
+    return sample_repo
+
+
+@pytest.fixture
+def git_env(git_repo) -> LocalShellEnv:
+    return LocalShellEnv(str(git_repo))

@@ -361,44 +361,71 @@ class PatchEditorAgent:
 
         return None  # no build system detected, skip
 
+    def _add_loop_message(self, msg):
+        """Append a message to the window manager (if enabled) or the raw list."""
+        if self.window_manager:
+            self.window_manager.add_message(msg)
+        else:
+            self.messages.append(msg)
+
+    def _emit_step_nudges(self, step):
+        """Append step-budget reminders (25/50/75/90%) and last-minute nudges."""
+        milestones = {int(self.max_steps * f): int(f * 100) for f in (0.25, 0.50, 0.75, 0.90)}
+        if step in milestones:
+            self._add_loop_message(HumanMessage(content=(
+                f"This is step {step} ({milestones[step]}%), you still have "
+                f"{self.max_steps - step} remaining steps before submission."
+            )))
+        if step == self.max_steps - 5:
+            self._add_loop_message(HumanMessage(content=(
+                "You are running low on steps. Finalize your patch now — generate the unified diff and submit."
+            )))
+        elif step == self.max_steps - 2:
+            self._add_loop_message(HumanMessage(content=(
+                "URGENT: Submit your patch NOW. Generate the unified diff and finish immediately."
+            )))
+
+    def _emit_convergence_nudges(self):
+        """Nudge the model when it re-reads files without editing (per-file + global)."""
+        # Per-file: a file re-read 10+ times past the last nudge (no intervening edit).
+        for _fp, _cnt in list(self._file_view_counts.items()):
+            _last = self._file_last_nudge.get(_fp, 0)
+            if _cnt >= _last + 10:
+                self._file_last_nudge[_fp] = _cnt
+                self.logger.warning(f"[ConvergenceMonitor] Nudging: {_fp} viewed {_cnt} times without edit")
+                self._add_loop_message(HumanMessage(content=(
+                    f"NUDGE: You have reviewed {_fp} {_cnt} times. "
+                    f"This may indicate you're stuck in a loop. Please carefully "
+                    f"decide your next step — reflect on what you've learned and "
+                    f"whether continuing to inspect this file is the right move. "
+                    f"You should be more effective and efficient for the next step."
+                )))
+
+        # Global: excessive viewing without any edit at all.
+        if self._total_view_without_edit >= self._total_view_nudge_threshold:
+            total_views = self._total_view_without_edit
+            self.logger.warning(f"[ConvergenceMonitor] Global nudge: {total_views} views without any edit")
+            self._add_loop_message(HumanMessage(content=(
+                f"WARNING: You have performed {total_views} file viewing operations "
+                f"(view_file, grep_content, view_symbol, view_outline) without making "
+                f"a single edit. You should avoid repeatedly viewing files without doing "
+                f"anything. You should reason and act more meaningfully — based on what "
+                f"you have already read, formulate a concrete fix and use edit_file to "
+                f"implement it. Continuing to only read files wastes your budget."
+            )))
+            # Escalate the threshold for the next global nudge (20, 30, 40, ...).
+            self._total_view_nudge_threshold = total_views + 10
+
     def _run_loop(self):
         """Internal run loop after Docker is initialized. Step limit + cost control."""
         modified_files = []
-
-        # Step budget milestones for reminders
-        budget_milestones = {
-            int(self.max_steps * 0.25): lambda s: f"This is step {s} (25%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.50): lambda s: f"This is step {s} (50%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.75): lambda s: f"This is step {s} (75%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.90): lambda s: f"This is step {s} (90%), you still have {self.max_steps - s} remaining steps before submission.",
-        }
 
         step = 0
         while step < self.max_steps:
             step += 1
             self.logger.info(f"Step {step}/{self.max_steps}")
 
-            # Step budget reminders
-            if step in budget_milestones:
-                nudge_msg = HumanMessage(content=budget_milestones[step](step))
-                if self.window_manager:
-                    self.window_manager.add_message(nudge_msg)
-                else:
-                    self.messages.append(nudge_msg)
-
-            # Progressive nudges to encourage submission (keep existing last-minute nudges)
-            if step == self.max_steps - 5:
-                nudge_msg = HumanMessage(content="You are running low on steps. Finalize your patch now — generate the unified diff and submit.")
-                if self.window_manager:
-                    self.window_manager.add_message(nudge_msg)
-                else:
-                    self.messages.append(nudge_msg)
-            elif step == self.max_steps - 2:
-                nudge_msg = HumanMessage(content="URGENT: Submit your patch NOW. Generate the unified diff and finish immediately.")
-                if self.window_manager:
-                    self.window_manager.add_message(nudge_msg)
-                else:
-                    self.messages.append(nudge_msg)
+            self._emit_step_nudges(step)
 
             # Auto-inject messages from other agents every step (N=1)
             self._inject_bus_messages()
@@ -656,45 +683,7 @@ class PatchEditorAgent:
                     self.messages.append(resp)
                     self.messages.extend(msgs)
 
-                # Convergence monitor: if any file has been re-read 10+ times past
-                # the last nudge (without an intervening edit), append a nudge.
-                for _fp, _cnt in list(self._file_view_counts.items()):
-                    _last = self._file_last_nudge.get(_fp, 0)
-                    if _cnt >= _last + 10:
-                        self._file_last_nudge[_fp] = _cnt
-                        nudge = HumanMessage(content=(
-                            f"NUDGE: You have reviewed {_fp} {_cnt} times. "
-                            f"This may indicate you're stuck in a loop. Please carefully "
-                            f"decide your next step — reflect on what you've learned and "
-                            f"whether continuing to inspect this file is the right move. "
-                            f"You should be more effective and efficient for the next step."
-                        ))
-                        self.logger.warning(f"[ConvergenceMonitor] Nudging: {_fp} viewed {_cnt} times without edit")
-                        if self.window_manager:
-                            self.window_manager.add_message(nudge)
-                        else:
-                            self.messages.append(nudge)
-
-                # Global convergence monitor: detect excessive viewing without any edits.
-                if self._total_view_without_edit >= self._total_view_nudge_threshold:
-                    total_views = self._total_view_without_edit
-                    global_nudge = HumanMessage(content=(
-                        f"WARNING: You have performed {total_views} file viewing operations "
-                        f"(view_file, grep_content, view_symbol, view_outline) without making "
-                        f"a single edit. You should avoid repeatedly viewing files without doing "
-                        f"anything. You should reason and act more meaningfully — based on what "
-                        f"you have already read, formulate a concrete fix and use edit_file to "
-                        f"implement it. Continuing to only read files wastes your budget."
-                    ))
-                    self.logger.warning(
-                        f"[ConvergenceMonitor] Global nudge: {total_views} views without any edit"
-                    )
-                    if self.window_manager:
-                        self.window_manager.add_message(global_nudge)
-                    else:
-                        self.messages.append(global_nudge)
-                    # Increase threshold for next nudge (escalating: 20, 30, 40, ...)
-                    self._total_view_nudge_threshold = total_views + 10
+                self._emit_convergence_nudges()
 
                 # Auto-exit: if we've made edits + shared patch + got validation
                 if self._validation_passed and self._has_made_edits:
