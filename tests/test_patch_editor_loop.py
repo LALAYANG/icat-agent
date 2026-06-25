@@ -5,15 +5,16 @@ edit-tracking, DONE parsing, diff generation, empty-response and cost-limit path
 This is the coverage that makes the Phase 7 god-method split verifiable.
 """
 from agent.patch_editor_agent import PatchEditorAgent
+from agent.context_sharing import AgentMessageBus
 from conftest import SimpleFakeChat, ai, tool_call
 
 
-def _make_editor(git_env, tmp_path, responses, max_steps=5, max_cost=100.0):
+def _make_editor(git_env, tmp_path, responses, max_steps=5, max_cost=100.0, message_bus=None):
     agent = PatchEditorAgent(
         repo_path=git_env.repo_path, commit="x", problem="fix it",
         instance_id="t", log_path=str(tmp_path / "pe.log"), log_dir=str(tmp_path),
         model_name="anthropic:claude-sonnet-4-5", max_steps=max_steps,
-        max_cost=max_cost, message_bus=None,
+        max_cost=max_cost, message_bus=message_bus,
     )
     agent.docker_env = git_env
     agent._setup_tools()
@@ -52,6 +53,40 @@ def test_empty_responses_auto_submit_after_edits(git_env, tmp_path):
     ])
     result = agent._run_loop()
     assert "pkg/core.py" in result["patch_editor_modified_file"]
+    assert result["done_count"] == 1
+
+
+def test_validation_wait_passed_returns(git_env, tmp_path):
+    # With a message bus, the DONE path posts the patch and polls for validation.
+    # Pre-post a PASSING validation so the poll returns on round 0 (no sleep).
+    bus = AgentMessageBus()
+    bus.post("reproducer", "validation_complete", {"status": "all tests passed"})
+    agent = _make_editor(git_env, tmp_path, [
+        ai(tool_calls=[tool_call("search_replace", {
+            "path": "pkg/core.py", "old_text": "hello {name}", "new_text": "ok {name}"})]),
+        ai(content="DONE: pkg/core.py"),
+    ], message_bus=bus)
+    result = agent._run_loop()
+    assert "pkg/core.py" in result["patch_editor_modified_file"]
+    assert result["done_count"] == 1
+    # the patch was shared on the bus
+    assert bus.get_latest("patch_generated") is not None
+
+
+def test_validation_wait_failed_injects_refinement(git_env, tmp_path):
+    # A FAILING validation should inject a refinement message and loop back.
+    bus = AgentMessageBus()
+    bus.post("reproducer", "validation_complete", {"status": "FAILED: 2 tests still fail"})
+    agent = _make_editor(git_env, tmp_path, [
+        ai(tool_calls=[tool_call("search_replace", {
+            "path": "pkg/core.py", "old_text": "hello {name}", "new_text": "no {name}"})]),
+        ai(content="DONE: pkg/core.py"),   # step 2: triggers failed validation -> continue
+    ], max_steps=2, message_bus=bus)
+    result = agent._run_loop()
+    # loop exited via safety fallback after the refinement; a refine message was injected
+    msgs = agent.window_manager.get_messages() if agent.window_manager else agent.messages
+    joined = " ".join(str(getattr(m, "content", "")) for m in msgs)
+    assert "VALIDATION RESULTS FROM REPRODUCER" in joined
     assert result["done_count"] == 1
 
 

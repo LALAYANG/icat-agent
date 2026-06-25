@@ -16,6 +16,11 @@ from .tools import (
     make_share_findings, make_check_findings,
 )
 
+# Sentinel returned by _handle_final_output to ask the run loop to `continue`
+# (e.g. validation failed -> resume to refine the patch).
+_CONTINUE_LOOP = object()
+
+
 class PatchEditorAgent:
     def __init__(
         self,
@@ -385,6 +390,115 @@ class PatchEditorAgent:
                 "URGENT: Submit your patch NOW. Generate the unified diff and finish immediately."
             )))
 
+    def _handle_final_output(self, resp, modified_files):
+        """Handle a completion response (DONE: / modified_target+patch).
+
+        Generates the unified diff, optionally shares it and waits for the
+        reproducer's validation, and returns:
+        - a result dict to return from the run loop (done / passed / timeout),
+        - the ``_CONTINUE_LOOP`` sentinel to resume the loop (validation failed),
+        - or None if ``resp`` is not a completion signal.
+        """
+        txt = llm_text(resp)
+        if not ("DONE:" in txt or ("modified_target" in txt and "patch" in txt)):
+            return None
+
+        # Extract done files and patch description
+        done_files = modified_files.copy()  # Files we tracked
+        patch_desc = txt
+
+        if "DONE:" in txt:
+            done_part = txt.split("DONE:")[1].split("\n")[0]
+            done_files_from_text = [f.strip() for f in done_part.split(",") if f.strip()]
+            if done_files_from_text:
+                done_files = done_files_from_text
+            if "PATCH:" in txt:
+                patch_desc = txt.split("PATCH:")[1].strip()
+
+        # Generate unified diff
+        unified_diff = self._generate_unified_diff()
+
+        # Warn about possible silent write failure
+        if done_files and not unified_diff:
+            self.logger.warning(
+                f"[EmptyDiff] Modified files {done_files} but unified diff is EMPTY. "
+                f"Possible silent write failure (heredoc corruption, base64 issue, or file not in git tracking)."
+            )
+
+        # Save unified diff to shared context
+        if unified_diff:
+            self.shared_context.set_unified_diff(unified_diff)
+            # Share patch with other agents (reproducer will validate it)
+            # Skip if _auto_share_diff already posted the same diff
+            if self.message_bus:
+                if not hasattr(self, '_last_shared_diff') or self._last_shared_diff != unified_diff:
+                    self._last_shared_diff = unified_diff
+                    self.message_bus.post("patch_editor", "patch_generated", unified_diff)
+                    self.logger.info("[PatchEditor] Shared patch with other agents via message bus")
+
+                # Wait for validation result from reproducer
+                # The reproducer needs time to: apply patch, run tests, report back
+                self.logger.info("[PatchEditor] Waiting for validation from reproducer...")
+                import time as _time
+                validation_status = None  # None=timeout, "passed", "failed"
+                validation_detail = ""
+                for _wait_round in range(36):  # Up to 180 seconds (36 x 5s)
+                    # Check all possible validation message types
+                    for msg_type in ("validation_complete", "patch_validation", "test_results"):
+                        msg = self.message_bus.get_latest(msg_type)
+                        if msg:
+                            msg_data = msg.get("data", {})
+                            if isinstance(msg_data, dict):
+                                msg_str = msg_data.get("status", str(msg_data))
+                                validation_detail = msg_data.get("detailed_output", "") or msg_data.get("output", "") or str(msg_data)
+                            else:
+                                msg_str = str(msg_data)
+                                validation_detail = msg_str
+                            self.logger.info(f"[PatchEditor] Got {msg_type}: {msg_str}")
+                            validation_status = "failed" if "fail" in msg_str.lower() else "passed"
+                            break
+                    if validation_status is not None:
+                        break
+                    self.logger.info(f"[PatchEditor] Waiting for reproducer validation... ({(_wait_round+1)*5}s)")
+                    _time.sleep(5)
+
+                if validation_status == "failed":
+                    # Validation FAILED — inject feedback and loop back for refinement
+                    self.logger.info("[PatchEditor] Validation FAILED - attempting refinement")
+                    refine_msg = HumanMessage(
+                        content=(
+                            f"[VALIDATION RESULTS FROM REPRODUCER]\n"
+                            f"Status: FAILED\n"
+                            f"Output:\n{validation_detail[:3000]}\n\n"
+                            f"Your patch did NOT fix the bug. The reproducer applied your patch "
+                            f"and re-ran the tests — they still fail.\n"
+                            f"Please analyze the failure, make corrected edits, "
+                            f"and respond with DONE: again."
+                        )
+                    )
+                    if self.window_manager:
+                        self.window_manager.add_message(resp, increment_turn=True)
+                        self.window_manager.add_message(refine_msg)
+                    else:
+                        self.messages.append(resp)
+                        self.messages.append(refine_msg)
+                    return _CONTINUE_LOOP  # Go back to while-loop for refinement
+                elif validation_status == "passed":
+                    self.logger.info("[PatchEditor] Validation PASSED — done")
+                else:
+                    self.logger.info("[PatchEditor] No validation received after 180s timeout")
+
+        result = {
+            "patch_editor_modified_file": done_files if done_files else ["(none)"],
+            "patch_editor_patch": [patch_desc] if patch_desc else ["(none)"],
+            "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
+            "done_count": 1,
+        }
+        self._log_window_stats_on_exit()
+        self.detailed_log.log_result(result)
+        self.logger.info(f"Patch editing complete: {done_files}")
+        return result
+
     def _emit_convergence_nudges(self):
         """Nudge the model when it re-reads files without editing (per-file + global)."""
         # Per-file: a file re-read 10+ times past the last nudge (no intervening edit).
@@ -701,106 +815,14 @@ class PatchEditorAgent:
 
                 continue
 
-            # Check for final output
-            txt = llm_text(resp)
-
-            # Look for DONE: format (new) or modified_target/patch format (old)
-            if "DONE:" in txt or ("modified_target" in txt and "patch" in txt):
-                # Extract done files and patch description
-                done_files = modified_files.copy()  # Files we tracked
-                patch_desc = txt
-
-                if "DONE:" in txt:
-                    done_part = txt.split("DONE:")[1].split("\n")[0]
-                    done_files_from_text = [f.strip() for f in done_part.split(",") if f.strip()]
-                    if done_files_from_text:
-                        done_files = done_files_from_text
-                    if "PATCH:" in txt:
-                        patch_desc = txt.split("PATCH:")[1].strip()
-
-                # Generate unified diff
-                unified_diff = self._generate_unified_diff()
-
-                # Warn about possible silent write failure
-                if done_files and not unified_diff:
-                    self.logger.warning(
-                        f"[EmptyDiff] Modified files {done_files} but unified diff is EMPTY. "
-                        f"Possible silent write failure (heredoc corruption, base64 issue, or file not in git tracking)."
-                    )
-
-                # Save unified diff to shared context
-                if unified_diff:
-                    self.shared_context.set_unified_diff(unified_diff)
-                    # Share patch with other agents (reproducer will validate it)
-                    # Skip if _auto_share_diff already posted the same diff
-                    if self.message_bus:
-                        if not hasattr(self, '_last_shared_diff') or self._last_shared_diff != unified_diff:
-                            self._last_shared_diff = unified_diff
-                            self.message_bus.post("patch_editor", "patch_generated", unified_diff)
-                            self.logger.info("[PatchEditor] Shared patch with other agents via message bus")
-
-                        # Wait for validation result from reproducer
-                        # The reproducer needs time to: apply patch, run tests, report back
-                        self.logger.info("[PatchEditor] Waiting for validation from reproducer...")
-                        import time as _time
-                        validation_status = None  # None=timeout, "passed", "failed"
-                        validation_detail = ""
-                        for _wait_round in range(36):  # Up to 180 seconds (36 x 5s)
-                            # Check all possible validation message types
-                            for msg_type in ("validation_complete", "patch_validation", "test_results"):
-                                msg = self.message_bus.get_latest(msg_type)
-                                if msg:
-                                    msg_data = msg.get("data", {})
-                                    if isinstance(msg_data, dict):
-                                        msg_str = msg_data.get("status", str(msg_data))
-                                        validation_detail = msg_data.get("detailed_output", "") or msg_data.get("output", "") or str(msg_data)
-                                    else:
-                                        msg_str = str(msg_data)
-                                        validation_detail = msg_str
-                                    self.logger.info(f"[PatchEditor] Got {msg_type}: {msg_str}")
-                                    validation_status = "failed" if "fail" in msg_str.lower() else "passed"
-                                    break
-                            if validation_status is not None:
-                                break
-                            self.logger.info(f"[PatchEditor] Waiting for reproducer validation... ({(_wait_round+1)*5}s)")
-                            _time.sleep(5)
-
-                        if validation_status == "failed":
-                            # Validation FAILED — inject feedback and loop back for refinement
-                            self.logger.info("[PatchEditor] Validation FAILED - attempting refinement")
-                            refine_msg = HumanMessage(
-                                content=(
-                                    f"[VALIDATION RESULTS FROM REPRODUCER]\n"
-                                    f"Status: FAILED\n"
-                                    f"Output:\n{validation_detail[:3000]}\n\n"
-                                    f"Your patch did NOT fix the bug. The reproducer applied your patch "
-                                    f"and re-ran the tests — they still fail.\n"
-                                    f"Please analyze the failure, make corrected edits, "
-                                    f"and respond with DONE: again."
-                                )
-                            )
-                            if self.window_manager:
-                                self.window_manager.add_message(resp, increment_turn=True)
-                                self.window_manager.add_message(refine_msg)
-                            else:
-                                self.messages.append(resp)
-                                self.messages.append(refine_msg)
-                            continue  # Go back to while-loop for refinement
-                        elif validation_status == "passed":
-                            self.logger.info("[PatchEditor] Validation PASSED — done")
-                        else:
-                            self.logger.info("[PatchEditor] No validation received after 180s timeout")
-
-                result = {
-                    "patch_editor_modified_file": done_files if done_files else ["(none)"],
-                    "patch_editor_patch": [patch_desc] if patch_desc else ["(none)"],
-                    "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
-                    "done_count": 1,
-                }
-                self._log_window_stats_on_exit()
-                self.detailed_log.log_result(result)
-                self.logger.info(f"Patch editing complete: {done_files}")
-                return result
+            # Check for final output (DONE:/modified_target). Returns the result
+            # dict to finish, _CONTINUE_LOOP to refine after a failed validation,
+            # or None if this isn't a completion signal.
+            final = self._handle_final_output(resp, modified_files)
+            if final is _CONTINUE_LOOP:
+                continue
+            if final is not None:
+                return final
 
             # Skip empty responses to avoid context bloat and wasted LLM calls
             resp_text = llm_text(resp)
