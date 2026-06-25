@@ -390,6 +390,219 @@ class PatchEditorAgent:
                 "URGENT: Submit your patch NOW. Generate the unified diff and finish immediately."
             )))
 
+    def _handle_tool_calls(self, resp, modified_files):
+        """Execute the LLM's tool calls: dispatch, track edits/convergence,
+        handle the share-findings validation handshake, and append results.
+
+        Returns a result dict to finish (validation passed after sharing),
+        the _CONTINUE_LOOP sentinel after a normal tool turn, or None if the
+        response has no tool calls (caller falls through to final-output).
+        """
+        if not getattr(resp, "tool_calls", None):
+            return None
+        msgs = []
+        for c in resp.tool_calls:
+            fn = {
+                self.list_dir.name: self.list_dir,
+                self.view_file.name: self.view_file,
+                self.edit_file.name: self.edit_file,
+                self.search_replace.name: self.search_replace,
+                self.view_symbol.name: self.view_symbol,
+                self.view_outline.name: self.view_outline,
+                self.grep_content.name: self.grep_content,
+                self.trace_call_chain.name: self.trace_call_chain,
+                self.share_findings.name: self.share_findings,
+                self.check_findings.name: self.check_findings,
+            }.get(c["name"])
+
+            if fn:
+                try:
+                    out = fn.invoke(c["args"])
+                    self.detailed_log.log_tool_call(c["name"], c["args"], out)
+                    self.logger.info(f"Tool {c['name']} called with {c['args']}")
+
+                    # Convergence monitor: track repeated reads per file.
+                    _path_arg = c["args"].get("path") if isinstance(c["args"], dict) else None
+                    if _path_arg:
+                        if c["name"] in ("view_file", "view_outline", "view_symbol", "grep_content"):
+                            self._file_view_counts[_path_arg] = self._file_view_counts.get(_path_arg, 0) + 1
+                            self._total_view_without_edit += 1
+                        elif c["name"] in ("edit_file", "search_replace"):
+                            # An edit resets the read counter and the nudge state for this file.
+                            self._file_view_counts.pop(_path_arg, None)
+                            self._file_last_nudge.pop(_path_arg, None)
+                            self._total_view_without_edit = 0
+                            self._total_view_nudge_threshold = 80  # Reset threshold
+
+                    # Track modified files and shared findings
+                    if c["name"] in ("edit_file", "search_replace") and "path" in c["args"]:
+                        modified_files.append(c["args"]["path"])
+                        self._has_made_edits = True
+                    elif c["name"] == "share_findings" and self._has_made_edits:
+                        self._patch_shared = True
+                        if self.message_bus and c["args"].get("finding_type") == "patch_generated":
+                            # Step 1: Build check
+                            build_error = self._run_build_check()
+                            if build_error:
+                                out += f"\n\n{build_error}\nFix the build errors before submitting the patch."
+                                self.message_bus.post("patch_editor", "build_failed", build_error)
+                                self.logger.warning(f"[PatchEditor] Build check failed, not posting diff")
+                                self._patch_shared = False
+                                # Don't block — let agent see error and fix
+                            else:
+                                # Step 2: Post diff
+                                try:
+                                    unified_diff = self._generate_unified_diff()
+                                    if unified_diff:
+                                        self.message_bus.post("patch_editor", "patch_generated", unified_diff)
+                                        self.logger.info("[PatchEditor] Auto-posted unified diff to bus")
+                                except Exception as e:
+                                    self.logger.warning(f"[PatchEditor] Failed to auto-post diff: {e}")
+
+                                # Step 3: Block-wait for reproducer validation (zero LLM cost)
+                                # Polls message bus every 5s. Exits on:
+                                #   - validation_passed/failed/complete from reproducer
+                                #   - reproducer_done signal (reproducer finished/died)
+                                #   - timeout after 1200s
+                                import time as _time
+                                self.logger.info("[PatchEditor] Waiting for reproducer validation (idle, zero cost)...")
+                                wait_result = None
+                                wait_detail = ""
+                                max_wait_seconds = 1200
+                                wait_start = _time.time()
+                                last_log = wait_start
+
+                                while _time.time() - wait_start < max_wait_seconds:
+                                    _time.sleep(5)
+                                    elapsed = _time.time() - wait_start
+
+                                    # Log progress every 300s
+                                    if _time.time() - last_log >= 300:
+                                        self.logger.info(f"[PatchEditor] Still waiting for validation ({int(elapsed)}s elapsed)...")
+                                        last_log = _time.time()
+
+                                    if not self.message_bus:
+                                        continue
+
+                                    # Read new messages since last check
+                                    new = self.message_bus.read(
+                                        since=self._last_bus_check_time,
+                                        exclude_from="patch_editor",
+                                    )
+
+                                    # Also scan ALL messages for reproducer_done (may have been
+                                    # posted before our poll window started)
+                                    all_msgs = self.message_bus.read(exclude_from="patch_editor")
+                                    reproducer_dead = any(
+                                        m["type"] in ("reproducer_done", "reproducer_complete")
+                                        for m in all_msgs
+                                    )
+
+                                    for m in new:
+                                        msg_type = m["type"]
+                                        data_str = str(m.get("data", ""))
+
+                                        # Validation signals
+                                        if msg_type in ("validation_complete", "validation_passed", "validation_failed"):
+                                            if msg_type == "validation_passed" or "validated_passed" in data_str:
+                                                wait_result = "passed"
+                                            else:
+                                                wait_result = "failed"
+                                                wait_detail = data_str[:3000]
+                                            self._last_bus_check_time = _time.time()
+                                            break
+
+                                    # Check if reproducer is done (from full message scan)
+                                    if not wait_result and reproducer_dead:
+                                        self.logger.info("[PatchEditor] Reproducer finished — stopping wait")
+                                        # Check if there's a validation message we missed
+                                        for m in all_msgs:
+                                            if m["type"] in ("validation_failed", "validation_complete"):
+                                                data_str = str(m.get("data", ""))
+                                                if "validated_passed" in data_str:
+                                                    wait_result = "passed"
+                                                else:
+                                                    wait_result = "failed"
+                                                    wait_detail = data_str[:3000]
+                                                break
+                                        if not wait_result:
+                                            wait_result = "reproducer_done"
+
+                                    if wait_result:
+                                        break
+
+                                if wait_result == "passed":
+                                    self._validation_passed = True
+                                    self.logger.info("[PatchEditor] Validation PASSED — exiting")
+                                    unified_diff = self._generate_unified_diff()
+                                    result = {
+                                        "patch_editor_modified_file": modified_files if modified_files else ["(none)"],
+                                        "patch_editor_patch": ["Validation passed"],
+                                        "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
+                                        "done_count": 1,
+                                    }
+                                    self._log_window_stats_on_exit()
+                                    self.detailed_log.log_result(result)
+                                    return result
+                                elif wait_result == "failed":
+                                    self._validation_failure_count += 1
+                                    self.logger.info(f"[PatchEditor] Validation FAILED (attempt {self._validation_failure_count}) — resuming to revise patch")
+                                    failure_msg = HumanMessage(content=(
+                                        f"[VALIDATION FAILED from reproducer — attempt {self._validation_failure_count}]\n{wait_detail}\n\n"
+                                        "There are validation failures. You should carefully revise your patch and reflect on what went wrong before trying again."
+                                    ))
+                                    if self.window_manager:
+                                        self.window_manager.add_message(failure_msg)
+                                    else:
+                                        self.messages.append(failure_msg)
+                                    self._patch_shared = False
+                                    self._inject_bus_messages()
+                                elif wait_result == "reproducer_done":
+                                    self.logger.info("[PatchEditor] Reproducer done — injecting any remaining feedback and resuming")
+                                    self._patch_shared = False
+                                    self._inject_bus_messages()
+                                else:
+                                    self.logger.info("[PatchEditor] No validation after 1200s — resuming")
+
+                    # REAL-TIME CONTEXT SHARING: Update shared context after relevant tool calls
+                    self._share_tool_findings(c["name"], c["args"], out)
+
+                    msgs.append(ToolMessage(f"OBSERVATION:\n{out}", tool_call_id=c["id"]))
+                except Exception as e:
+                    error_msg = f"Tool error: {str(e)}"
+                    self.logger.error(error_msg)
+                    self.detailed_log.log_error(e, f"Tool {c['name']}")
+                    msgs.append(ToolMessage(f"OBSERVATION:\n{error_msg}", tool_call_id=c["id"]))
+            else:
+                self.logger.warning(f"Unknown tool: {c['name']}")
+
+        # Add messages to window manager or raw list
+        if self.window_manager:
+            self.window_manager.add_message(resp, increment_turn=True)
+            for tm in msgs:
+                self.window_manager.add_message(tm)
+        else:
+            self.messages.append(resp)
+            self.messages.extend(msgs)
+
+        self._emit_convergence_nudges()
+
+        # Auto-exit: if we've made edits + shared patch + got validation
+        if self._validation_passed and self._has_made_edits:
+            self.logger.info("[PatchEditor] Auto-exit: validation passed after sharing patch")
+            unified_diff = self._generate_unified_diff()
+            result = {
+                "patch_editor_modified_file": modified_files if modified_files else ["(none)"],
+                "patch_editor_patch": ["Validation passed"],
+                "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
+                "done_count": 1,
+            }
+            self._log_window_stats_on_exit()
+            self.detailed_log.log_result(result)
+            return result
+
+        return _CONTINUE_LOOP
+
     def _handle_final_output(self, resp, modified_files):
         """Handle a completion response (DONE: / modified_target+patch).
 
@@ -611,209 +824,11 @@ class PatchEditorAgent:
                 self.detailed_log.log_error(e, f"Step {step}")
                 break
 
-            if getattr(resp, "tool_calls", None):
-                msgs = []
-                for c in resp.tool_calls:
-                    fn = {
-                        self.list_dir.name: self.list_dir,
-                        self.view_file.name: self.view_file,
-                        self.edit_file.name: self.edit_file,
-                        self.search_replace.name: self.search_replace,
-                        self.view_symbol.name: self.view_symbol,
-                        self.view_outline.name: self.view_outline,
-                        self.grep_content.name: self.grep_content,
-                        self.trace_call_chain.name: self.trace_call_chain,
-                        self.share_findings.name: self.share_findings,
-                        self.check_findings.name: self.check_findings,
-                    }.get(c["name"])
-
-                    if fn:
-                        try:
-                            out = fn.invoke(c["args"])
-                            self.detailed_log.log_tool_call(c["name"], c["args"], out)
-                            self.logger.info(f"Tool {c['name']} called with {c['args']}")
-
-                            # Convergence monitor: track repeated reads per file.
-                            _path_arg = c["args"].get("path") if isinstance(c["args"], dict) else None
-                            if _path_arg:
-                                if c["name"] in ("view_file", "view_outline", "view_symbol", "grep_content"):
-                                    self._file_view_counts[_path_arg] = self._file_view_counts.get(_path_arg, 0) + 1
-                                    self._total_view_without_edit += 1
-                                elif c["name"] in ("edit_file", "search_replace"):
-                                    # An edit resets the read counter and the nudge state for this file.
-                                    self._file_view_counts.pop(_path_arg, None)
-                                    self._file_last_nudge.pop(_path_arg, None)
-                                    self._total_view_without_edit = 0
-                                    self._total_view_nudge_threshold = 80  # Reset threshold
-
-                            # Track modified files and shared findings
-                            if c["name"] in ("edit_file", "search_replace") and "path" in c["args"]:
-                                modified_files.append(c["args"]["path"])
-                                self._has_made_edits = True
-                            elif c["name"] == "share_findings" and self._has_made_edits:
-                                self._patch_shared = True
-                                if self.message_bus and c["args"].get("finding_type") == "patch_generated":
-                                    # Step 1: Build check
-                                    build_error = self._run_build_check()
-                                    if build_error:
-                                        out += f"\n\n{build_error}\nFix the build errors before submitting the patch."
-                                        self.message_bus.post("patch_editor", "build_failed", build_error)
-                                        self.logger.warning(f"[PatchEditor] Build check failed, not posting diff")
-                                        self._patch_shared = False
-                                        # Don't block — let agent see error and fix
-                                    else:
-                                        # Step 2: Post diff
-                                        try:
-                                            unified_diff = self._generate_unified_diff()
-                                            if unified_diff:
-                                                self.message_bus.post("patch_editor", "patch_generated", unified_diff)
-                                                self.logger.info("[PatchEditor] Auto-posted unified diff to bus")
-                                        except Exception as e:
-                                            self.logger.warning(f"[PatchEditor] Failed to auto-post diff: {e}")
-
-                                        # Step 3: Block-wait for reproducer validation (zero LLM cost)
-                                        # Polls message bus every 5s. Exits on:
-                                        #   - validation_passed/failed/complete from reproducer
-                                        #   - reproducer_done signal (reproducer finished/died)
-                                        #   - timeout after 1200s
-                                        import time as _time
-                                        self.logger.info("[PatchEditor] Waiting for reproducer validation (idle, zero cost)...")
-                                        wait_result = None
-                                        wait_detail = ""
-                                        max_wait_seconds = 1200
-                                        wait_start = _time.time()
-                                        last_log = wait_start
-
-                                        while _time.time() - wait_start < max_wait_seconds:
-                                            _time.sleep(5)
-                                            elapsed = _time.time() - wait_start
-
-                                            # Log progress every 300s
-                                            if _time.time() - last_log >= 300:
-                                                self.logger.info(f"[PatchEditor] Still waiting for validation ({int(elapsed)}s elapsed)...")
-                                                last_log = _time.time()
-
-                                            if not self.message_bus:
-                                                continue
-
-                                            # Read new messages since last check
-                                            new = self.message_bus.read(
-                                                since=self._last_bus_check_time,
-                                                exclude_from="patch_editor",
-                                            )
-
-                                            # Also scan ALL messages for reproducer_done (may have been
-                                            # posted before our poll window started)
-                                            all_msgs = self.message_bus.read(exclude_from="patch_editor")
-                                            reproducer_dead = any(
-                                                m["type"] in ("reproducer_done", "reproducer_complete")
-                                                for m in all_msgs
-                                            )
-
-                                            for m in new:
-                                                msg_type = m["type"]
-                                                data_str = str(m.get("data", ""))
-
-                                                # Validation signals
-                                                if msg_type in ("validation_complete", "validation_passed", "validation_failed"):
-                                                    if msg_type == "validation_passed" or "validated_passed" in data_str:
-                                                        wait_result = "passed"
-                                                    else:
-                                                        wait_result = "failed"
-                                                        wait_detail = data_str[:3000]
-                                                    self._last_bus_check_time = _time.time()
-                                                    break
-
-                                            # Check if reproducer is done (from full message scan)
-                                            if not wait_result and reproducer_dead:
-                                                self.logger.info("[PatchEditor] Reproducer finished — stopping wait")
-                                                # Check if there's a validation message we missed
-                                                for m in all_msgs:
-                                                    if m["type"] in ("validation_failed", "validation_complete"):
-                                                        data_str = str(m.get("data", ""))
-                                                        if "validated_passed" in data_str:
-                                                            wait_result = "passed"
-                                                        else:
-                                                            wait_result = "failed"
-                                                            wait_detail = data_str[:3000]
-                                                        break
-                                                if not wait_result:
-                                                    wait_result = "reproducer_done"
-
-                                            if wait_result:
-                                                break
-
-                                        if wait_result == "passed":
-                                            self._validation_passed = True
-                                            self.logger.info("[PatchEditor] Validation PASSED — exiting")
-                                            unified_diff = self._generate_unified_diff()
-                                            result = {
-                                                "patch_editor_modified_file": modified_files if modified_files else ["(none)"],
-                                                "patch_editor_patch": ["Validation passed"],
-                                                "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
-                                                "done_count": 1,
-                                            }
-                                            self._log_window_stats_on_exit()
-                                            self.detailed_log.log_result(result)
-                                            return result
-                                        elif wait_result == "failed":
-                                            self._validation_failure_count += 1
-                                            self.logger.info(f"[PatchEditor] Validation FAILED (attempt {self._validation_failure_count}) — resuming to revise patch")
-                                            failure_msg = HumanMessage(content=(
-                                                f"[VALIDATION FAILED from reproducer — attempt {self._validation_failure_count}]\n{wait_detail}\n\n"
-                                                "There are validation failures. You should carefully revise your patch and reflect on what went wrong before trying again."
-                                            ))
-                                            if self.window_manager:
-                                                self.window_manager.add_message(failure_msg)
-                                            else:
-                                                self.messages.append(failure_msg)
-                                            self._patch_shared = False
-                                            self._inject_bus_messages()
-                                        elif wait_result == "reproducer_done":
-                                            self.logger.info("[PatchEditor] Reproducer done — injecting any remaining feedback and resuming")
-                                            self._patch_shared = False
-                                            self._inject_bus_messages()
-                                        else:
-                                            self.logger.info("[PatchEditor] No validation after 1200s — resuming")
-
-                            # REAL-TIME CONTEXT SHARING: Update shared context after relevant tool calls
-                            self._share_tool_findings(c["name"], c["args"], out)
-
-                            msgs.append(ToolMessage(f"OBSERVATION:\n{out}", tool_call_id=c["id"]))
-                        except Exception as e:
-                            error_msg = f"Tool error: {str(e)}"
-                            self.logger.error(error_msg)
-                            self.detailed_log.log_error(e, f"Tool {c['name']}")
-                            msgs.append(ToolMessage(f"OBSERVATION:\n{error_msg}", tool_call_id=c["id"]))
-                    else:
-                        self.logger.warning(f"Unknown tool: {c['name']}")
-
-                # Add messages to window manager or raw list
-                if self.window_manager:
-                    self.window_manager.add_message(resp, increment_turn=True)
-                    for tm in msgs:
-                        self.window_manager.add_message(tm)
-                else:
-                    self.messages.append(resp)
-                    self.messages.extend(msgs)
-
-                self._emit_convergence_nudges()
-
-                # Auto-exit: if we've made edits + shared patch + got validation
-                if self._validation_passed and self._has_made_edits:
-                    self.logger.info("[PatchEditor] Auto-exit: validation passed after sharing patch")
-                    unified_diff = self._generate_unified_diff()
-                    result = {
-                        "patch_editor_modified_file": modified_files if modified_files else ["(none)"],
-                        "patch_editor_patch": ["Validation passed"],
-                        "patch_editor_unified_diff": [unified_diff] if unified_diff else [],
-                        "done_count": 1,
-                    }
-                    self._log_window_stats_on_exit()
-                    self.detailed_log.log_result(result)
-                    return result
-
+            tool_result = self._handle_tool_calls(resp, modified_files)
+            if tool_result is _CONTINUE_LOOP:
                 continue
+            if tool_result is not None:
+                return tool_result
 
             # Check for final output (DONE:/modified_target). Returns the result
             # dict to finish, _CONTINUE_LOOP to refine after a failed validation,
