@@ -10,6 +10,7 @@ from .utils import DetailedLogger
 from .docker_env import DockerEnvironment
 from .context_sharing import SharedContextManager, AgentMessageBus
 from .context_window import create_window_manager
+from .prompt_loader import build_plan_message
 
 
 class BaseAgent:
@@ -92,24 +93,11 @@ class BaseAgent:
         initial_message = get_prompt_fn("initial_message", **system_kwargs) or ""
 
         self.window_manager.set_system_message(system_prompt)
-
-        if self.plan:
-            try:
-                import json as _json
-                plan_obj = _json.loads(self.plan) if isinstance(self.plan, str) else self.plan
-                plan_msg = get_prompt_fn(
-                    plan_key,
-                    **plan_obj,
-                )
-            except (ValueError, TypeError, AttributeError):
-                raw_key = plan_key + "_raw" if not plan_key.endswith("_raw") else plan_key
-                plan_msg = get_prompt_fn(raw_key, plan=self.plan)
-            if not plan_msg:
-                raise ValueError(f"Missing {self.ROLE}.{plan_key} in prompts.yaml")
-            self.window_manager.set_plan_message(initial_message + "\n\n" + plan_msg)
-        else:
-            no_plan_msg = get_prompt_fn(no_plan_key) or ""
-            self.window_manager.set_plan_message(initial_message + "\n\n" + no_plan_msg)
+        self.window_manager.set_plan_message(build_plan_message(
+            get_prompt_fn, self.plan, initial_message,
+            plan_key=plan_key, no_plan_key=no_plan_key,
+            missing_label=f"{self.ROLE}.{plan_key}",
+        ))
 
         self.messages = self.window_manager.get_messages()
 

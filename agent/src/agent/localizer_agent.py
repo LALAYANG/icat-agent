@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional
-from .utils import create_chat_model, enable_anthropic_tool_caching
+from .utils import create_chat_model, enable_anthropic_tool_caching, llm_text
 from .base_agent import BaseAgent
 from .context_sharing import AgentMessageBus
 from .prompt_loader import get_localizer_prompt
@@ -118,7 +118,7 @@ class LocalizerAgent(BaseAgent):
             except Exception:
                 break  # 3 consecutive errors, abort
 
-            response_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            response_text = llm_text(resp)
             self.detailed_log.log_llm_call(prompt_text, response_text, {"step": step, "has_tools": bool(getattr(resp, "tool_calls", None))}, raw_response=resp)
 
             if self.detailed_log.should_stop():
@@ -145,7 +145,7 @@ class LocalizerAgent(BaseAgent):
                 continue
 
             # Check for final output
-            text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            text = llm_text(resp)
             if "FINAL:" in text or "File:" in text:
                 files, rationale = [], ""
                 if "FINAL:" in text:

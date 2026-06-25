@@ -6,11 +6,11 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-from .utils import DetailedLogger, create_chat_model, enable_anthropic_tool_caching
+from .utils import DetailedLogger, create_chat_model, enable_anthropic_tool_caching, llm_text
 from .docker_env import DockerEnvironment
 from .context_sharing import SharedContextManager, AgentMessageBus
 from .context_window import SlidingWindowManager, create_window_manager
-from .prompt_loader import get_reproducer_prompt
+from .prompt_loader import get_reproducer_prompt, build_plan_message
 from .tools import (
     make_view_file, make_run_python, make_run_regression_tests,
     make_run_command, make_apply_patch,
@@ -150,41 +150,9 @@ class ReproducerAgent:
         # Initialize model
         self.model = create_chat_model(model_name)
 
-        # Create tools — all from shared factories in agent/tools.py
-        self.run_python = make_run_python(
-            self.docker_env,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
-        )
-        self.run_test, self.register_tests = make_run_regression_tests(
-            self.docker_env,
-            instance_id=self.instance_id,
-            available_tests=self.available_regression_tests,
-            detect_framework_fn=detect_framework if HAS_TEST_RUNNER else None,
-            test_commands=TEST_COMMANDS if HAS_TEST_RUNNER else None,
-            convert_test_name_fn=convert_test_name_for_framework,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda test, result, output: self.shared_context.add_regression_test_result("before", test, result, output),
-            message_bus=self.message_bus,
-        )
-        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=getattr(self, "truncate_view", False))
-        self.run_command = make_run_command(
-            self.docker_env,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
-        )
-        self.apply_patch = make_apply_patch(
-            self.docker_env,
-            message_bus=self.message_bus,
-            shared_context=self.shared_context,
-        )
-        self.share_findings = make_share_findings(self.message_bus, agent_name="reproducer")
-        self.check_findings = make_check_findings(self.message_bus, agent_name="reproducer")
-
-        all_tools = [self.run_python, self.run_test, self.register_tests, self.view_file, self.run_command, self.apply_patch, self.share_findings, self.check_findings]
-        self.model_with_tools = enable_anthropic_tool_caching(
-            self.model.bind_tools(all_tools), self.model_name
-        )
+        # Docker-dependent tools are built once the Docker container is ready,
+        # via _setup_tools() in run() (factories capture docker_env at creation).
+        self.model_with_tools = None
 
         # Build system prompt
         self._build_system_prompt()
@@ -215,22 +183,10 @@ class ReproducerAgent:
         if self.window_manager:
             self.window_manager.set_system_message(system_prompt)
 
-            if self.plan:
-                try:
-                    import json as _json
-                    plan_obj = _json.loads(self.plan) if isinstance(self.plan, str) else self.plan
-                    plan_content = get_reproducer_prompt(
-                        "plan_injection",
-                        **plan_obj,
-                    )
-                except (ValueError, TypeError, AttributeError):
-                    plan_content = get_reproducer_prompt("plan_injection_raw", plan=self.plan)
-                if not plan_content:
-                    raise ValueError("Missing reproducer.plan_injection in prompts.yaml")
-                self.window_manager.set_plan_message(initial_message + "\n\n" + plan_content)
-            else:
-                no_plan_msg = get_reproducer_prompt("no_plan_message") or ""
-                self.window_manager.set_plan_message(initial_message + "\n\n" + no_plan_msg)
+            self.window_manager.set_plan_message(build_plan_message(
+                get_reproducer_prompt, self.plan, initial_message,
+                missing_label="reproducer.plan_injection",
+            ))
 
             # Messages property will be computed from window manager
             self.messages = self.window_manager.get_messages()
@@ -239,23 +195,10 @@ class ReproducerAgent:
             self.messages = [
                 SystemMessage(content=system_prompt),
             ]
-
-            if self.plan:
-                try:
-                    import json as _json
-                    plan_obj = _json.loads(self.plan) if isinstance(self.plan, str) else self.plan
-                    plan_content = get_reproducer_prompt(
-                        "plan_injection",
-                        **plan_obj,
-                    )
-                except (ValueError, TypeError, AttributeError):
-                    plan_content = get_reproducer_prompt("plan_injection_raw", plan=self.plan)
-                if not plan_content:
-                    raise ValueError("Missing reproducer.plan_injection in prompts.yaml")
-                self.messages.append(HumanMessage(content=initial_message + "\n\n" + plan_content))
-            else:
-                no_plan_msg = get_reproducer_prompt("no_plan_message") or ""
-                self.messages.append(HumanMessage(content=initial_message + "\n\n" + no_plan_msg))
+            self.messages.append(HumanMessage(content=build_plan_message(
+                get_reproducer_prompt, self.plan, initial_message,
+                missing_label="reproducer.plan_injection",
+            )))
 
     # ==================== Trajectory Logging ====================
 
@@ -476,6 +419,49 @@ class ReproducerAgent:
 
     # ==================== Main Run ====================
 
+    def _setup_tools(self):
+        """Create docker-dependent tools and bind them to the model.
+
+        Must be called after self.docker_env is initialized (in run()). Tool
+        factories capture docker_env at creation time, so they are built here
+        rather than in __init__ (where docker_env is still None).
+        """
+        self.run_python = make_run_python(
+            self.docker_env,
+            trajectory_callback=self._log_trajectory_step,
+            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
+        )
+        self.run_test, self.register_tests = make_run_regression_tests(
+            self.docker_env,
+            instance_id=self.instance_id,
+            available_tests=self.available_regression_tests,
+            detect_framework_fn=detect_framework if HAS_TEST_RUNNER else None,
+            test_commands=TEST_COMMANDS if HAS_TEST_RUNNER else None,
+            convert_test_name_fn=convert_test_name_for_framework,
+            trajectory_callback=self._log_trajectory_step,
+            context_callback=lambda test, result, output: self.shared_context.add_regression_test_result("before", test, result, output),
+            message_bus=self.message_bus,
+        )
+        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=getattr(self, "truncate_view", False))
+        self.run_command = make_run_command(
+            self.docker_env,
+            trajectory_callback=self._log_trajectory_step,
+            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
+        )
+        self.apply_patch = make_apply_patch(
+            self.docker_env,
+            message_bus=self.message_bus,
+            shared_context=self.shared_context,
+        )
+        self.share_findings = make_share_findings(self.message_bus, agent_name="reproducer")
+        self.check_findings = make_check_findings(self.message_bus, agent_name="reproducer")
+
+        all_tools = [self.run_python, self.run_test, self.register_tests, self.view_file, self.run_command, self.apply_patch, self.share_findings, self.check_findings]
+        self.model_with_tools = enable_anthropic_tool_caching(
+            self.model.bind_tools(all_tools), self.model_name
+        )
+        self.logger.info("Tools initialized with Docker environment")
+
     def run(self) -> Dict[str, Any]:
         """Run the reproducer agent."""
         self.detailed_log.log_start({
@@ -511,40 +497,8 @@ class ReproducerAgent:
                 }
             self.logger.info(f"Docker container started: {self.docker_env.container_id[:12]}")
 
-        # Re-create all tools now that docker_env is available
-        # (tools created at __init__ time captured docker_env=None)
-        self.run_python = make_run_python(
-            self.docker_env,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
-        )
-        self.run_test, self.register_tests = make_run_regression_tests(
-            self.docker_env,
-            instance_id=self.instance_id,
-            available_tests=self.available_regression_tests,
-            detect_framework_fn=detect_framework if HAS_TEST_RUNNER else None,
-            test_commands=TEST_COMMANDS if HAS_TEST_RUNNER else None,
-            convert_test_name_fn=convert_test_name_for_framework,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda test, result, output: self.shared_context.add_regression_test_result("before", test, result, output),
-            message_bus=self.message_bus,
-        )
-        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=getattr(self, "truncate_view", False))
-        self.run_command = make_run_command(
-            self.docker_env,
-            trajectory_callback=self._log_trajectory_step,
-            context_callback=lambda role, action, result, meta: self.shared_context.add_trajectory_step(role, action, result, meta),
-        )
-        self.apply_patch = make_apply_patch(
-            self.docker_env,
-            message_bus=self.message_bus,
-            shared_context=self.shared_context,
-        )
-        all_tools = [self.run_python, self.run_test, self.register_tests, self.view_file, self.run_command, self.apply_patch, self.share_findings, self.check_findings]
-        self.model_with_tools = enable_anthropic_tool_caching(
-            self.model.bind_tools(all_tools), self.model_name
-        )
-        self.logger.info("Tools re-initialized with Docker environment")
+        # Build docker-dependent tools and bind them to the model now that Docker is ready.
+        self._setup_tools()
 
         try:
             return self._run_loop()
@@ -655,7 +609,7 @@ class ReproducerAgent:
                 resp = self.model_with_tools.invoke(current_messages)
 
                 # Log interaction
-                response_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+                response_text = llm_text(resp)
                 self.detailed_log.log_llm_call(prompt_text, response_text, {"step": step}, raw_response=resp)
 
                 # Log to trajectory (full content, no truncation)
@@ -833,7 +787,7 @@ class ReproducerAgent:
                 continue
 
             # Check for final output
-            text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            text = llm_text(resp)
 
             # ── Check for REPRODUCTION_SCRIPT (Phase 1 complete → enter Phase 2) ──
             # IMPORTANT: Check this BEFORE VALIDATION_COMPLETE because the LLM
@@ -1023,9 +977,9 @@ class ReproducerAgent:
                 f"tokens_saved={stats['tokens_saved']}"
             )
 
+    # DEPRECATED (no callers as of 2026-06-24) — candidate for removal; see refactor plan.
     def run_with_regression_tests(self) -> Dict[str, Any]:
-        """
-        Run reproducer with full regression test suite.
+        """[DEPRECATED — no callers] Run reproducer with full regression test suite.
         This is typically called during patch validation.
         """
         # First run reproduction
@@ -1039,9 +993,9 @@ class ReproducerAgent:
 
         return result
 
+    # DEPRECATED (no callers as of 2026-06-24) — candidate for removal; see refactor plan.
     def _validate_patch_with_tests(self, patch_diff: str, reproduction_script: str) -> Dict[str, Any]:
-        """
-        Validate a patch by applying the diff, running BOTH the reproduction
+        """[DEPRECATED — no callers] Validate a patch by applying the diff, running BOTH the reproduction
         script AND regression tests, and sharing detailed results.
 
         Args:
@@ -1120,9 +1074,9 @@ class ReproducerAgent:
 
         return result
 
+    # DEPRECATED (no callers as of 2026-06-24) — candidate for removal; see refactor plan.
     def validate_patch(self) -> Dict[str, Any]:
-        """
-        Validate a patch by running reproduction test and regression tests after patch.
+        """[DEPRECATED — no callers] Validate a patch by running reproduction test and regression tests after patch.
         Should be called after patch has been applied.
         """
         results = {

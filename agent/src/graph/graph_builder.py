@@ -50,7 +50,7 @@ from agent.prompt_loader import (
 
 # Additional imports for agentic self-planning
 import fnmatch
-from agent.utils import create_chat_model
+from agent.utils import create_chat_model, extract_json_object, strip_json_fences, llm_text
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 from agent.docker_env import DockerEnvironment
@@ -533,7 +533,7 @@ class RolePlanner:
                 ])
 
                 tool_calls = getattr(resp, "tool_calls", None)
-                text = resp.content if isinstance(resp.content, str) else str(resp.content)
+                text = llm_text(resp)
                 self.logger.info(f"[RolePlanner-{self.role}] Force response: tool_calls={bool(tool_calls)}, text_len={len(text.strip())}")
 
                 if tool_calls:
@@ -548,14 +548,10 @@ class RolePlanner:
                 # If LLM responded with text containing JSON instead of a tool call, extract it
                 if not self.plan_submitted and text.strip():
                     self.logger.info(f"[RolePlanner-{self.role}] Extracting JSON from text response")
-                    if "```" in text:
-                        match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-                        if match:
-                            text = match.group(1).strip()
-                    json_match = _re.search(r'\{.*\}', text, _re.DOTALL)
-                    if json_match:
+                    _cand = extract_json_object(text)
+                    if _cand:
                         try:
-                            plan_obj = _json.loads(json_match.group(0))
+                            plan_obj = _json.loads(_cand)
                             if isinstance(plan_obj, dict):
                                 self.final_plan = _json.dumps(plan_obj)
                                 self.plan_submitted = True
@@ -679,16 +675,11 @@ def triage_node(state: dict) -> dict:
             SystemMessage(content="You analyze issue descriptions for a bug-fixing system. Return ONLY a valid JSON object (not a tuple or list). Use double quotes for all keys and string values. Use true/false (lowercase) for booleans. Do NOT wrap the JSON in markdown code blocks."),
             HumanMessage(content=triage_prompt),
         ])
-        text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        text = llm_text(resp)
 
         # Extract JSON
-        if "```" in text:
-            match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-            if match:
-                text = match.group(1).strip()
-        json_match = _re.search(r'\{.*\}', text, _re.DOTALL)
-        if json_match:
-            text = json_match.group(0)
+        _cand = extract_json_object(text)
+        text = _cand if _cand is not None else strip_json_fences(text)
 
         try:
             triage = _json.loads(text)
@@ -947,16 +938,12 @@ def _explorer_node(state: dict) -> dict:
 
             # Extract from text if still not submitted
             if not context_submitted[0]:
-                text = force_resp.content if isinstance(force_resp.content, str) else str(force_resp.content)
+                text = llm_text(force_resp)
                 if text.strip():
-                    if "```" in text:
-                        match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-                        if match:
-                            text = match.group(1).strip()
-                    json_match = _re.search(r'\{.*\}', text, _re.DOTALL)
-                    if json_match:
+                    _cand = extract_json_object(text)
+                    if _cand:
                         try:
-                            obj = _json.loads(json_match.group(0))
+                            obj = _json.loads(_cand)
                             if isinstance(obj, dict):
                                 context_result[0] = _json.dumps(obj)
                                 context_submitted[0] = True
@@ -993,15 +980,11 @@ def _explorer_node(state: dict) -> dict:
                     SystemMessage(content=f"You are a {role} planner. Return ONLY a valid JSON plan."),
                     HumanMessage(content=plan_prompt),
                 ])
-                text = resp.content if isinstance(resp.content, str) else str(resp.content)
+                text = llm_text(resp)
 
-                if "```" in text:
-                    match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-                    if match:
-                        text = match.group(1).strip()
-                json_match = _re.search(r'\{.*\}', text, _re.DOTALL)
-                if json_match:
-                    plan_obj = _json.loads(json_match.group(0))
+                _cand = extract_json_object(text)
+                if _cand:
+                    plan_obj = _json.loads(_cand)
                     log.info(f"[Explorer] {role} plan generated successfully")
                     return role, _json.dumps(plan_obj)
                 else:
@@ -1075,14 +1058,9 @@ def plan_evaluation_node(state: dict) -> dict:
                 SystemMessage(content="You evaluate bug-fixing plan quality and alignment. Return ONLY valid JSON."),
                 HumanMessage(content=combined_prompt),
             ])
-            txt = resp.content if isinstance(resp.content, str) else str(resp.content)
-            if "```" in txt:
-                match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', txt)
-                if match:
-                    txt = match.group(1).strip()
-            json_match = re.search(r'\{.*\}', txt, re.DOTALL)
-            if json_match:
-                txt = json_match.group(0)
+            txt = llm_text(resp)
+            _cand = extract_json_object(txt)
+            txt = _cand if _cand is not None else strip_json_fences(txt)
             result = json.loads(txt)
             quality_scores = result.get("quality", quality_scores)
             alignment_scores = result.get("alignment", alignment_scores)
@@ -1190,14 +1168,9 @@ def plan_refinement_node(state: dict) -> dict:
             HumanMessage(content=refinement_prompt),
         ])
 
-        txt = resp.content if isinstance(resp.content, str) else str(resp.content)
-        if "```" in txt:
-            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', txt)
-            if match:
-                txt = match.group(1).strip()
-        json_match = re.search(r'\{.*\}', txt, re.DOTALL)
-        if json_match:
-            txt = json_match.group(0)
+        txt = llm_text(resp)
+        _cand = extract_json_object(txt)
+        txt = _cand if _cand is not None else strip_json_fences(txt)
 
         refined = json.loads(txt)
 

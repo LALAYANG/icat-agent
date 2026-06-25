@@ -1,2 +1,20 @@
 __pycache__
 *.log
+*.pyc
+
+# Secrets / local env
+.env
+
+# Virtualenv
+.venv/
+
+# Run outputs (per-instance agent logs, predictions, trajectories)
+/logs/
+/logs_*/
+/test_logs/
+
+# Local comparison/reference trajectories (not part of the codebase)
+/comp/
+
+# pytest / tooling caches
+.pytest_cache/

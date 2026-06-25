@@ -9,6 +9,7 @@ This module provides utilities to:
 """
 from __future__ import annotations
 import os
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -256,3 +257,44 @@ def get_reproducer_planner_prompt(prompt_key: str = "system_prompt", **kwargs) -
 def get_plan_evaluation_prompt(prompt_key: str = "quality_prompt", **kwargs) -> Optional[str]:
     """Get a plan evaluation prompt (quality_prompt, alignment_prompt, or refinement_prompt)."""
     return get_prompt("plan_evaluation", prompt_key, **kwargs)
+
+
+def build_plan_message(
+    get_prompt_fn,
+    plan,
+    initial_message: str,
+    *,
+    plan_key: str = "plan_injection",
+    no_plan_key: str = "no_plan_message",
+    missing_label: str = "plan_injection",
+) -> str:
+    """Render an agent's plan block and join it to the initial message.
+
+    Centralizes the plan-JSON parsing previously duplicated across agents:
+    if a plan is present, parse it as JSON and render the structured
+    ``plan_key`` template; on JSON/type errors fall back to ``{plan_key}_raw``;
+    if there is no plan, use ``no_plan_key``.
+
+    Args:
+        get_prompt_fn: an agent-specific prompt getter (e.g. get_reproducer_prompt).
+        plan: the plan as a JSON string or dict (or falsy for no plan).
+        initial_message: the agent's initial message, prepended to the block.
+        plan_key/no_plan_key: prompt keys to render.
+        missing_label: used in the error if the plan template is missing
+            (e.g. "patch_editor.plan_injection").
+
+    Returns:
+        ``initial_message + "\\n\\n" + <plan-or-no-plan block>``.
+    """
+    if plan:
+        try:
+            plan_obj = json.loads(plan) if isinstance(plan, str) else plan
+            block = get_prompt_fn(plan_key, **plan_obj)
+        except (ValueError, TypeError, AttributeError):
+            raw_key = plan_key + "_raw" if not plan_key.endswith("_raw") else plan_key
+            block = get_prompt_fn(raw_key, plan=plan)
+        if not block:
+            raise ValueError(f"Missing {missing_label} in prompts.yaml")
+    else:
+        block = get_prompt_fn(no_plan_key) or ""
+    return initial_message + "\n\n" + block

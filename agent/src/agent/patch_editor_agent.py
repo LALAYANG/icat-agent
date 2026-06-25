@@ -4,10 +4,10 @@ import time
 import logging
 from typing import Any, Dict, List, Optional
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-from .utils import DetailedLogger, create_chat_model, enable_anthropic_tool_caching
+from .utils import DetailedLogger, create_chat_model, enable_anthropic_tool_caching, llm_text
 from .docker_env import DockerEnvironment
 from .context_sharing import SharedContextManager, AgentMessageBus
-from .prompt_loader import get_patch_editor_prompt
+from .prompt_loader import get_patch_editor_prompt, build_plan_message
 from .context_window import SlidingWindowManager, create_window_manager
 from .tools import (
     make_list_dir, make_view_file, make_view_symbol, make_view_outline,
@@ -87,27 +87,10 @@ class PatchEditorAgent:
         # Shared context for inter-agent communication
         self.shared_context = SharedContextManager.get_instance(instance_id, log_dir)
 
-        # tools — all from shared factories in agent/tools.py
-        self.list_dir = make_list_dir(self.docker_env)
-        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=getattr(self, "truncate_view", False))
-        self.edit_file = make_edit_file(self.docker_env)
-        self.search_replace = make_search_replace(self.docker_env)
-        self.view_symbol = make_view_symbol(self.docker_env)
-        self.view_outline = make_view_outline(self.docker_env)
-        self.grep_content = make_grep_content(self.docker_env)
-        self.trace_call_chain = make_trace_call_chain(self.docker_env)
-        self.share_findings = make_share_findings(
-            self.message_bus, agent_name="patch_editor",
-            wait_for_validation=True,
-            docker_env=self.docker_env,
-        )
-        self.check_findings = make_check_findings(self.message_bus, agent_name="patch_editor")
-
+        # The base chat model is created here; docker-dependent tools are built
+        # once the Docker container is ready, via _setup_tools() in run().
         self.model = create_chat_model(model_name)
-        all_tools = [self.list_dir, self.view_file, self.edit_file, self.search_replace, self.view_symbol, self.view_outline, self.grep_content, self.trace_call_chain, self.share_findings, self.check_findings]
-        self.model_with_tools = enable_anthropic_tool_caching(
-            self.model.bind_tools(all_tools), self.model_name
-        )
+        self.model_with_tools = None
 
         # Build system prompt (role identity only) and initial message (everything else)
         system_prompt = get_patch_editor_prompt("system_prompt")
@@ -125,24 +108,10 @@ class PatchEditorAgent:
         if self.window_manager:
             self.window_manager.set_system_message(system_prompt)
 
-            if plan:
-                # Parse plan JSON to extract structured fields for the template
-                try:
-                    import json as _json
-                    plan_obj = _json.loads(plan) if isinstance(plan, str) else plan
-                    plan_injection = get_patch_editor_prompt(
-                        "plan_injection",
-                        **plan_obj,
-                    )
-                except (ValueError, TypeError, AttributeError):
-                    # Fall back to raw plan injection if JSON parsing fails
-                    plan_injection = get_patch_editor_prompt("plan_injection_raw", plan=plan)
-                if not plan_injection:
-                    raise ValueError("Missing patch_editor.plan_injection in prompts.yaml")
-                self.window_manager.set_plan_message(initial_message + "\n\n" + plan_injection)
-            else:
-                no_plan_msg = get_patch_editor_prompt("no_plan_message") or ""
-                self.window_manager.set_plan_message(initial_message + "\n\n" + no_plan_msg)
+            self.window_manager.set_plan_message(build_plan_message(
+                get_patch_editor_prompt, plan, initial_message,
+                missing_label="patch_editor.plan_injection",
+            ))
 
             # Messages property will be computed from window manager
             self.messages = self.window_manager.get_messages()
@@ -151,22 +120,10 @@ class PatchEditorAgent:
             self.messages = [
                 SystemMessage(content=system_prompt),
             ]
-            if plan:
-                try:
-                    import json as _json
-                    plan_obj = _json.loads(plan) if isinstance(plan, str) else plan
-                    plan_injection = get_patch_editor_prompt(
-                        "plan_injection",
-                        **plan_obj,
-                    )
-                except (ValueError, TypeError, AttributeError):
-                    plan_injection = get_patch_editor_prompt("plan_injection_raw", plan=plan)
-                if not plan_injection:
-                    raise ValueError("Missing patch_editor.plan_injection in prompts.yaml")
-                self.messages.append(HumanMessage(initial_message + "\n\n" + plan_injection))
-            else:
-                no_plan_msg = get_patch_editor_prompt("no_plan_message") or ""
-                self.messages.append(HumanMessage(initial_message + "\n\n" + no_plan_msg))
+            self.messages.append(HumanMessage(build_plan_message(
+                get_patch_editor_prompt, plan, initial_message,
+                missing_label="patch_editor.plan_injection",
+            )))
 
     def _generate_unified_diff(self) -> str:
         """
@@ -331,9 +288,26 @@ class PatchEditorAgent:
                 }
             self.logger.info(f"Docker container started: {self.docker_env.container_id[:12]}")
 
-        # Re-create ALL tools that depend on docker_env (they captured None at __init__ time)
+        # Build docker-dependent tools and bind them to the model now that Docker is ready.
+        self._setup_tools()
+
+        try:
+            return self._run_loop()
+        finally:
+            # Only clean up if we own the docker env
+            if self.owns_docker:
+                self.docker_env.__exit__(None, None, None)
+                self.logger.info("Docker container cleaned up")
+
+    def _setup_tools(self):
+        """Create docker-dependent tools and bind them to the model.
+
+        Must be called after self.docker_env is initialized (in run()). Tool
+        factories capture docker_env at creation time, so they are built here
+        rather than in __init__ (where docker_env is still None).
+        """
         self.list_dir = make_list_dir(self.docker_env)
-        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=getattr(self, "truncate_view", False))
+        self.view_file = make_view_file(self.docker_env, max_lines_cap=100, truncate_output=self.truncate_view)
         self.edit_file = make_edit_file(self.docker_env)
         self.search_replace = make_search_replace(self.docker_env)
         self.view_symbol = make_view_symbol(self.docker_env)
@@ -345,19 +319,13 @@ class PatchEditorAgent:
             wait_for_validation=True,
             docker_env=self.docker_env,
         )
+        self.check_findings = make_check_findings(self.message_bus, agent_name="patch_editor")
+
         all_tools = [self.list_dir, self.view_file, self.edit_file, self.search_replace, self.view_symbol, self.view_outline, self.grep_content, self.trace_call_chain, self.share_findings, self.check_findings]
         self.model_with_tools = enable_anthropic_tool_caching(
             self.model.bind_tools(all_tools), self.model_name
         )
-        self.logger.info("Tools re-initialized with Docker environment")
-
-        try:
-            return self._run_loop()
-        finally:
-            # Only clean up if we own the docker env
-            if self.owns_docker:
-                self.docker_env.__exit__(None, None, None)
-                self.logger.info("Docker container cleaned up")
+        self.logger.info("Tools initialized with Docker environment")
 
     def _run_build_check(self):
         """Run a compile/build check for the current repo. Returns error string or None."""
@@ -479,7 +447,7 @@ class PatchEditorAgent:
                 resp = self.model_with_tools.invoke(current_messages)
 
                 # Log the LLM interaction
-                response_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+                response_text = llm_text(resp)
                 self.detailed_log.log_llm_call(prompt_text, response_text, {"step": step, "has_tools": bool(getattr(resp, "tool_calls", None))}, raw_response=resp)
 
                 # Check cost limit
@@ -745,7 +713,7 @@ class PatchEditorAgent:
                 continue
 
             # Check for final output
-            txt = resp.content if isinstance(resp.content, str) else str(resp.content)
+            txt = llm_text(resp)
 
             # Look for DONE: format (new) or modified_target/patch format (old)
             if "DONE:" in txt or ("modified_target" in txt and "patch" in txt):
@@ -846,7 +814,7 @@ class PatchEditorAgent:
                 return result
 
             # Skip empty responses to avoid context bloat and wasted LLM calls
-            resp_text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            resp_text = llm_text(resp)
             if not resp_text.strip() or resp_text.strip() == '[]':
                 self._empty_response_count = getattr(self, '_empty_response_count', 0) + 1
                 if self._empty_response_count >= 3:
@@ -920,8 +888,9 @@ class PatchEditorAgent:
         except Exception as e:
             self.logger.warning(f"Failed to share tool findings: {e}")
 
+    # DEPRECATED (no callers as of 2026-06-24) — candidate for removal; see refactor plan.
     def _auto_share_diff(self):
-        """Run `git diff` in Docker and post the unified diff to the message bus.
+        """[DEPRECATED — no callers] Run `git diff` in Docker and post the unified diff to the message bus.
 
         Called after every successful edit_file so the reproducer's
         apply_patch() always has access to a real unified diff, regardless

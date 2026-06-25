@@ -636,9 +636,10 @@ Provide a concise summary (max 300 words):"""
 
         return messages
 
+    # DEPRECATED (no callers as of 2026-06-24) — candidate for removal; see refactor plan.
     def get_messages_for_anthropic(self) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Get messages formatted for Anthropic API with cache control.
+        [DEPRECATED — no callers] Get messages formatted for Anthropic API with cache control.
 
         Returns:
             Tuple of (system_prompt, messages_list) where messages_list
@@ -721,9 +722,11 @@ Provide a concise summary (max 300 words):"""
         self._update_total_tokens()
 
 
+# DEPRECATED (no callers as of 2026-06-24; superseded by SlidingWindowManager.get_messages
+# cache logic) — candidate for removal; see refactor plan. Still exported from agent/__init__.py.
 class PromptCacheManager:
     """
-    Manages prompt caching for Anthropic models.
+    [DEPRECATED — no callers] Manages prompt caching for Anthropic models.
 
     Anthropic's prompt caching allows caching the first parts of a prompt
     that don't change between requests, reducing costs and latency.

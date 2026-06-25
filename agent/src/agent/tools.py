@@ -5,6 +5,8 @@ import logging
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 
+from .utils import extract_json_object, strip_json_fences, llm_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,6 +20,20 @@ def normalize_docker_path(path: str, repo_path: str = "/testbed") -> str:
         return f"{repo_path}{path}"
     else:
         return f"{repo_path}/{path}"
+
+
+# Single source of truth for the "docker not ready" guard shared by every tool.
+_DOCKER_NOT_READY = "[ERROR] Docker environment not initialized"
+
+
+def _require_docker(docker_env):
+    """Return the standard error string if docker_env is missing, else None.
+
+    Tools use: ``if (err := _require_docker(docker_env)): return err``.
+    """
+    if docker_env is None:
+        return _DOCKER_NOT_READY
+    return None
 
 
 # Builtins set used by trace_call_chain (module-level constant)
@@ -40,8 +56,8 @@ def make_find_files(docker_env):
     @tool
     def find_files(pattern: str):
         """Find files by name pattern (wildcards supported)."""
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         cmd = f"cd {docker_env.repo_path} && find . -name '{pattern}' -type f -not -path '*/.git/*' 2>/dev/null | head -30"
         returncode, stdout, _ = docker_env.run_command(cmd, timeout=15)
         if returncode == 0 and stdout.strip():
@@ -66,8 +82,8 @@ def make_grep_content(docker_env):
             path: File or directory to search in (default: whole repo)
             file_pattern: Glob to filter files (default: all source files)
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         if path:
             full_path = normalize_docker_path(path, docker_env.repo_path)
@@ -120,8 +136,8 @@ def make_view_file(docker_env, *, max_lines_cap: int = 800, on_view_callback=Non
             start_line: Starting line number (default 1)
             max_lines: Max lines to return (default 50, max 100). Prefer view_symbol for specific functions.
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         requested_max = max_lines
         max_lines = min(max_lines, max_lines_cap)
         if requested_max != max_lines:
@@ -184,8 +200,8 @@ def make_list_dir(docker_env):
         Args:
             path: Directory path relative to repo root (default: root)
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
         returncode, stdout, stderr = docker_env.run_command(
             f"ls -la {full_path} 2>/dev/null | head -60", timeout=10
@@ -283,8 +299,8 @@ print(json.dumps(matches))
             path: File path relative to repo root (supports .py, .java, .js)
             symbol_name: Function, method, or class name to extract
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
 
         returncode, stdout, _ = docker_env.run_command(
@@ -498,8 +514,8 @@ print(json.dumps(outline))
         Args:
             path: File path relative to repo root
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
 
         returncode, stdout, _ = docker_env.run_command(
@@ -715,8 +731,8 @@ def make_edit_file(docker_env):
             end_line: Last line to replace (inclusive). 0 = insert before start_line.
             new_content: Replacement content
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
 
         # Check file exists
@@ -816,8 +832,8 @@ def make_search_replace(docker_env):
             new_text: Text to replace it with
             replace_all: If True, replace ALL occurrences at once (useful for renaming variables/fields across a file)
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
 
         rc, file_content, stderr = docker_env.run_command(f"cat {full_path}")
@@ -871,8 +887,9 @@ def make_search_replace(docker_env):
     return search_replace
 
 
+# DEPRECATED (not bound by any agent as of 2026-06-24) — candidate for removal; see refactor plan.
 def make_edit_symbol(docker_env):
-    """Create an edit_symbol tool that replaces a function/class body using AST to find boundaries."""
+    """[DEPRECATED — unused] Create an edit_symbol tool that replaces a function/class body using AST to find boundaries."""
 
     # Reuse the same AST script from view_symbol to find symbol boundaries
     _FIND_SYMBOL_SCRIPT = r'''
@@ -946,8 +963,8 @@ print(json.dumps(matches))
             new_body: Complete new definition (including def/class line and full body)
             class_name: Class name to disambiguate methods (optional)
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         full_path = normalize_docker_path(path, docker_env.repo_path)
 
         rc, out, _ = docker_env.run_command(
@@ -1235,8 +1252,8 @@ print(json.dumps(graph))
             function_name: Function name to trace
             file_path: Optional file path to narrow search
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         cache_key = f"{function_name}:{file_path}"
         if cache_key in _cache:
@@ -1372,8 +1389,9 @@ def make_check_findings(message_bus, *, agent_name: str):
     return check_findings
 
 
+# DEPRECATED (not bound by any agent as of 2026-06-24) — candidate for removal; see refactor plan.
 def make_query_agents(shared_context, *, agent_name: str):
-    """Create a query_agents tool for reading other agents' shared context."""
+    """[DEPRECATED — unused] Create a query_agents tool for reading other agents' shared context."""
     @tool
     def query_agents(agent_name_to_query: str = "all"):
         """Query other agents' findings.
@@ -1448,8 +1466,8 @@ def make_run_python(docker_env, *, trajectory_callback=None, context_callback=No
     @tool
     def run_python(code: str) -> str:
         """Execute Python code in the repo. Exit 1 = bug reproduced, exit 0 = no bug."""
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         tmp_script = "/tmp/_repro_run.py"
         if not docker_env.write_file(tmp_script, code):
@@ -1551,8 +1569,8 @@ def make_run_regression_tests(
     @tool
     def run_regression_tests() -> str:
         """Run all regression tests for this instance (including any you registered). Auto-detects framework."""
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         # Combine pre-filtered + registered tests
         all_prefiltered = list(available_tests)
@@ -1725,8 +1743,8 @@ def make_run_command(docker_env, *, trajectory_callback=None, context_callback=N
     @tool
     def run_command(cmd: str) -> str:
         """Run a shell command in the repo. NEVER use ls -R or find without limits — large output wastes tokens."""
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         returncode, stdout, stderr = docker_env.run_command(
             f"cd {docker_env.repo_path} && {cmd}", timeout=60
@@ -1889,8 +1907,8 @@ def make_run_tests(docker_env, *, instance_id: str, detect_framework_fn=None, te
         Args:
             test_path: Path to test file or directory relative to repo root
         """
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
         if detect_framework_fn:
             framework = detect_framework_fn(instance_id)
         else:
@@ -1944,8 +1962,8 @@ def make_validate_entities(docker_env):
         """
         import hashlib as _hashlib
 
-        if docker_env is None:
-            return "[ERROR] Docker environment not initialized"
+        if (err := _require_docker(docker_env)):
+            return err
 
         cache_key = _hashlib.md5(entities_json.encode()).hexdigest()
         if cache_key in _cache:
@@ -2117,14 +2135,9 @@ def make_check_plan_quality(model, *, role: str):
                 SystemMessage(content="You evaluate bug-fixing plan quality. Return ONLY valid JSON."),
                 HumanMessage(content=prompt),
             ])
-            txt = resp.content if isinstance(resp.content, str) else str(resp.content)
-            if "```" in txt:
-                match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', txt)
-                if match:
-                    txt = match.group(1).strip()
-            json_match = _re.search(r'\{.*\}', txt, _re.DOTALL)
-            if json_match:
-                txt = json_match.group(0)
+            txt = llm_text(resp)
+            _cand = extract_json_object(txt)
+            txt = _cand if _cand is not None else strip_json_fences(txt)
 
             result = _json.loads(txt)
             overall = result.get("overall", 0.0)

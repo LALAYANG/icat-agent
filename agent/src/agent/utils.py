@@ -3,6 +3,7 @@
 
 import json
 import logging
+import re
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -13,6 +14,43 @@ import litellm
 
 
 DEFAULT_MAX_COST_PER_INSTANCE = 2.0
+
+
+def strip_json_fences(text: str) -> str:
+    """Remove a ```json ... ``` (or bare ``` ... ```) code-fence wrapper if present.
+
+    Returns the inner text, or the original string when no fence is found.
+    """
+    if "```" in text:
+        m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+        if m:
+            return m.group(1).strip()
+    return text
+
+
+def llm_text(resp) -> str:
+    """Return an LLM response's content as a plain string.
+
+    LangChain messages may carry either a str or a list of content blocks;
+    agents consistently want the str form (``str(content)`` for non-str).
+    Centralizes the ``resp.content if isinstance(...) else str(...)`` idiom.
+    """
+    content = resp.content
+    return content if isinstance(content, str) else str(content)
+
+
+def extract_json_object(text: str) -> Optional[str]:
+    """Extract the outermost ``{...}`` JSON object from an LLM text response.
+
+    Strips a code fence first (via strip_json_fences), then returns the substring
+    from the first ``{`` to the last ``}`` (greedy, DOTALL), or None if no braces
+    are present. The caller is responsible for json.loads() and any fallback —
+    this centralizes only the fence-strip + brace-extraction that was duplicated
+    across graph_builder.py and tools.py.
+    """
+    text = strip_json_fences(text)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    return m.group(0) if m else None
 
 
 class OpenRouterResponseCapture:
