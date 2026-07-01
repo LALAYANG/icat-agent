@@ -1,5 +1,32 @@
 """Tests for AgentMessageBus and AgentContext."""
-from agent.context_sharing import AgentMessageBus, AgentContext
+from agent.context_sharing import AgentMessageBus, AgentContext, BusMessageType
+
+
+def test_bus_message_type_values_are_stable():
+    """The constants must stay byte-identical to the wire strings the agents
+    still match against (some via data-payload substring checks). Guard against
+    accidental drift."""
+    assert BusMessageType.LOCALIZED_FILES == "localized_files"
+    assert BusMessageType.LOCALIZED_FUNCTIONS == "localized_functions"
+    assert BusMessageType.TEST_INFO == "test_info"
+    assert BusMessageType.BUG_CONFIRMED == "bug_confirmed"
+    assert BusMessageType.VALIDATION_PASSED == "validation_passed"
+    assert BusMessageType.VALIDATION_FAILED == "validation_failed"
+    assert BusMessageType.VALIDATION_COMPLETE == "validation_complete"
+    assert BusMessageType.PATCH_GENERATED == "patch_generated"
+    assert BusMessageType.TEST_RESULTS == "test_results"
+
+
+def test_post_routes_signals_by_constant():
+    """post() must fire the right threading events for the canonical types."""
+    bus = AgentMessageBus()
+    bus.post("patch_editor", BusMessageType.PATCH_GENERATED, "diff")
+    assert bus._patch_ready.is_set()
+    bus.post("reproducer", BusMessageType.TEST_RESULTS, "r")
+    assert bus._test_results_ready.is_set()
+    bus.post("reproducer", BusMessageType.VALIDATION_FAILED, {"x": 1})
+    assert bus._validation_feedback_ready.is_set()
+    assert bus._validation_feedback["type"] == "validation_failed"
 
 
 def test_post_and_read():

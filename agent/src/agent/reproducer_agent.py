@@ -35,6 +35,12 @@ except ImportError:
     convert_test_name_for_framework = None
 
 
+# Sentinels returned by the _run_loop sub-handlers to control the loop:
+# break out (done) or continue to the next step.
+_BREAK_LOOP = object()
+_CONTINUE_LOOP = object()
+
+
 class RegressionTestsManager:
     """
     Manages regression tests from regression_tests/tests.json.
@@ -507,12 +513,329 @@ class ReproducerAgent:
                 self.docker_env.__exit__(None, None, None)
                 self.logger.info("Docker container cleaned up")
 
+    def _add_loop_message(self, msg):
+        """Append a message to the window manager (if enabled) or the raw list."""
+        if self.window_manager:
+            self.window_manager.add_message(msg)
+        else:
+            self.messages.append(msg)
+
+    def _emit_progressive_nudges(self, step, has_script):
+        """Phase-aware last-minute nudges (at max_steps-5 and max_steps-2).
+
+        The wording depends on whether a reproduction script already exists:
+        before it, nudge toward REPRODUCTION_SCRIPT; after, toward VALIDATION_COMPLETE.
+        """
+        if step == self.max_steps - 5:
+            if has_script:
+                txt = ("You are running low on steps. "
+                       "Wrap up validation and output VALIDATION_COMPLETE: PASSED or VALIDATION_COMPLETE: FAILED now.")
+            else:
+                txt = ("You are running low on steps. "
+                       "Start wrapping up your reproduction script now. Use REPRODUCTION_SCRIPT: and RESULT: and TEST_OUTPUT: format to submit.")
+            self._add_loop_message(HumanMessage(content=txt))
+        elif step == self.max_steps - 2:
+            if has_script:
+                txt = ("URGENT: You must finish NOW. "
+                       "Output VALIDATION_COMPLETE: PASSED or VALIDATION_COMPLETE: FAILED immediately.")
+            else:
+                txt = ("URGENT: You must finish NOW. "
+                       "Output REPRODUCTION_SCRIPT: ```python ... ``` and RESULT: and TEST_OUTPUT: immediately.")
+            self._add_loop_message(HumanMessage(content=txt))
+
+    def _handle_tool_calls(self, resp):
+        """Dispatch the LLM's tool calls and track validation progress.
+
+        Returns _BREAK_LOOP (validation passed -> done), _CONTINUE_LOOP
+        (normal turn, or waiting on a patch), or None if there were no
+        tool calls (caller falls through to final-output parsing).
+        """
+        if not getattr(resp, "tool_calls", None):
+            return None
+        tool_msgs = []
+        for call in resp.tool_calls:
+            tool_fn = {
+                self.run_python.name: self.run_python,
+                self.run_test.name: self.run_test,
+                self.register_tests.name: self.register_tests,
+                self.view_file.name: self.view_file,
+                self.run_command.name: self.run_command,
+                self.apply_patch.name: self.apply_patch,
+                self.share_findings.name: self.share_findings,
+                self.check_findings.name: self.check_findings,
+            }.get(call["name"])
+
+            if tool_fn:
+                try:
+                    out = tool_fn.invoke(call["args"])
+                    self.detailed_log.log_tool_call(call["name"], call["args"], out)
+                    self.logger.info(f"Tool {call['name']} called with {call['args']}")
+                    tool_msgs.append(ToolMessage(f"OBSERVATION:\n{out}", tool_call_id=call["id"]))
+
+                    # Track validation progress for auto-exit
+                    if call["name"] == "apply_patch" and "successfully" in out.lower():
+                        self._patch_applied = True
+                        self._tests_run_after_patch = False  # reset — need new tests
+                        self._findings_shared_after_patch = False
+                    elif call["name"] == "run_python" and self._patch_applied:
+                        self._tests_run_after_patch = True
+                        self._last_reproduction_script = call["args"].get("code", "")
+                    elif call["name"] == "run_regression_tests" and self._patch_applied:
+                        self._tests_run_after_patch = True
+                    elif call["name"] == "share_findings":
+                        finding_type = call["args"].get("finding_type", "")
+                        if self._patch_applied and finding_type == "validation_passed":
+                            self._findings_shared_after_patch = True
+                            self._validation_passed_exit = True
+                        elif finding_type == "bug_confirmed" and not self._patch_applied:
+                            self._bug_confirmed_via_tool = True
+                        elif finding_type == "validation_failed" and self._patch_applied:
+                            self._validation_failed_waiting = True
+
+                    # REAL-TIME CONTEXT SHARING: Update shared context after relevant tool calls
+                    self._share_tool_findings(call["name"], call["args"], out)
+                except Exception as e:
+                    error_msg = f"Tool error: {str(e)}"
+                    self.logger.error(error_msg)
+                    self.detailed_log.log_error(e, f"Tool {call['name']}")
+                    tool_msgs.append(ToolMessage(f"OBSERVATION:\n{error_msg}", tool_call_id=call["id"]))
+
+        # Add messages to window manager or raw list
+        if self.window_manager:
+            self.window_manager.add_message(resp, increment_turn=True)
+            for tm in tool_msgs:
+                self.window_manager.add_message(tm)
+        else:
+            self.messages.append(resp)
+            self.messages.extend(tool_msgs)
+
+        # Immediate exit when validation_passed was shared
+        if getattr(self, '_validation_passed_exit', False):
+            self.logger.info("[Reproducer] Auto-exit: validation_passed shared — stopping immediately")
+            self._reproduction_result = "validated_passed"
+            if not self._reproduction_script and getattr(self, '_last_reproduction_script', None):
+                self._reproduction_script = self._last_reproduction_script
+            if self._reproduction_script:
+                self.shared_context.set_reproduction_script(self._reproduction_script)
+            if self.message_bus:
+                self.message_bus.post("reproducer", "validation_complete", {
+                    "status": "validated_passed",
+                    "script": self._reproduction_script[:2000] if self._reproduction_script else None,
+                })
+            return _BREAK_LOOP
+
+        # If validation_failed was shared, wait for revised patch (no LLM calls)
+        if getattr(self, '_validation_failed_waiting', False):
+            self.logger.info("[Reproducer] Validation failed — waiting for revised patch (no LLM calls)...")
+            patch_arrived = False
+            if self.message_bus:
+                patch_arrived = self.message_bus.wait_for_patch(timeout=600)
+            if patch_arrived:
+                self.logger.info("[Reproducer] Revised patch received!")
+                # Reset state for next validation round
+                self._patch_applied = False
+                self._tests_run_after_patch = False
+                self._findings_shared_after_patch = False
+                phase_msg = HumanMessage(content=(
+                    "The patch editor has revised the patch based on your feedback.\n"
+                    "1. Call apply_patch() to apply the revised patch\n"
+                    "2. Re-run your tests to verify\n"
+                    "3. Report validation_passed or validation_failed"
+                ))
+                if self.window_manager:
+                    self.window_manager.add_message(phase_msg)
+                else:
+                    self.messages.append(phase_msg)
+            else:
+                self.logger.warning("[Reproducer] No revised patch after 600s — continuing")
+            self._validation_failed_waiting = False
+            return _CONTINUE_LOOP
+
+        # If bug_confirmed was shared via tool call, wait for patch (no LLM calls)
+        if self._bug_confirmed_via_tool and not self._patch_applied:
+            self.logger.info("[Reproducer] Bug confirmed via tool. Waiting for patch (no LLM calls)...")
+            patch_arrived = False
+            if self.message_bus:
+                patch_arrived = self.message_bus.wait_for_patch(timeout=600)
+            if patch_arrived:
+                self.logger.info("[Reproducer] Patch received from patch editor!")
+            else:
+                self.logger.warning("[Reproducer] Timed out waiting for patch (600s)")
+            # Inject Phase 2 message
+            phase2_msg = HumanMessage(content=(
+                "A patch has been generated by the patch editor. Enter PHASE 2 (patch validation).\n\n"
+                "Steps:\n"
+                "1. Call apply_patch() to apply the patch to YOUR container\n"
+                "2. Re-run your reproduction script with run_python() to verify the fix\n"
+                "3. Also re-run regression tests with run_regression_tests()\n"
+                "4. Check results carefully:\n"
+                "   - If ALL tests pass AND reproduction script passes: share_findings('validation_passed', '<summary>')\n"
+                "   - If ANY test fails OR ANY error occurs: share_findings('validation_failed', '<details>')\n"
+                "   IMPORTANT: Do NOT declare validation_passed if there are ANY errors, failures, or non-zero exit codes."
+            ))
+            if self.window_manager:
+                self.window_manager.add_message(phase2_msg)
+            else:
+                self.messages.append(phase2_msg)
+            self._bug_confirmed_via_tool = False  # reset so we don't wait again
+            return _CONTINUE_LOOP
+
+        # Auto-exit: only when the model explicitly posts share_findings("validation_passed", ...)
+        if self._patch_applied and self._tests_run_after_patch and self._findings_shared_after_patch:
+            self.logger.info("[Reproducer] Auto-exit: model posted validation_passed")
+            self._reproduction_result = "validated_passed"
+            # Save the last reproduction script for logging
+            if not self._reproduction_script and getattr(self, '_last_reproduction_script', None):
+                self._reproduction_script = self._last_reproduction_script
+            if self._reproduction_script:
+                self.shared_context.set_reproduction_script(self._reproduction_script)
+            if self.message_bus:
+                self.message_bus.post("reproducer", "validation_complete", {
+                    "status": "validated_passed",
+                    "script": self._reproduction_script[:2000] if self._reproduction_script else None,
+                })
+            return _BREAK_LOOP
+
+        return _CONTINUE_LOOP
+
+    def _handle_final_output(self, resp):
+        """Parse a non-tool response for Phase-1 REPRODUCTION_SCRIPT/RESULT or
+        Phase-2 VALIDATION_COMPLETE. Returns _BREAK_LOOP (validation passed),
+        _CONTINUE_LOOP (validation failed, or bug confirmed -> wait for patch),
+        or None if the response is neither (caller appends it to history).
+        """
+        # Check for final output
+        text = llm_text(resp)
+
+        # ── Check for REPRODUCTION_SCRIPT (Phase 1 complete → enter Phase 2) ──
+        # IMPORTANT: Check this BEFORE VALIDATION_COMPLETE because the LLM
+        # may include "VALIDATION_COMPLETE: PASSED or FAILED" as a description
+        # of future steps alongside REPRODUCTION_SCRIPT output, which would
+        # be falsely matched as an actual validation result.
+        has_reproduction = "REPRODUCTION_SCRIPT:" in text or "RESULT:" in text
+
+        # ── Check for VALIDATION_COMPLETE ──
+        # Only match when it looks like an actual directive, not a description.
+        # Require it to appear at the start of a line (after optional whitespace).
+        validation_match = re.search(r'(?m)^\s*VALIDATION_COMPLETE:\s*(PASSED|FAILED)', text)
+        # Also reject matches that look like instructions (e.g. "PASSED or FAILED")
+        if validation_match and not has_reproduction:
+            is_passed = validation_match.group(1).upper() == "PASSED"
+            self._reproduction_result = "validated_passed" if is_passed else "validated_failed"
+            self.logger.info(f"[Reproducer] Validation result: {self._reproduction_result}")
+
+            if self.message_bus:
+                self.message_bus.post("reproducer", "validation_complete", {
+                    "status": self._reproduction_result,
+                    "script": self._reproduction_script[:2000] if self._reproduction_script else None,
+                    "detailed_output": text[-3000:],
+                })
+
+            if is_passed:
+                # Only terminate on PASSED — the fix is confirmed
+                return _BREAK_LOOP
+            else:
+                # FAILED — keep looping so the patch editor can revise.
+                # Inject a message telling the LLM to wait for a revised patch.
+                retry_msg = HumanMessage(content=(
+                    "Validation FAILED. Your feedback has been shared with the patch editor.\n"
+                    "Wait for a revised patch (you will receive a LIVE UPDATE), then call apply_patch() and re-validate.\n"
+                    "When the revised patch passes, output VALIDATION_COMPLETE: PASSED. Otherwise, share the test results with others as feedback."
+                ))
+                if self.window_manager:
+                    self.window_manager.add_message(resp, increment_turn=True)
+                    self.window_manager.add_message(retry_msg)
+                else:
+                    self.messages.append(resp)
+                    self.messages.append(retry_msg)
+                return _CONTINUE_LOOP
+
+        if has_reproduction:
+            # Extract reproduction script
+            if "```python" in text:
+                script_start = text.find("```python") + 9
+                script_end = text.find("```", script_start)
+                if script_end > script_start:
+                    self._reproduction_script = text[script_start:script_end].strip()
+
+            # Extract result
+            if "RESULT:" in text:
+                result_line = text.split("RESULT:")[1].split("\n")[0].strip()
+                if "REPRODUCED" in result_line.upper():
+                    self._reproduction_result = "reproduced" if "NOT" not in result_line.upper() else "not_reproduced"
+                elif "ERROR" in result_line.upper():
+                    self._reproduction_result = "error"
+                else:
+                    self._reproduction_result = result_line.lower()
+
+            # Extract test output (printed results from the script)
+            reproduction_test_output = ""
+            if "TEST_OUTPUT:" in text:
+                reproduction_test_output = text.split("TEST_OUTPUT:")[1].strip()
+                # Trim to first section boundary or end
+                for boundary in ["REPRODUCTION_SCRIPT:", "VALIDATION_COMPLETE:"]:
+                    if boundary in reproduction_test_output:
+                        reproduction_test_output = reproduction_test_output[:reproduction_test_output.find(boundary)].strip()
+
+            # Share bug confirmation and test info with other agents
+            if self.message_bus:
+                bug_data = {
+                    "status": self._reproduction_result or "unknown",
+                    "script": self._reproduction_script,
+                    "test_output": reproduction_test_output or text,
+                }
+                self.message_bus.post("reproducer", "bug_confirmed", bug_data)
+                if self._reproduction_script:
+                    self.message_bus.post("reproducer", "test_info", {
+                        "reproduction_script": self._reproduction_script[:2000],
+                        "result": self._reproduction_result,
+                        "test_output": reproduction_test_output or text[-3000:],
+                        "regression_tests": self.available_regression_tests[:10],
+                    })
+
+            # Phase 2: Wait for patch WITHOUT calling the LLM.
+            # Uses threading.Event — blocks with zero cost until patch_generated arrives.
+            self.logger.info("[Reproducer] Bug confirmed. Waiting for patch from patch editor (no LLM calls)...")
+            if self.window_manager:
+                self.window_manager.add_message(resp, increment_turn=True)
+            else:
+                self.messages.append(resp)
+
+            patch_arrived = False
+            if self.message_bus:
+                patch_arrived = self.message_bus.wait_for_patch(timeout=600)
+
+            if patch_arrived:
+                self.logger.info("[Reproducer] Patch received from patch editor!")
+            else:
+                self.logger.warning("[Reproducer] Timed out waiting for patch (600s)")
+
+            # Now inject Phase 2 message and resume LLM loop
+            phase2_msg = HumanMessage(content=(
+                "A patch has been generated by the patch editor. Enter PHASE 2 (patch validation).\n\n"
+                "Steps:\n"
+                "1. Call apply_patch() to apply the patch to YOUR container\n"
+                "2. Re-run your reproduction script with run_python() to verify the fix\n"
+                "3. Also re-run regression tests with run_regression_tests()\n"
+                "4. Check results carefully:\n"
+                "   - If ALL tests pass AND reproduction script passes: share_findings('validation_passed', '<summary>')\n"
+                "   - If ANY test fails OR ANY error occurs: share_findings('validation_failed', '<details>')\n"
+                "   IMPORTANT: Do NOT declare validation_passed if there are ANY errors, failures, or non-zero exit codes.\n"
+                "Do NOT output REPRODUCTION_SCRIPT again. Focus on validating the patch."
+            ))
+            if self.window_manager:
+                self.window_manager.add_message(phase2_msg)
+            else:
+                self.messages.append(phase2_msg)
+            return _CONTINUE_LOOP
+        return None
+
     def _run_loop(self) -> Dict[str, Any]:
         """Internal run loop with step limit enforcement.
         After confirming the bug, stays alive to validate patches from the editor.
         """
-        reproduction_script = None
-        reproduction_result = None
+        self._reproduction_script = None
+        self._reproduction_result = None
 
         # Auto-exit tracking: detect when validation is complete without magic strings
         self._patch_applied = False
@@ -522,13 +845,8 @@ class ReproducerAgent:
         self._validation_passed_exit = False
         self._last_reproduction_script = None
 
-        # Step budget milestones
-        budget_milestones = {
-            int(self.max_steps * 0.25): lambda s: f"This is step {s} (25%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.50): lambda s: f"This is step {s} (50%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.75): lambda s: f"This is step {s} (75%), you still have {self.max_steps - s} remaining steps before submission.",
-            int(self.max_steps * 0.90): lambda s: f"This is step {s} (90%), you still have {self.max_steps - s} remaining steps before submission.",
-        }
+        # Step budget milestones (25/50/75/90%)
+        milestones = {int(self.max_steps * f): int(f * 100) for f in (0.25, 0.50, 0.75, 0.90)}
 
         step = 0
         while step < self.max_steps:
@@ -536,49 +854,17 @@ class ReproducerAgent:
             self.logger.info(f"Step {step}/{self.max_steps}")
 
             # Step budget reminders
-            if step in budget_milestones:
-                nudge_msg = HumanMessage(content=budget_milestones[step](step))
-                if self.window_manager:
-                    self.window_manager.add_message(nudge_msg)
-                else:
-                    self.messages.append(nudge_msg)
+            if step in milestones:
+                self._add_loop_message(HumanMessage(content=(
+                    f"This is step {step} ({milestones[step]}%), you still have "
+                    f"{self.max_steps - step} remaining steps before submission."
+                )))
 
             # Auto-inject messages from other agents every step (N=1)
             self._inject_bus_messages()
 
-            # Progressive nudges to encourage submission
-            if step == self.max_steps - 5:
-                if reproduction_script:
-                    nudge_text = (
-                        "You are running low on steps. "
-                        "Wrap up validation and output VALIDATION_COMPLETE: PASSED or VALIDATION_COMPLETE: FAILED now."
-                    )
-                else:
-                    nudge_text = (
-                        "You are running low on steps. "
-                        "Start wrapping up your reproduction script now. Use REPRODUCTION_SCRIPT: and RESULT: and TEST_OUTPUT: format to submit."
-                    )
-                nudge = HumanMessage(content=nudge_text)
-                if self.window_manager:
-                    self.window_manager.add_message(nudge)
-                else:
-                    self.messages.append(nudge)
-            elif step == self.max_steps - 2:
-                if reproduction_script:
-                    nudge_text = (
-                        "URGENT: You must finish NOW. "
-                        "Output VALIDATION_COMPLETE: PASSED or VALIDATION_COMPLETE: FAILED immediately."
-                    )
-                else:
-                    nudge_text = (
-                        "URGENT: You must finish NOW. "
-                        "Output REPRODUCTION_SCRIPT: ```python ... ``` and RESULT: and TEST_OUTPUT: immediately."
-                    )
-                nudge = HumanMessage(content=nudge_text)
-                if self.window_manager:
-                    self.window_manager.add_message(nudge)
-                else:
-                    self.messages.append(nudge)
+            # Progressive (last-minute) nudges to encourage submission
+            self._emit_progressive_nudges(step, self._reproduction_script is not None)
 
             # Log sliding window stats if enabled
             if self.window_manager:
@@ -638,277 +924,18 @@ class ReproducerAgent:
                 )
                 break
 
-            # Handle tool calls
-            if getattr(resp, "tool_calls", None):
-                tool_msgs = []
-                for call in resp.tool_calls:
-                    tool_fn = {
-                        self.run_python.name: self.run_python,
-                        self.run_test.name: self.run_test,
-                        self.register_tests.name: self.register_tests,
-                        self.view_file.name: self.view_file,
-                        self.run_command.name: self.run_command,
-                        self.apply_patch.name: self.apply_patch,
-                        self.share_findings.name: self.share_findings,
-                        self.check_findings.name: self.check_findings,
-                    }.get(call["name"])
-
-                    if tool_fn:
-                        try:
-                            out = tool_fn.invoke(call["args"])
-                            self.detailed_log.log_tool_call(call["name"], call["args"], out)
-                            self.logger.info(f"Tool {call['name']} called with {call['args']}")
-                            tool_msgs.append(ToolMessage(f"OBSERVATION:\n{out}", tool_call_id=call["id"]))
-
-                            # Track validation progress for auto-exit
-                            if call["name"] == "apply_patch" and "successfully" in out.lower():
-                                self._patch_applied = True
-                                self._tests_run_after_patch = False  # reset — need new tests
-                                self._findings_shared_after_patch = False
-                            elif call["name"] == "run_python" and self._patch_applied:
-                                self._tests_run_after_patch = True
-                                self._last_reproduction_script = call["args"].get("code", "")
-                            elif call["name"] == "run_regression_tests" and self._patch_applied:
-                                self._tests_run_after_patch = True
-                            elif call["name"] == "share_findings":
-                                finding_type = call["args"].get("finding_type", "")
-                                if self._patch_applied and finding_type == "validation_passed":
-                                    self._findings_shared_after_patch = True
-                                    self._validation_passed_exit = True
-                                elif finding_type == "bug_confirmed" and not self._patch_applied:
-                                    self._bug_confirmed_via_tool = True
-                                elif finding_type == "validation_failed" and self._patch_applied:
-                                    self._validation_failed_waiting = True
-
-                            # REAL-TIME CONTEXT SHARING: Update shared context after relevant tool calls
-                            self._share_tool_findings(call["name"], call["args"], out)
-                        except Exception as e:
-                            error_msg = f"Tool error: {str(e)}"
-                            self.logger.error(error_msg)
-                            self.detailed_log.log_error(e, f"Tool {call['name']}")
-                            tool_msgs.append(ToolMessage(f"OBSERVATION:\n{error_msg}", tool_call_id=call["id"]))
-
-                # Add messages to window manager or raw list
-                if self.window_manager:
-                    self.window_manager.add_message(resp, increment_turn=True)
-                    for tm in tool_msgs:
-                        self.window_manager.add_message(tm)
-                else:
-                    self.messages.append(resp)
-                    self.messages.extend(tool_msgs)
-
-                # Immediate exit when validation_passed was shared
-                if getattr(self, '_validation_passed_exit', False):
-                    self.logger.info("[Reproducer] Auto-exit: validation_passed shared — stopping immediately")
-                    reproduction_result = "validated_passed"
-                    if not reproduction_script and getattr(self, '_last_reproduction_script', None):
-                        reproduction_script = self._last_reproduction_script
-                    if reproduction_script:
-                        self.shared_context.set_reproduction_script(reproduction_script)
-                    if self.message_bus:
-                        self.message_bus.post("reproducer", "validation_complete", {
-                            "status": "validated_passed",
-                            "script": reproduction_script[:2000] if reproduction_script else None,
-                        })
-                    break
-
-                # If validation_failed was shared, wait for revised patch (no LLM calls)
-                if getattr(self, '_validation_failed_waiting', False):
-                    self.logger.info("[Reproducer] Validation failed — waiting for revised patch (no LLM calls)...")
-                    patch_arrived = False
-                    if self.message_bus:
-                        patch_arrived = self.message_bus.wait_for_patch(timeout=600)
-                    if patch_arrived:
-                        self.logger.info("[Reproducer] Revised patch received!")
-                        # Reset state for next validation round
-                        self._patch_applied = False
-                        self._tests_run_after_patch = False
-                        self._findings_shared_after_patch = False
-                        phase_msg = HumanMessage(content=(
-                            "The patch editor has revised the patch based on your feedback.\n"
-                            "1. Call apply_patch() to apply the revised patch\n"
-                            "2. Re-run your tests to verify\n"
-                            "3. Report validation_passed or validation_failed"
-                        ))
-                        if self.window_manager:
-                            self.window_manager.add_message(phase_msg)
-                        else:
-                            self.messages.append(phase_msg)
-                    else:
-                        self.logger.warning("[Reproducer] No revised patch after 600s — continuing")
-                    self._validation_failed_waiting = False
-                    continue
-
-                # If bug_confirmed was shared via tool call, wait for patch (no LLM calls)
-                if self._bug_confirmed_via_tool and not self._patch_applied:
-                    self.logger.info("[Reproducer] Bug confirmed via tool. Waiting for patch (no LLM calls)...")
-                    patch_arrived = False
-                    if self.message_bus:
-                        patch_arrived = self.message_bus.wait_for_patch(timeout=600)
-                    if patch_arrived:
-                        self.logger.info("[Reproducer] Patch received from patch editor!")
-                    else:
-                        self.logger.warning("[Reproducer] Timed out waiting for patch (600s)")
-                    # Inject Phase 2 message
-                    phase2_msg = HumanMessage(content=(
-                        "A patch has been generated by the patch editor. Enter PHASE 2 (patch validation).\n\n"
-                        "Steps:\n"
-                        "1. Call apply_patch() to apply the patch to YOUR container\n"
-                        "2. Re-run your reproduction script with run_python() to verify the fix\n"
-                        "3. Also re-run regression tests with run_regression_tests()\n"
-                        "4. Check results carefully:\n"
-                        "   - If ALL tests pass AND reproduction script passes: share_findings('validation_passed', '<summary>')\n"
-                        "   - If ANY test fails OR ANY error occurs: share_findings('validation_failed', '<details>')\n"
-                        "   IMPORTANT: Do NOT declare validation_passed if there are ANY errors, failures, or non-zero exit codes."
-                    ))
-                    if self.window_manager:
-                        self.window_manager.add_message(phase2_msg)
-                    else:
-                        self.messages.append(phase2_msg)
-                    self._bug_confirmed_via_tool = False  # reset so we don't wait again
-                    continue
-
-                # Auto-exit: only when the model explicitly posts share_findings("validation_passed", ...)
-                if self._patch_applied and self._tests_run_after_patch and self._findings_shared_after_patch:
-                    self.logger.info("[Reproducer] Auto-exit: model posted validation_passed")
-                    reproduction_result = "validated_passed"
-                    # Save the last reproduction script for logging
-                    if not reproduction_script and getattr(self, '_last_reproduction_script', None):
-                        reproduction_script = self._last_reproduction_script
-                    if reproduction_script:
-                        self.shared_context.set_reproduction_script(reproduction_script)
-                    if self.message_bus:
-                        self.message_bus.post("reproducer", "validation_complete", {
-                            "status": "validated_passed",
-                            "script": reproduction_script[:2000] if reproduction_script else None,
-                        })
-                    break
-
+            # Handle tool calls (dispatch + validation handshake).
+            tc = self._handle_tool_calls(resp)
+            if tc is _BREAK_LOOP:
+                break
+            if tc is _CONTINUE_LOOP:
                 continue
 
-            # Check for final output
-            text = llm_text(resp)
-
-            # ── Check for REPRODUCTION_SCRIPT (Phase 1 complete → enter Phase 2) ──
-            # IMPORTANT: Check this BEFORE VALIDATION_COMPLETE because the LLM
-            # may include "VALIDATION_COMPLETE: PASSED or FAILED" as a description
-            # of future steps alongside REPRODUCTION_SCRIPT output, which would
-            # be falsely matched as an actual validation result.
-            has_reproduction = "REPRODUCTION_SCRIPT:" in text or "RESULT:" in text
-
-            # ── Check for VALIDATION_COMPLETE ──
-            # Only match when it looks like an actual directive, not a description.
-            # Require it to appear at the start of a line (after optional whitespace).
-            validation_match = re.search(r'(?m)^\s*VALIDATION_COMPLETE:\s*(PASSED|FAILED)', text)
-            # Also reject matches that look like instructions (e.g. "PASSED or FAILED")
-            if validation_match and not has_reproduction:
-                is_passed = validation_match.group(1).upper() == "PASSED"
-                reproduction_result = "validated_passed" if is_passed else "validated_failed"
-                self.logger.info(f"[Reproducer] Validation result: {reproduction_result}")
-
-                if self.message_bus:
-                    self.message_bus.post("reproducer", "validation_complete", {
-                        "status": reproduction_result,
-                        "script": reproduction_script[:2000] if reproduction_script else None,
-                        "detailed_output": text[-3000:],
-                    })
-
-                if is_passed:
-                    # Only terminate on PASSED — the fix is confirmed
-                    break
-                else:
-                    # FAILED — keep looping so the patch editor can revise.
-                    # Inject a message telling the LLM to wait for a revised patch.
-                    retry_msg = HumanMessage(content=(
-                        "Validation FAILED. Your feedback has been shared with the patch editor.\n"
-                        "Wait for a revised patch (you will receive a LIVE UPDATE), then call apply_patch() and re-validate.\n"
-                        "When the revised patch passes, output VALIDATION_COMPLETE: PASSED. Otherwise, share the test results with others as feedback."
-                    ))
-                    if self.window_manager:
-                        self.window_manager.add_message(resp, increment_turn=True)
-                        self.window_manager.add_message(retry_msg)
-                    else:
-                        self.messages.append(resp)
-                        self.messages.append(retry_msg)
-                    continue
-
-            if has_reproduction:
-                # Extract reproduction script
-                if "```python" in text:
-                    script_start = text.find("```python") + 9
-                    script_end = text.find("```", script_start)
-                    if script_end > script_start:
-                        reproduction_script = text[script_start:script_end].strip()
-
-                # Extract result
-                if "RESULT:" in text:
-                    result_line = text.split("RESULT:")[1].split("\n")[0].strip()
-                    if "REPRODUCED" in result_line.upper():
-                        reproduction_result = "reproduced" if "NOT" not in result_line.upper() else "not_reproduced"
-                    elif "ERROR" in result_line.upper():
-                        reproduction_result = "error"
-                    else:
-                        reproduction_result = result_line.lower()
-
-                # Extract test output (printed results from the script)
-                reproduction_test_output = ""
-                if "TEST_OUTPUT:" in text:
-                    reproduction_test_output = text.split("TEST_OUTPUT:")[1].strip()
-                    # Trim to first section boundary or end
-                    for boundary in ["REPRODUCTION_SCRIPT:", "VALIDATION_COMPLETE:"]:
-                        if boundary in reproduction_test_output:
-                            reproduction_test_output = reproduction_test_output[:reproduction_test_output.find(boundary)].strip()
-
-                # Share bug confirmation and test info with other agents
-                if self.message_bus:
-                    bug_data = {
-                        "status": reproduction_result or "unknown",
-                        "script": reproduction_script,
-                        "test_output": reproduction_test_output or text,
-                    }
-                    self.message_bus.post("reproducer", "bug_confirmed", bug_data)
-                    if reproduction_script:
-                        self.message_bus.post("reproducer", "test_info", {
-                            "reproduction_script": reproduction_script[:2000],
-                            "result": reproduction_result,
-                            "test_output": reproduction_test_output or text[-3000:],
-                            "regression_tests": self.available_regression_tests[:10],
-                        })
-
-                # Phase 2: Wait for patch WITHOUT calling the LLM.
-                # Uses threading.Event — blocks with zero cost until patch_generated arrives.
-                self.logger.info("[Reproducer] Bug confirmed. Waiting for patch from patch editor (no LLM calls)...")
-                if self.window_manager:
-                    self.window_manager.add_message(resp, increment_turn=True)
-                else:
-                    self.messages.append(resp)
-
-                patch_arrived = False
-                if self.message_bus:
-                    patch_arrived = self.message_bus.wait_for_patch(timeout=600)
-
-                if patch_arrived:
-                    self.logger.info("[Reproducer] Patch received from patch editor!")
-                else:
-                    self.logger.warning("[Reproducer] Timed out waiting for patch (600s)")
-
-                # Now inject Phase 2 message and resume LLM loop
-                phase2_msg = HumanMessage(content=(
-                    "A patch has been generated by the patch editor. Enter PHASE 2 (patch validation).\n\n"
-                    "Steps:\n"
-                    "1. Call apply_patch() to apply the patch to YOUR container\n"
-                    "2. Re-run your reproduction script with run_python() to verify the fix\n"
-                    "3. Also re-run regression tests with run_regression_tests()\n"
-                    "4. Check results carefully:\n"
-                    "   - If ALL tests pass AND reproduction script passes: share_findings('validation_passed', '<summary>')\n"
-                    "   - If ANY test fails OR ANY error occurs: share_findings('validation_failed', '<details>')\n"
-                    "   IMPORTANT: Do NOT declare validation_passed if there are ANY errors, failures, or non-zero exit codes.\n"
-                    "Do NOT output REPRODUCTION_SCRIPT again. Focus on validating the patch."
-                ))
-                if self.window_manager:
-                    self.window_manager.add_message(phase2_msg)
-                else:
-                    self.messages.append(phase2_msg)
+            # Parse the response for a Phase-1/Phase-2 final output.
+            fo = self._handle_final_output(resp)
+            if fo is _BREAK_LOOP:
+                break
+            if fo is _CONTINUE_LOOP:
                 continue
 
             # Add response to message history
@@ -918,21 +945,21 @@ class ReproducerAgent:
                 self.messages.append(resp)
 
         # Save to shared context
-        if reproduction_script:
-            self.shared_context.set_reproduction_script(reproduction_script)
-        if reproduction_result:
-            self.shared_context.set_reproduction_result(reproduction_result)
+        if self._reproduction_script:
+            self.shared_context.set_reproduction_script(self._reproduction_script)
+        if self._reproduction_result:
+            self.shared_context.set_reproduction_result(self._reproduction_result)
 
         self.shared_context.update_reproducer_status("completed")
 
         # Notify patch editor that reproducer is done (so it stops waiting)
         if self.message_bus:
-            self.message_bus.post("reproducer", "reproducer_done", reproduction_result or "completed")
+            self.message_bus.post("reproducer", "reproducer_done", self._reproduction_result or "completed")
 
         result = {
-            "reproducer_status": [reproduction_result or "unknown"],
+            "reproducer_status": [self._reproduction_result or "unknown"],
             "reproducer_output": [response_text if 'response_text' in dir() else ""],
-            "reproducer_script": reproduction_script,
+            "reproducer_script": self._reproduction_script,
             "reproducer_expected": None,
             "reproducer_actual": None,
             "regression_tests_available": len(self.available_regression_tests),
@@ -944,11 +971,11 @@ class ReproducerAgent:
             action="reproduction_complete",
             action_type="result",
             input_data=None,
-            output_data=reproduction_script,
+            output_data=self._reproduction_script,
             metadata={
-                "status": reproduction_result,
-                "script_generated": bool(reproduction_script),
-                "patch_validated": reproduction_result in ("validated_passed", "validated_failed"),
+                "status": self._reproduction_result,
+                "script_generated": bool(self._reproduction_script),
+                "patch_validated": self._reproduction_result in ("validated_passed", "validated_failed"),
                 "total_steps": len(self.trajectory)
             }
         )
@@ -962,7 +989,7 @@ class ReproducerAgent:
 
         self._log_window_stats_on_exit()
         self.detailed_log.log_result(result)
-        self.logger.info(f"Reproduction complete: {reproduction_result}")
+        self.logger.info(f"Reproduction complete: {self._reproduction_result}")
         return result
 
     def _log_window_stats_on_exit(self):

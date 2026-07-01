@@ -157,6 +157,7 @@ class SlidingWindowManager:
             return litellm.utils.token_counter(text=text, model=self.model_name)
         except Exception:
             # Fallback: rough estimate (4 chars per token)
+            self.logger.debug(f"token_counter failed for {self.model_name}; using char/4 estimate", exc_info=True)
             return len(text) // 4
 
     def _count_message_tokens(self, message: BaseMessage) -> int:

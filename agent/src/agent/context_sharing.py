@@ -9,6 +9,37 @@ import logging
 import threading
 
 
+class BusMessageType:
+    """Canonical names for AgentMessageBus message types.
+
+    These constants document the wire strings used across the agents; their
+    VALUES must stay byte-identical to the literals still used in the agents'
+    matching logic (e.g. patch_editor/reproducer), which this refactor does not
+    rewrite because some of those checks inspect the message *data payload*
+    rather than the type (e.g. ``"validated_passed" in data_text``).
+
+    NOTE (correctness item, intentionally not changed here): the reproducer
+    posts success as type ``validation_complete`` with ``data["status"] ==
+    "validated_passed"``, while ``post()`` only signals the validation event for
+    types ``validation_passed``/``validation_failed``. The patch_editor copes by
+    also substring-matching the payload. That apparent mismatch is tracked
+    separately and must be addressed in a behavior-changing pass, not this one.
+    """
+    # Localizer
+    LOCALIZED_FILES = "localized_files"
+    LOCALIZED_FUNCTIONS = "localized_functions"
+    # Reproducer
+    TEST_INFO = "test_info"
+    BUG_CONFIRMED = "bug_confirmed"
+    VALIDATION_PASSED = "validation_passed"
+    VALIDATION_FAILED = "validation_failed"
+    VALIDATION_COMPLETE = "validation_complete"
+    # Patch editor
+    PATCH_GENERATED = "patch_generated"
+    # Shared
+    TEST_RESULTS = "test_results"
+
+
 class AgentMessageBus:
     """
     Thread-safe message bus for real-time communication between parallel agents.
@@ -53,11 +84,11 @@ class AgentMessageBus:
             )
 
         # Signal waiting agents
-        if msg_type == "patch_generated":
+        if msg_type == BusMessageType.PATCH_GENERATED:
             self._patch_ready.set()
-        elif msg_type == "test_results":
+        elif msg_type == BusMessageType.TEST_RESULTS:
             self._test_results_ready.set()
-        elif msg_type in ("validation_passed", "validation_failed"):
+        elif msg_type in (BusMessageType.VALIDATION_PASSED, BusMessageType.VALIDATION_FAILED):
             self._validation_feedback = msg
             self._validation_feedback_ready.set()
 

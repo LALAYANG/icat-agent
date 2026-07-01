@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 import litellm
 
 
+_logger = logging.getLogger("agent.utils")
+
 DEFAULT_MAX_COST_PER_INSTANCE = 2.0
 
 
@@ -72,7 +74,8 @@ class OpenRouterResponseCapture:
             if isinstance(data, dict) and "usage" in data:
                 self.last_raw_usage = data["usage"]
         except Exception:
-            pass
+            # Non-fatal: usage capture is best-effort; cost reporting falls back.
+            _logger.debug("OpenRouter usage capture failed", exc_info=True)
 
 # Singleton — shared across all OpenRouter models in the process
 _openrouter_capture = OpenRouterResponseCapture()
@@ -171,7 +174,8 @@ def _inject_cache_control_on_request(request):
             # Drop chunked encoding if it was set, since we have a fixed body now.
             request.headers.pop("Transfer-Encoding", None)
     except Exception:
-        pass
+        # Non-fatal: if the cache-marker rewrite fails, send the body unmodified.
+        _logger.debug("OpenRouter request cache-marker rewrite failed", exc_info=True)
 
 
 def get_openrouter_cost() -> float | None:
@@ -220,7 +224,8 @@ def enable_anthropic_tool_caching(bound_model, model_name: str):
                 if CACHE_CONTROL_MARKER not in desc:
                     fn['description'] = (CACHE_CONTROL_MARKER + " " + desc).strip()
     except Exception:
-        pass
+        # Non-fatal: tool-caching marker is an optimization; bind the model as-is.
+        _logger.debug("Tool-caching marker injection failed", exc_info=True)
     return bound_model
 
 
@@ -510,7 +515,8 @@ class CostTracker:
                 cache_read = int(details.get("cached_tokens") or raw.get("cache_read_input_tokens") or 0)
                 cache_creation = int(raw.get("cache_creation_input_tokens") or 0)
             except Exception:
-                pass
+                # Non-fatal: cache-token fallback parse failed; counts stay 0.
+                self.logger.debug("OpenRouter cache-token fallback parse failed", exc_info=True)
 
         call_record = {
             "timestamp": datetime.now().isoformat(),
