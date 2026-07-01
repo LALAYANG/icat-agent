@@ -18,12 +18,14 @@ class BusMessageType:
     rewrite because some of those checks inspect the message *data payload*
     rather than the type (e.g. ``"validated_passed" in data_text``).
 
-    NOTE (correctness item, intentionally not changed here): the reproducer
-    posts success as type ``validation_complete`` with ``data["status"] ==
-    "validated_passed"``, while ``post()`` only signals the validation event for
-    types ``validation_passed``/``validation_failed``. The patch_editor copes by
-    also substring-matching the payload. That apparent mismatch is tracked
-    separately and must be addressed in a behavior-changing pass, not this one.
+    Two validation signal styles coexist: the reproducer's model posts
+    ``validation_passed``/``validation_failed`` via the share_findings tool (the
+    verdict is the type), while the reproducer's loop posts a terminal
+    ``validation_complete`` whose verdict lives in ``data["status"]``
+    (``validated_passed``/``validated_failed``). ``post()`` wakes
+    ``wait_for_validation()`` on all three, and ``validation_verdict()`` maps
+    either style to a boolean so consumers never assume the type. The
+    patch_editor's own payload substring checks remain as a redundant fallback.
     """
     # Localizer
     LOCALIZED_FILES = "localized_files"
@@ -56,6 +58,14 @@ class AgentMessageBus:
       - test_results: Reproducer tested a patch (pass/fail)
     """
 
+    # Any of these carries a validation verdict; wait_for_validation() watches
+    # for all three and validation_verdict() interprets whichever one arrives.
+    _VALIDATION_TYPES = (
+        BusMessageType.VALIDATION_PASSED,
+        BusMessageType.VALIDATION_FAILED,
+        BusMessageType.VALIDATION_COMPLETE,
+    )
+
     def __init__(self):
         self._messages: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -65,8 +75,10 @@ class AgentMessageBus:
         self._validation_feedback: Optional[Dict[str, Any]] = None
         self.logger = logging.getLogger("AgentMessageBus")
 
-    def post(self, from_agent: str, msg_type: str, data: Any) -> None:
-        """Post a message visible to all agents."""
+    def post(self, from_agent: str, msg_type: str, data: Any) -> int:
+        """Post a message visible to all agents. Returns the message's id, which
+        callers can pass to wait_for_validation(after_id=...) to ignore verdicts
+        from earlier rounds."""
         with self._lock:
             msg_id = len(self._messages) + 1
             msg = {
@@ -88,9 +100,18 @@ class AgentMessageBus:
             self._patch_ready.set()
         elif msg_type == BusMessageType.TEST_RESULTS:
             self._test_results_ready.set()
-        elif msg_type in (BusMessageType.VALIDATION_PASSED, BusMessageType.VALIDATION_FAILED):
+        elif msg_type in self._VALIDATION_TYPES:
+            # validation_passed/failed carry the verdict in the type; the
+            # reproducer's terminal validation_complete carries it in
+            # data["status"] (validated_passed / validated_failed). All three
+            # must wake wait_for_validation(); consumers read the verdict via
+            # validation_verdict() rather than assuming the type. The event is
+            # only a wakeup hint — wait_for_validation() re-scans the message log
+            # (the source of truth) so a set() that races a clear() is harmless.
             self._validation_feedback = msg
             self._validation_feedback_ready.set()
+
+        return msg_id
 
     def read(
         self,
@@ -136,14 +157,63 @@ class AgentMessageBus:
         self._test_results_ready.clear()
         return self._test_results_ready.wait(timeout=timeout)
 
-    def wait_for_validation(self, timeout: float = 600) -> Optional[Dict[str, Any]]:
-        """Block until reproducer posts validation_passed or validation_failed.
-        Returns the feedback message, or None on timeout."""
-        self._validation_feedback_ready.clear()
-        self._validation_feedback = None
-        if self._validation_feedback_ready.wait(timeout=timeout):
-            return self._validation_feedback
-        return None
+    def wait_for_validation(
+        self, timeout: float = 600, after_id: int = 0
+    ) -> Optional[Dict[str, Any]]:
+        """Block until the reproducer posts a validation verdict, i.e. a
+        validation_passed / validation_failed / validation_complete message with
+        id > after_id. Returns that message, or None on timeout.
+
+        Pass after_id = the id returned when you posted your patch so a verdict
+        from an earlier round isn't returned again.
+
+        Race-free: the verdict is found by scanning the message log under the
+        lock, so a post that fires between the caller's clear() and wait() is
+        never lost — worst case it costs one extra re-scan. The event is only a
+        wakeup hint, not the source of truth.
+        """
+        deadline = time.time() + timeout
+        while True:
+            # Clear BEFORE scanning: any post that lands after this clear() will
+            # re-set the event, so the following wait() won't miss it; any post
+            # that already landed is found by the scan regardless of the flag.
+            self._validation_feedback_ready.clear()
+            with self._lock:
+                for m in reversed(self._messages):
+                    if m["id"] <= after_id:
+                        break  # older than the caller's anchor — stop scanning
+                    if m["type"] in self._VALIDATION_TYPES:
+                        return m
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            self._validation_feedback_ready.wait(timeout=remaining)
+
+    @staticmethod
+    def validation_verdict(feedback: Dict[str, Any]) -> Optional[bool]:
+        """Interpret a validation feedback message as passed (True) / failed
+        (False) / unknown (None), regardless of which signal style produced it.
+
+        - validation_passed / validation_failed: the verdict is the type.
+        - validation_complete: the verdict is data["status"]
+          (validated_passed / validated_failed).
+
+        This is the single place that maps either style to a boolean so callers
+        never have to assume `type == "validation_passed"`.
+        """
+        if not feedback:
+            return None
+        fb_type = feedback.get("type")
+        if fb_type == BusMessageType.VALIDATION_PASSED:
+            return True
+        if fb_type == BusMessageType.VALIDATION_FAILED:
+            return False
+        data = feedback.get("data")
+        if isinstance(data, dict) and "status" in data:
+            return data["status"] == "validated_passed"
+        # Fallback for stringified payloads (e.g. validation_complete posted as
+        # text): mirror the substring check the patch_editor already relies on.
+        return "validated_passed" in str(data)
 
     def get_latest(self, msg_type: str) -> Optional[Dict[str, Any]]:
         """Get the most recent message of a given type."""

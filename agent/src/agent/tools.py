@@ -1342,21 +1342,26 @@ def make_share_findings(message_bus, *, agent_name: str, post_callback=None,
             data: What you found
         """
         if message_bus:
-            message_bus.post(agent_name, finding_type, data)
+            posted_id = message_bus.post(agent_name, finding_type, data)
             if post_callback:
                 post_callback(finding_type, data)
 
             if wait_for_validation and finding_type == "patch_generated":
                 _collect_and_post_diff()
                 _logger.info(f"[{agent_name}] Patch shared. Waiting for reproducer validation...")
-                feedback = message_bus.wait_for_validation(timeout=600)
+                # Anchor on this patch's id so a verdict from a previous round
+                # isn't mistaken for this patch's result.
+                feedback = message_bus.wait_for_validation(timeout=600, after_id=posted_id)
                 if feedback is None:
                     return ("[Shared with other agents] patch_generated.\n"
                             "WARNING: Timed out waiting for validation (600s). "
                             "The reproducer may not be running. Proceed with caution.")
-                fb_type = feedback["type"]
                 fb_data = str(feedback["data"])
-                if fb_type == "validation_passed":
+                # Verdict comes from the type (validation_passed/failed) OR from
+                # data["status"] (validation_complete) — validation_verdict()
+                # handles both so a passing validation_complete isn't misread as
+                # a failure.
+                if message_bus.validation_verdict(feedback) is True:
                     return (f"[Shared with other agents] patch_generated.\n"
                             f"VALIDATION PASSED: {fb_data[:500]}\n"
                             f"Your patch is correct! Declare DONE.")
