@@ -467,7 +467,33 @@ reproducer:
         Don't blindly re-run the same failing tests.
 
     **CRITICAL VALIDATION RULES:**
+    - HARD REQUIREMENT — you may ONLY call share_findings("validation_passed", ...) AFTER you have
+      actually executed the repository's EXISTING test file(s) for EVERY source file your patch
+      touched (e.g. a change to lib/.../ssh.py REQUIRES running test/units/.../test_ssh.py), applied
+      the patch first, and seen that run finish with 0 failures and 0 errors. Run it with the real
+      path, e.g. `run_command("cd /app && python -m pytest test/units/plugins/connection/test_ssh.py -v")`.
+    - You MUST paste the actual pytest/go/jest SUMMARY LINE (e.g. "=== 12 passed in 3.4s ===" or
+      "X passed, Y failed") into your validation_passed message as proof. No summary line showing
+      0 failures = you are NOT allowed to say validation_passed.
+    - Static code inspection (e.g. "the code now uses get_option everywhere", "the constants are
+      removed", "the diff looks correct") is NEVER sufficient and NEVER justifies validation_passed.
+      Your OWN reproduction scripts passing is NOT enough either — the existing repo tests are what matters.
+    - A patch that fixes the target behaviour but BREAKS any previously-passing test in those files is a
+      FAILURE — report validation_failed. Run the WHOLE existing test file, not just the new behaviour.
     - Do NOT declare validation_passed if ANY test failed or ANY error occurred.
+    - YOUR JOB IS TO CATCH FAILURES, NOT TO MAKE TESTS PASS. When you hit a test failure, an
+      import error, a traceback, or a patch that won't apply, do NOT blindly ignore it, skip it,
+      route around it, or fabricate a clean summary. That failure IS the signal you exist to find —
+      surface it. A test failure or error means the patch has a defect; report validation_failed
+      with the exact failing test name and error output. A run where you uncover a real failure is a
+      SUCCESS for you (you did your job); a run where you suppress one to declare validation_passed
+      is a FAILURE.
+    - NEVER "skip the problematic test" and validate on the rest. If a test cannot even run (import
+      error, patch fails to apply, collection error), that is validation_failed — not something to
+      work around. The failing/unrunnable test is the most important evidence, not an obstacle.
+    - The validation_passed summary line MUST come from the actual output of run_command/run_test
+      invoking a real test runner. A summary you print() or hand-write yourself proves nothing and
+      is forbidden — it is fabrication.
     - Do NOT ignore errors like "no such table", SyntaxError, Traceback, or test FAILURES.
     - Do NOT assume tests passed — you must actually run them and check the output.
     - If regression tests show ANY failures, that is a FAILURE.

@@ -1,0 +1,14 @@
+{
+  "instance_ansible__ansible-935528e22e5283ee3f63a8772830d3d01f55ed8c-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5": [
+    "test/units/plugins/connection/test_ssh.py::TestConnectionBaseClass::test_plugins_connection_ssh_basic",
+    "test/units/plugins/connection/test_ssh.py::TestConnectionBaseClass::test_plugins_connection_ssh_module",
+    "test/units/plugins/connection/test_ssh.py::TestConnectionBaseClass::test_plugins_connection_ssh__build_command",
+    "test/units/plugins/connection/test_ssh.py::TestConnectionBaseClass::test_plugins_connection_ssh_exec_command",
+    "test/units/plugins/connection/test_ssh.py::TestConnectionBaseClass::test_plugins_connection_ssh__examine_output",
+    "test/units/plugins/connection/test_ssh.py::TestSSHConnectionRun::test_password_with_become",
+    "test/units/plugins/connection/test_ssh.py::TestSSHConnectionRun::test_password_with_prompt",
+    "test/units/plugins/connection/test_ssh.py::TestSSHConnectionRun::test_no_escalation",
+    "test/units/plugins/connection/test_ssh.py::TestSSHConnectionRun::test_pasword_without_data",
+    "test/units/plugins/connection/test_ssh.py::TestSSHConnectionRun::test_with_password"
+  ]
+}
