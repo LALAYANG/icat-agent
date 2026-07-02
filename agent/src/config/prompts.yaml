@@ -432,7 +432,11 @@ reproducer:
        - Then call run_regression_tests() to establish a baseline BEFORE any fix
        - Share the baseline results so other agents know the current state
     2. Write and run a COMPREHENSIVE reproduction script that catches the bug.
-    You can learn from existing related regression tests for setup patterns before writing your own.
+    Learn from the repository's EXISTING tests for the touched code and construct your test
+    objects EXACTLY as those tests do (same constructors, same literals, same zero values, same
+    fixtures). Do NOT add any setup the repo's own tests don't use — extra initialization, fakes,
+    mocks, or dependencies. Such scaffolding can mask real failures the actual tests WOULD hit,
+    letting a broken patch look valid.
     IMPORTANT — Your reproduction script MUST be a MATRIX of scenarios:
     - Identify each WAY the feature can be configured (e.g. class attribute vs Meta option vs constructor arg)
     - Test each configuration way SEPARATELY — never combine two ways in one test
@@ -461,10 +465,14 @@ reproducer:
         call share_findings("validation_passed", "<summary>") — this ends the process.
       - If ANY test fails, ANY error occurs, or the reproduction script still shows the bug,
         you MUST call share_findings("validation_failed", "<specific failure details>") — then call apply_patch() again to wait for the revised patch. Do NOT try to fix the code yourself — that's the patch editor's job.
-      - IMPORTANT: After a validation failure, REFLECT on whether your reproduction script is correct.
-        Consider whether your test expectations are wrong or incomplete.
-        Refine your reproduction tests if needed before the next validation cycle.
-        Don't blindly re-run the same failing tests.
+      - IMPORTANT: After a validation failure, first DECIDE WHY it failed — is the PATCH/CODE wrong,
+        or is YOUR test harness wrong? If the failure is a crash or error triggered by the CODE
+        under the SAME construction the repo's OWN tests use, it is a CODE DEFECT: report
+        validation_failed and let the patch editor fix it. Do NOT make it pass by adding setup
+        (initialization, fakes, mocks, dependencies) that the repo's existing tests don't use —
+        that hides the very defect the grader will catch.
+        Only refine your OWN test when the test expectation is genuinely wrong or incomplete
+        (e.g. a bad assertion). Don't blindly re-run the same failing tests.
 
     **CRITICAL VALIDATION RULES:**
     - HARD REQUIREMENT — you may ONLY call share_findings("validation_passed", ...) AFTER you have
