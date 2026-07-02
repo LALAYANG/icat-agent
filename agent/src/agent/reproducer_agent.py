@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import re
+import shlex
 import time
 import logging
 from pathlib import Path
@@ -506,12 +507,153 @@ class ReproducerAgent:
         # Build docker-dependent tools and bind them to the model now that Docker is ready.
         self._setup_tools()
 
+        # Method-1 retrieval: seed the reproducer with how the repo's EXISTING tests
+        # construct/call the code under test, so its reproduction mirrors the real
+        # construction instead of inventing setup (mocks/loggers) that masks defects.
+        # Repo-derived, no prompt leakage: the extraction logic is identical for every
+        # instance; only the retrieved snippets differ.
+        try:
+            ref = self._retrieve_construction_examples()
+            if ref:
+                self._add_loop_message(HumanMessage(content=ref))
+                self.logger.info(f"[Reproducer] Injected construction reference ({len(ref)} chars)")
+            else:
+                self.logger.info("[Reproducer] No construction reference retrieved")
+        except Exception as e:
+            self.logger.debug(f"[Reproducer] construction retrieval skipped: {e}", exc_info=True)
+
         try:
             return self._run_loop()
         finally:
             if self.owns_docker:
                 self.docker_env.__exit__(None, None, None)
                 self.logger.info("Docker container cleaned up")
+
+    # Vendored / build dirs to skip when grepping the repo for construction examples,
+    # so third-party test files (e.g. node_modules) don't drown out the repo's own tests.
+    _GREP_EXCLUDES = ("--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=vendor "
+                      "--exclude-dir=dist --exclude-dir=build --exclude-dir=.venv "
+                      "--exclude-dir=venv --exclude-dir=__pycache__ --exclude-dir=.tox "
+                      "--exclude-dir=site-packages --exclude-dir=third_party --exclude-dir=target")
+
+    def _retrieve_construction_examples(self, max_symbols: int = 18, max_snippets: int = 16) -> Optional[str]:
+        """Method-1 retrieval (no prompt leakage): extract, from the repo's OWN
+        existing tests, how the code under test is constructed and invoked, and
+        return it as a context block to seed the reproducer.
+
+        The same generic extraction runs for every instance; only the snippets
+        differ, and they come from files the agent already has full access to
+        (existing tests — NOT the hidden gold test patch). This shows the
+        reproducer the repo's real object construction (e.g. a bare struct with no
+        logger) so it mirrors it rather than adding scaffolding that hides defects.
+        """
+        env = self.docker_env
+        if env is None:
+            return None
+
+        def sh(cmd: str, timeout: int = 45) -> str:
+            try:
+                _, out, _ = env.run_command(cmd, timeout=timeout)
+                return out or ""
+            except Exception:
+                return ""
+
+        # --- text context: localizer findings + plan + problem statement ---
+        texts = [self.plan or "", self.problem or ""]
+        try:
+            lc = self.shared_context.get_localizer_context()
+            if lc:
+                texts.append(json.dumps(lc) if isinstance(lc, (dict, list)) else str(lc))
+        except Exception:
+            pass
+        blob = "\n".join(texts)
+
+        SRC_EXT = r'(?:go|py|js|jsx|ts|tsx|java|rb|rs|cc|cpp|c|h)'
+        _is_src = lambda f: ("_test." not in f and "/test" not in f
+                             and ".spec." not in f and not f.startswith("test"))
+
+        # focal files named directly in the issue/plan
+        focal_files = []
+        for f in re.findall(r'[\w][\w./-]*\.' + SRC_EXT, blob):
+            f = f.lstrip("./")
+            if _is_src(f) and f not in focal_files:
+                focal_files.append(f)
+
+        # candidate symbols mentioned in the issue text (camelCase, or snake_case foo()
+        text_syms = set(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*)\b', blob))
+        text_syms |= set(re.findall(r'\b([a-z_][a-z0-9_]{4,})\s*\(', blob))
+        text_syms = {s for s in text_syms if 4 < len(s) < 40}
+
+        # locate focal files by where those symbols are DEFINED (source, not tests)
+        if text_syms:
+            alt = "|".join(re.escape(s) for s in list(text_syms)[:20])
+            out = sh("grep -rlE " + self._GREP_EXCLUDES
+                     + " " + shlex.quote(r'(func|def|class|type)[^=]*\b(' + alt + r')\b')
+                     + " . 2>/dev/null | grep -vE '(_test\\.|/tests?/|\\.spec\\.|test_)'"
+                     + " | grep -E '\\.(go|py|js|jsx|ts|tsx|java|rb)$' | head -8")
+            for f in out.splitlines():
+                f = f.strip().lstrip("./")
+                if f and f not in focal_files:
+                    focal_files.append(f)
+        focal_files = focal_files[:8]
+        if not focal_files:
+            return None
+
+        # symbols DEFINED in the focal files (types / functions / receiver methods / classes)
+        symbols = set(text_syms)
+        for path in focal_files:
+            out = sh("grep -nE '^[[:space:]]*(func|type|class|def|export ) ' "
+                     + shlex.quote(path) + " 2>/dev/null | head -100", timeout=30)
+            for line in out.splitlines():
+                m = re.search(r'func\s*\([^)]*\*?([A-Za-z_]\w+)\s*\)\s*([A-Za-z_]\w+)', line)  # Go method
+                if m:
+                    symbols.add(m.group(1)); symbols.add(m.group(2)); continue
+                m = re.search(r'\b(?:func|type|class|def)\s+([A-Za-z_]\w+)', line)
+                if m:
+                    symbols.add(m.group(1))
+        symbols = [s for s in symbols if len(s) > 2][:max_symbols]
+        if not symbols:
+            return None
+        sym_alt = "|".join(re.escape(s) for s in symbols)
+
+        # test files referencing any focal symbol (skip vendored/dependency dirs so
+        # e.g. node_modules test files don't drown out the repo's own tests)
+        out = sh("grep -rlE " + self._GREP_EXCLUDES + " " + shlex.quote(sym_alt)
+                 + " --include='*_test.*' --include='test_*.py' --include='*_test.py'"
+                 + " --include='*.test.*' --include='*.spec.*' . 2>/dev/null | head -25", timeout=50)
+        test_files = [x.strip() for x in out.splitlines() if x.strip()]
+        if not test_files:
+            return None
+        quoted_tf = " ".join(shlex.quote(t) for t in test_files[:25])
+
+        # construction / call sites for each symbol, with a little leading context
+        snippets = []
+        for sym in symbols:
+            pat = r'([&(]?\b' + re.escape(sym) + r'\b[[:space:]]*[{(]|new' + re.escape(sym) + r'\b)'
+            out = sh("grep -nHE -B2 " + shlex.quote(pat) + " " + quoted_tf
+                     + " 2>/dev/null | head -12", timeout=45)
+            for line in out.splitlines():
+                s = line.rstrip()
+                if not s or s.endswith("--"):
+                    continue
+                if s not in snippets:
+                    snippets.append(s)
+                if len(snippets) >= max_snippets:
+                    break
+            if len(snippets) >= max_snippets:
+                break
+        if not snippets:
+            return None
+
+        return (
+            "CONSTRUCTION REFERENCE — retrieved from THIS repository's EXISTING tests.\n"
+            "Below is how the repo's own tests construct and invoke the code under test. When you "
+            "write your reproduction, build and call the objects the SAME way these tests do "
+            "(same constructors, same literals, same zero values). Do NOT add initialization, fakes, "
+            "mocks, or dependencies these tests omit — such scaffolding can hide a real defect (e.g. a "
+            "crash under the real construction) and make a broken patch look valid.\n\n"
+            + "\n".join(snippets[:max_snippets])
+        )
 
     def _add_loop_message(self, msg):
         """Append a message to the window manager (if enabled) or the raw list."""
